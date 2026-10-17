@@ -16,11 +16,13 @@
  */
 package org.apache.tika.parser.image;
 
-import java.io.InputStream;
 
 import org.junit.jupiter.api.Test;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
@@ -28,7 +30,7 @@ import org.apache.tika.parser.Parser;
 /**
  * Test class for the ICNSParser
  */
-public class ICNSParserTest {
+public class ICNSParserTest extends TikaTest {
 
     private final Parser parser = new ICNSParser();
 
@@ -38,14 +40,13 @@ public class ICNSParserTest {
     @Test
     public void testICNS_basic() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/icns");
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/icns");
         metadata.set("Icons count", "1");
         metadata.set("Icons details", "512x512 (JPEG 2000 or PNG format)");
 
 
-        try (InputStream stream = getClass()
-                .getResourceAsStream("/test-documents/testICNS_basic.icns")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testICNS_basic.icns")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
     }
 
@@ -55,15 +56,15 @@ public class ICNSParserTest {
     @Test
     public void testICNS() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/icns");
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/icns");
         metadata.set("Icons count", "2");
         metadata.set("Icons details", "16x16 (24 bpp), 32x32 (24 bpp)");
         metadata.set("Masked icon count", "2");
         metadata.set("Masked icon details", "16x16 (8 bpp), 32x32 (8 bpp)");
 
 
-        try (InputStream stream = getClass().getResourceAsStream("/test-documents/testICNS.icns")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testICNS.icns")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
     }
 }

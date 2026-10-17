@@ -17,14 +17,15 @@
 package org.apache.tika.parser.asm;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Set;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -33,6 +34,7 @@ import org.apache.tika.parser.Parser;
 /**
  * Parser for Java .class files.
  */
+@TikaComponent
 public class ClassParser implements Parser {
 
     /**
@@ -47,9 +49,9 @@ public class ClassParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        new XHTMLClassVisitor(handler, metadata).parse(stream);
+        new XHTMLClassVisitor(handler, metadata, context).parse(tis);
     }
 
 }

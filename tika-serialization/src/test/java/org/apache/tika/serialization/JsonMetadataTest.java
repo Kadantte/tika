@@ -16,25 +16,28 @@
  */
 package org.apache.tika.serialization;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.nio.file.Paths;
 
 import org.junit.jupiter.api.Test;
 
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 
 public class JsonMetadataTest {
 
     @Test
     public void testBasicSerializationAndDeserialization() throws Exception {
         Metadata metadata = new Metadata();
+        metadata.add(TikaCoreProperties.TIKA_CONTENT, "this is the content");
         metadata.add("k1", "v1");
         metadata.add("k1", "v2");
         //test duplicate value
@@ -54,7 +57,7 @@ public class JsonMetadataTest {
         StringWriter writer = new StringWriter();
         JsonMetadata.toJson(metadata, writer);
         Metadata deserialized = JsonMetadata.fromJson(new StringReader(writer.toString()));
-        assertEquals(7, deserialized.names().length);
+        assertEquals(8, deserialized.names().length);
         assertEquals(metadata, deserialized);
 
         //test that this really is 6 Chinese characters
@@ -66,11 +69,13 @@ public class JsonMetadataTest {
         writer = new StringWriter();
         JsonMetadata.setPrettyPrinting(true);
         JsonMetadata.toJson(metadata, writer);
-        assertTrue(writer
+        String expected = "{[NEWLINE]  \"alma_mater\" : \"普林斯顿大学\",[NEWLINE]  \"html\" : \"<html><body>&amp;&nbsp;</body></html>\"," +
+                "[NEWLINE]  \"json_escapes\" : \"the: \\\"quick\\\" brown, fox\"," +
+                "[NEWLINE]  \"k1\" : [ \"v1\", \"v2\" ],[NEWLINE]  \"k3\" : [ \"v3\", \"v3\" ],[NEWLINE]  \"k4\" : \"500,000\"," +
+                "[NEWLINE]  \"url\" : \"/myApp/myAction.html?method=router&cmd=1\",[NEWLINE]  \"tk:content\" : \"this is the content\"[NEWLINE]}";
+        assertEquals(expected, writer
                 .toString()
-                .replaceAll("\r\n", "\n")
-                .contains("\"json_escapes\" : \"the: \\\"quick\\\" brown, fox\",\n" + "  \"k1\" : [ \"v1\", \"v2\" ],\n" + "  \"k3\" : [ \"v3\", \"v3\" ],\n" +
-                        "  \"k4\" : \"500,000\",\n" + "  \"url\" : \"/myApp/myAction.html?method=router&cmd=1\"\n" + "}"));
+                .replaceAll("[\r\n]+", "[NEWLINE]"));
     }
 
     @Test
@@ -114,10 +119,7 @@ public class JsonMetadataTest {
     @Test
     public void testLargeValues() throws Exception {
         //TIKA-4154
-        TikaConfig tikaConfig = null;
-        try (InputStream is = JsonMetadata.class.getResourceAsStream("/config/tika-config-json.xml")) {
-            tikaConfig = new TikaConfig(is);
-        }
+        TikaLoader.load(Paths.get(JsonMetadata.class.getResource("/configs/tika-config-json.json").toURI()));
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 30000000; i++) {
             sb.append("v");
@@ -127,6 +129,27 @@ public class JsonMetadataTest {
         StringWriter writer = new StringWriter();
         JsonMetadata.toJson(m, writer);
         Metadata deserialized = JsonMetadata.fromJson(new StringReader(writer.toString()));
+        assertEquals(m, deserialized);
+    }
+
+    @Test
+    public void testInternalKeysRoundTrip() throws Exception {
+        //reserved keys must survive serialize->deserialize (reconstructed via Property).
+        Metadata m = new Metadata();
+        m.set(TikaCoreProperties.TIKA_CONTENT, "the content");
+        m.add(TikaCoreProperties.TIKA_PARSED_BY, "org.apache.tika.parser.DefaultParser");
+        m.add(TikaCoreProperties.TIKA_PARSED_BY, "org.apache.tika.parser.pdf.PDFParser");
+        m.add("k1", "v1");
+
+        StringWriter writer = new StringWriter();
+        JsonMetadata.toJson(m, writer);
+        Metadata deserialized = JsonMetadata.fromJson(new StringReader(writer.toString()));
+
+        assertEquals("the content", deserialized.get(TikaCoreProperties.TIKA_CONTENT));
+        assertArrayEquals(
+                new String[] {"org.apache.tika.parser.DefaultParser",
+                        "org.apache.tika.parser.pdf.PDFParser"},
+                deserialized.getValues(TikaCoreProperties.TIKA_PARSED_BY));
         assertEquals(m, deserialized);
     }
 }

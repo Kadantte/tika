@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,41 +25,42 @@ import java.io.InputStreamReader;
 import java.io.Reader;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.io.IOUtils;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
 import org.apache.tika.config.Initializable;
-import org.apache.tika.config.InitializableProblemHandler;
-import org.apache.tika.config.Param;
+import org.apache.tika.config.JsonConfig;
+import org.apache.tika.config.ParseTimeout;
 import org.apache.tika.detect.FileCommandDetector;
 import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.exception.TikaTimeoutException;
 import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
-import org.apache.tika.parser.external.ExternalParser;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.ProcessUtils;
 import org.apache.tika.utils.SystemUtils;
 
 /**
  * Parser that uses the "strings" (or strings-alternative) command to find the
  * printable strings in a object, or other binary, file
- * (application/octet-stream). Useful as "best-effort" parser for files detected
- * as application/octet-stream.
+ * (application/octet-tis). Useful as "best-effort" parser for files detected
+ * as application/octet-tis.
  *
  * @author gtotaro
  */
+@TikaComponent(spi = false)
 public class StringsParser implements Parser, Initializable {
     /**
      * Serial version UID
@@ -69,16 +70,23 @@ public class StringsParser implements Parser, Initializable {
     private static final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.OCTET_STREAM);
 
-    private final StringsConfig defaultStringsConfig = new StringsConfig();
-
-    private String filePath = "";
+    private StringsConfig defaultConfig = new StringsConfig();
 
     private FileCommandDetector fileCommandDetector;
 
     private boolean stringsPresent = false;
     private boolean hasEncodingOption = false;//whether or not the strings app allows -e
 
-    private String stringsPath = "";
+    public StringsParser() {
+    }
+
+    public StringsParser(StringsConfig config) {
+        this.defaultConfig = config;
+    }
+
+    public StringsParser(JsonConfig jsonConfig) {
+        defaultConfig = ConfigDeserializer.buildConfig(jsonConfig, StringsConfig.class);
+    }
 
     public static String getStringsProg() {
         return SystemUtils.IS_OS_WINDOWS ? "strings.exe" : "strings";
@@ -90,16 +98,15 @@ public class StringsParser implements Parser, Initializable {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         if (!stringsPresent) {
             return;
         }
-        StringsConfig stringsConfig = context.get(StringsConfig.class, defaultStringsConfig);
+        StringsConfig stringsConfig = context.get(StringsConfig.class, defaultConfig);
 
         try (TemporaryResources tmp = new TemporaryResources()) {
-            TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
             File input = tis.getFile();
 
             // Metadata
@@ -110,11 +117,11 @@ public class StringsParser implements Parser, Initializable {
             int totalBytes = 0;
 
             // Content
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
 
             xhtml.startDocument();
 
-            totalBytes = doStrings(input, stringsConfig, xhtml);
+            totalBytes = doStrings(input, stringsConfig, xhtml, context);
 
             xhtml.endDocument();
 
@@ -125,33 +132,31 @@ public class StringsParser implements Parser, Initializable {
 
     private String doFile(TikaInputStream tis) throws IOException {
         Metadata tmpMetadata = new Metadata();
-        fileCommandDetector.detect(tis, tmpMetadata);
-        return tmpMetadata.get(Metadata.CONTENT_TYPE);
+        fileCommandDetector.detect(tis, tmpMetadata, new ParseContext());
+        return tmpMetadata.get(HttpHeaders.CONTENT_TYPE);
     }
 
     /**
      * Checks if the "strings" command is supported.
-     *
-     * @return Returns returns {@code true} if the strings command is supported.
      */
     private void checkForStrings() {
-        String stringsProg = getStringsPath() + getStringsProg();
+        String stringsProg = defaultConfig.getStringsPath() + getStringsProg();
 
 
         String[] checkCmd = {stringsProg, "--version"};
         try {
-            stringsPresent = ExternalParser.check(checkCmd);
+            stringsPresent = ProcessUtils.checkCommand(checkCmd);
             if (!stringsPresent) {
                 return;
             }
             // Check if the -e option (encoding) is supported
             if (!SystemUtils.IS_OS_WINDOWS) {
                 String[] checkOpt =
-                        {stringsProg, "-e", "" + defaultStringsConfig.getEncoding().get(),
+                        {stringsProg, "-e", "" + defaultConfig.getEncoding().get(),
                                 "/dev/null"};
                 int[] errorValues =
                         {1, 2}; // Exit status code: 1 = general error; 2 = incorrect usage.
-                hasEncodingOption = ExternalParser.check(checkOpt, errorValues);
+                hasEncodingOption = ProcessUtils.checkCommand(checkOpt, errorValues);
             }
         } catch (NoClassDefFoundError ncdfe) {
             // This happens under OSGi + Fork Parser - see TIKA-1507
@@ -172,10 +177,11 @@ public class StringsParser implements Parser, Initializable {
      * @throws TikaException if the parsing process has been interrupted.
      * @throws SAXException
      */
-    private int doStrings(File input, StringsConfig config, XHTMLContentHandler xhtml)
+    private int doStrings(File input, StringsConfig config, XHTMLContentHandler xhtml,
+                          ParseContext context)
             throws IOException, TikaException, SAXException {
 
-        String stringsProg = getStringsPath() + getStringsProg();
+        String stringsProg = defaultConfig.getStringsPath() + getStringsProg();
 
         // Builds the command array
         ArrayList<String> cmdList = new ArrayList<>(4);
@@ -199,13 +205,16 @@ public class StringsParser implements Parser, Initializable {
         // Reads content printed out by "strings" command
         Thread gobbler = logStream(out, xhtml, totalBytes);
         gobbler.start();
+        long requestedMillis = config.getTimeoutMillis();
         try {
-            boolean completed = process.waitFor(config.getTimeoutSeconds(), TimeUnit.SECONDS);
+            long timeoutMillis = ParseTimeout.getOrCreate(context).budgetFor(requestedMillis);
+            boolean completed = ProcessUtils.waitForWithHeartbeat(process, context, timeoutMillis);
             if (!completed) {
-                throw new TimeoutException("timed out");
+                throw new TikaTimeoutException("strings process timed out", requestedMillis, timeoutMillis);
             }
             gobbler.join(10000);
-        } catch (InterruptedException | TimeoutException e) {
+            ParseTimeout.checkpoint(context);
+        } catch (InterruptedException e) {
             throw new TikaException("strings process failed", e);
         } finally {
             process.destroyForcibly();
@@ -214,10 +223,10 @@ public class StringsParser implements Parser, Initializable {
         return totalBytes.get();
     }
 
-    private Thread logStream(final InputStream stream, final ContentHandler handler,
+    private Thread logStream(final InputStream tis, final ContentHandler handler,
                              final AtomicInteger totalBytes) {
         return new Thread(() -> {
-            Reader reader = new InputStreamReader(stream, UTF_8);
+            Reader reader = new InputStreamReader(tis, UTF_8);
             char[] buffer = new char[1024];
             try {
                 for (int n = reader.read(buffer); n != -1; n = reader.read(buffer)) {
@@ -227,65 +236,20 @@ public class StringsParser implements Parser, Initializable {
             } catch (SAXException | IOException e) {
                 //swallow
             } finally {
-                IOUtils.closeQuietly(stream);
+                IOUtils.closeQuietly(tis);
             }
         });
     }
 
-    public String getStringsPath() {
-        return stringsPath;
-    }
-
-    /**
-     * Sets the "strings" installation folder.
-     *
-     * @param path the "strings" installation folder.
-     */
-    @Field
-    public void setStringsPath(String path) {
-        if (!path.isEmpty() && !path.endsWith(File.separator)) {
-            path += File.separatorChar;
-        }
-        this.stringsPath = path;
-    }
-
-    @Field
-    public void setEncoding(String encoding) {
-        defaultStringsConfig.setEncoding(StringsEncoding.valueOf(encoding));
-    }
-
-    public int getMinLength() {
-        return defaultStringsConfig.getMinLength();
-    }
-
-    @Field
-    public void setMinLength(int minLength) {
-        defaultStringsConfig.setMinLength(minLength);
-    }
-
-    public int getTimeoutSeconds() {
-        return defaultStringsConfig.getTimeoutSeconds();
-    }
-
-    @Field
-    public void setTimeoutSeconds(int timeoutSeconds) {
-        defaultStringsConfig.setTimeoutSeconds(timeoutSeconds);
-    }
-
-    public StringsEncoding getStringsEncoding() {
-        return defaultStringsConfig.getEncoding();
+    public StringsConfig getDefaultConfig() {
+        return defaultConfig;
     }
 
     @Override
-    public void initialize(Map<String, Param> params) throws TikaConfigException {
+    public void initialize() throws TikaConfigException {
         checkForStrings();
         fileCommandDetector = new FileCommandDetector();
-        fileCommandDetector.setFilePath(filePath);
-        fileCommandDetector.setTimeoutMs(defaultStringsConfig.getTimeoutSeconds() * 1000);
-    }
-
-    @Override
-    public void checkInitialization(InitializableProblemHandler problemHandler)
-            throws TikaConfigException {
+        fileCommandDetector.setFilePath(defaultConfig.getFilePath());
+        fileCommandDetector.setTimeoutMillis(defaultConfig.getTimeoutMillis());
     }
 }

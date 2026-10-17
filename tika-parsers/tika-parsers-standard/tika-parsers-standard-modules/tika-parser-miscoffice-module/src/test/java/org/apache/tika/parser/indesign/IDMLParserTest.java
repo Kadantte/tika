@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.indesign;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -22,7 +21,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.IDML;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.XMP;
 import org.apache.tika.parser.Parser;
 
@@ -41,10 +43,10 @@ public class IDMLParserTest extends TikaTest {
     public void testParserToText() throws Exception {
         Metadata metadata = new Metadata();
         String content = getText("testIndesign.idml", parser, metadata);
-        assertEquals("3", metadata.get("TotalPageCount"));
-        assertEquals("2", metadata.get("MasterSpreadPageCount"));
-        assertEquals("1", metadata.get("SpreadPageCount"));
-        assertEquals("application/vnd.adobe.indesign-idml-package", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("3", metadata.get(Office.PAGE_COUNT));
+        assertEquals("2", metadata.get(IDML.MASTER_SPREAD_PAGE_COUNT));
+        assertEquals("1", metadata.get(IDML.SPREAD_PAGE_COUNT));
+        assertEquals("application/vnd.adobe.indesign-idml-package", metadata.get(HttpHeaders.CONTENT_TYPE));
         // failure below could be because of missing javax.xml.bind if xmpbox 2.* is used
         // check the swallowed throwable in XMPMetadataExtractor.parse()
         assertEquals("2020-09-20T20:07:44Z", metadata.get(XMP.CREATE_DATE));
@@ -60,7 +62,7 @@ public class IDMLParserTest extends TikaTest {
         // failure below could be because of missing javax.xml.bind if xmpbox 2.* is used
         // check the swallowed throwable in XMPMetadataExtractor.parse()
         assertEquals("Adobe InDesign CC 14.0 (Windows)", metadata.get(XMP.CREATOR_TOOL));
-        assertEquals("3", metadata.get("TotalPageCount"));
+        assertEquals("3", metadata.get(Office.PAGE_COUNT));
         assertContains("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit", xml);
         assertContains("<meta name=\"xmp:CreatorTool\" content=\"Adobe InDesign CC 14.0 (Windows)\" />", xml);
     }

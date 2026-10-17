@@ -16,10 +16,8 @@
  */
 package org.apache.tika.parser.dbf;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Calendar;
@@ -31,15 +29,18 @@ import java.util.Set;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.detect.CharsetSupersets;
 import org.apache.tika.detect.EncodingDetector;
+import org.apache.tika.detect.EncodingResult;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
+import org.apache.tika.parser.AbstractEncodingDetectorParser;
 import org.apache.tika.parser.ParseContext;
-import org.apache.tika.parser.Parser;
-import org.apache.tika.parser.txt.Icu4jEncodingDetector;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 /**
@@ -50,7 +51,8 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * It caches the first 10 rows and then runs encoding dectection
  * on the "character" cells.
  */
-public class DBFParser implements Parser {
+@TikaComponent
+public class DBFParser extends AbstractEncodingDetectorParser {
 
     private static final int ROWS_TO_BUFFER_FOR_CHARSET_DETECTION = 10;
     private static final int MAX_CHARS_FOR_CHARSET_DETECTION = 20000;
@@ -59,17 +61,25 @@ public class DBFParser implements Parser {
     private static final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.application("x-dbf"));
 
+    public DBFParser() {
+        super();
+    }
+
+    public DBFParser(EncodingDetector encodingDetector) {
+        super(encodingDetector);
+    }
+
     @Override
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        DBFReader reader = DBFReader.open(stream);
+        DBFReader reader = DBFReader.open(tis);
         DBFFileHeader header = reader.getHeader();
-        metadata.set(Metadata.CONTENT_TYPE, header.getVersion().getFullMimeString());
+        metadata.set(HttpHeaders.CONTENT_TYPE, header.getVersion().getFullMimeString());
 
         //insert metadata here
         Calendar lastModified = header.getLastModified();
@@ -86,16 +96,18 @@ public class DBFParser implements Parser {
             row = reader.next();
         }
 
-        Charset charset = getCharset(firstRows, header);
-        metadata.set(Metadata.CONTENT_ENCODING, charset.toString());
+        Charset charset = getCharset(firstRows, header, context);
+        metadata.set(HttpHeaders.CONTENT_ENCODING, charset.toString());
+        //report detected (above); decode with its superset
+        Charset decodeAs = CharsetSupersets.decodeAs(charset);
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         xhtml.startElement("table");
         xhtml.startElement("thead");
         for (DBFColumnHeader col : header.getCols()) {
             xhtml.startElement("th");
-            xhtml.characters(col.getName(charset));
+            xhtml.characters(col.getName(decodeAs));
             xhtml.endElement("th");
         }
         xhtml.endElement("thead");
@@ -105,12 +117,12 @@ public class DBFParser implements Parser {
         //now write cached rows
         while (firstRows.size() > 0) {
             DBFRow cachedRow = firstRows.remove(0);
-            writeRow(cachedRow, charset, xhtml);
+            writeRow(cachedRow, decodeAs, xhtml);
         }
 
         //now continue with rest
         while (row != null) {
-            writeRow(row, charset, xhtml);
+            writeRow(row, decodeAs, xhtml);
             row = reader.next();
         }
         xhtml.endElement("tbody");
@@ -118,7 +130,7 @@ public class DBFParser implements Parser {
         xhtml.endDocument();
     }
 
-    private Charset getCharset(List<DBFRow> firstRows, DBFFileHeader header)
+    private Charset getCharset(List<DBFRow> firstRows, DBFFileHeader header, ParseContext parseContext)
             throws IOException, TikaException {
         //TODO: potentially use codepage info in the header
         Charset charset = DEFAULT_CHARSET;
@@ -136,9 +148,14 @@ public class DBFParser implements Parser {
         }
         byte[] bytes = bos.toByteArray();
         if (bytes.length > 20) {
-            EncodingDetector detector = new Icu4jEncodingDetector();
-            detector.detect(TikaInputStream.get(bytes), new Metadata());
-            charset = detector.detect(new ByteArrayInputStream(bytes), new Metadata());
+            EncodingDetector detector = getEncodingDetector(parseContext);
+            try (TikaInputStream tis = TikaInputStream.get(bytes)) {
+                List<EncodingResult> results =
+                        detector.detect(tis, new Metadata(), parseContext);
+                if (!results.isEmpty() && results.get(0).getCharset() != null) {
+                    charset = results.get(0).getCharset();
+                }
+            }
         }
         return charset;
     }

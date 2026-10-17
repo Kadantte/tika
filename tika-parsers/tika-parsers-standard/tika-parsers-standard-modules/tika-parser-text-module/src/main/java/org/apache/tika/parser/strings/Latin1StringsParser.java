@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,6 +25,8 @@ import java.util.Set;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -47,6 +49,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * <p>
  * The implementation is optimized for fast parsing with only one pass.
  */
+@TikaComponent(spi = false)
 public class Latin1StringsParser implements Parser {
 
     private static final long serialVersionUID = 1L;
@@ -188,17 +191,17 @@ public class Latin1StringsParser implements Parser {
     }
 
     /**
-     * @see org.apache.tika.parser.Parser#parse(java.io.InputStream,
+     * @see org.apache.tika.parser.Parser#parse(TikaInputStream,
      * org.xml.sax.ContentHandler, org.apache.tika.metadata.Metadata,
      * org.apache.tika.parser.ParseContext)
      */
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException {
         /*
          * Creates a new instance because the object is not immutable.
          */
-        new Latin1StringsParser().doParse(stream, handler, metadata, context);
+        new Latin1StringsParser().doParse(tis, handler, metadata, context);
     }
 
     /**
@@ -210,26 +213,26 @@ public class Latin1StringsParser implements Parser {
      * position is updated to the temp position. If it is not, the temp position
      * is reseted to the current position.
      *
-     * @param stream   the input stream.
+     * @param stream   the input tis.
      * @param handler  the output content handler
      * @param metadata the metadata of the file
      * @param context  the parsing context
      * @throws IOException  if an io error occurs
      * @throws SAXException if a sax error occurs
      */
-    private void doParse(InputStream stream, ContentHandler handler, Metadata metadata,
+    private void doParse(InputStream tis, ContentHandler handler, Metadata metadata,
                          ParseContext context) throws IOException, SAXException {
 
         tmpPos = 0;
         outPos = 0;
 
-        xhtml = new XHTMLContentHandler(handler, metadata);
+        xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         int i = 0;
         do {
             inSize = 0;
-            while ((i = stream.read(input, inSize, BUF_SIZE - inSize)) > 0) {
+            while ((i = tis.read(input, inSize, BUF_SIZE - inSize)) > 0) {
                 inSize += i;
             }
             inPos = 0;
@@ -240,7 +243,7 @@ public class Latin1StringsParser implements Parser {
                  * Test for a possible UTF8 encoded char
                  */
                 if (c == (byte) 0xC3) {
-                    byte c_ = inPos < inSize ? input[inPos++] : (byte) stream.read();
+                    byte c_ = inPos < inSize ? input[inPos++] : (byte) tis.read();
                     /*
                      * Test if the next byte is in the valid UTF8 range
                      */
@@ -259,7 +262,7 @@ public class Latin1StringsParser implements Parser {
                      * Test for a possible UTF8 encoded char
                      */
                 } else if (c == (byte) 0xC2) {
-                    byte c_ = inPos < inSize ? input[inPos++] : (byte) stream.read();
+                    byte c_ = inPos < inSize ? input[inPos++] : (byte) tis.read();
                     /*
                      * Test if the next byte is in the valid UTF8 range
                      */

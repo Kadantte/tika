@@ -17,8 +17,6 @@
 package org.apache.tika.parser.mp4;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
 import java.text.DecimalFormat;
 import java.text.NumberFormat;
 import java.util.Arrays;
@@ -33,7 +31,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import com.drew.imaging.mp4.Mp4Reader;
 import com.drew.metadata.Directory;
 import com.drew.metadata.MetadataException;
 import com.drew.metadata.mp4.Mp4BoxHandler;
@@ -43,18 +40,24 @@ import com.drew.metadata.mp4.media.Mp4VideoDirectory;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ExceptionReporting;
 import org.apache.tika.exception.RuntimeSAXException;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.Audio;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
+import org.apache.tika.metadata.TIFF;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.metadata.Video;
 import org.apache.tika.metadata.XMPDM;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.ExceptionUtils;
 import org.apache.tika.utils.StringUtils;
 
 /**
@@ -63,6 +66,7 @@ import org.apache.tika.utils.StringUtils;
  * <p>
  * This uses Drew Noakes' metadata-extractor: https://github.com/drewnoakes/metadata-extractor
  */
+@TikaComponent(name = "mp4-parser")
 public class MP4Parser implements Parser {
     /**
      * Serial version UID
@@ -76,6 +80,14 @@ public class MP4Parser implements Parser {
     private static final MediaType AUDIO_MP4 = MediaType.audio("mp4");
 
     private static final int MAX_ERROR_MESSAGES = 100;
+
+    //an accepted MP4 box whose declared payload exceeds this is skipped rather than
+    //loaded, so a crafted box size cannot force a multi-GB allocation. Cover art and
+    //other legitimate metadata boxes are well under this; configurable if a real file
+    //needs more. See TikaMp4Reader and TIKA-4812.
+    private static final long DEFAULT_MAX_BOX_SIZE = 100L * 1024L * 1024L;
+
+    private long maxBoxSize = DEFAULT_MAX_BOX_SIZE;
     static {
         // All types should be 4 bytes long, space padded as needed
         typesMap.put(MediaType.audio("mp4"), Arrays.asList("M4A ", "M4B ", "F4A ", "F4B "));
@@ -94,42 +106,60 @@ public class MP4Parser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    /**
+     * The maximum declared payload, in bytes, of an accepted MP4 box that will be
+     * read into memory; larger boxes are skipped. Guards against a crafted box size
+     * forcing a multi-GB allocation.
+     */
+    public long getMaxBoxSize() {
+        return maxBoxSize;
+    }
+
+    public void setMaxBoxSize(long maxBoxSize) {
+        if (maxBoxSize <= 0) {
+            throw new IllegalArgumentException("maxBoxSize must be positive: " + maxBoxSize);
+        }
+        this.maxBoxSize = maxBoxSize;
+    }
+
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        TemporaryResources tmp = new TemporaryResources();
-        TikaInputStream tstream = TikaInputStream.get(stream, tmp, metadata);
 
-        try (InputStream is = Files.newInputStream(tstream.getPath())) {
-
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
-            xhtml.startDocument();
-            com.drew.metadata.Metadata mp4Metadata = new com.drew.metadata.Metadata();
-            Mp4BoxHandler boxHandler = new TikaMp4BoxHandler(mp4Metadata, metadata, xhtml);
-            try {
-                Mp4Reader.extract(is, boxHandler);
-            } catch (RuntimeSAXException e) {
-                throw (SAXException) e.getCause();
-            }
-            //TODO -- figure out how to get IOExceptions out of boxhandler. Mp4Reader
-            //currently swallows IOExceptions.
-            final Collection<Mp4Directory> mp4Directories =
-                    mp4Metadata.getDirectoriesOfType(Mp4Directory.class);
-            final Set<String> errorMessages = processMp4Directories(mp4Directories, metadata);
-
-            // Despite the brand, if we ONLY have audio streams with no video
-            if (isAudioOnly(mp4Directories)) {
-                // Mark this as audio/mp4
-                metadata.set(Metadata.CONTENT_TYPE, AUDIO_MP4.toString());
-            }
-
-            for (String m : errorMessages) {
-                metadata.add(TikaCoreProperties.TIKA_META_EXCEPTION_WARNING, m);
-            }
-            xhtml.endDocument();
-        } finally {
-            tmp.dispose();
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
+        xhtml.startDocument();
+        com.drew.metadata.Metadata mp4Metadata = new com.drew.metadata.Metadata();
+        Mp4BoxHandler boxHandler = new TikaMp4BoxHandler(mp4Metadata, metadata, xhtml, context);
+        //we used to spool to disk and then read from that with sannies parser.
+        //we think that drewnoakes' parser streams the data so we don't need to spool
+        //when the length is known (file-backed), pass it so a box that claims more than
+        //the input holds is skipped rather than allocated
+        long inputLength = tis.hasLength() ? tis.getLength() : -1;
+        try {
+            TikaMp4Reader.extract(tis, boxHandler, maxBoxSize, inputLength, metadata, context);
+        } catch (RuntimeSAXException e) {
+            throw (SAXException) e.getCause();
         }
+        //TODO -- figure out how to get IOExceptions out of boxhandler. Mp4Reader
+        //currently swallows IOExceptions.
+        final Collection<Mp4Directory> mp4Directories = mp4Metadata.getDirectoriesOfType(Mp4Directory.class);
+        final Set<String> errorMessages = processMp4Directories(mp4Directories, metadata);
+
+        // Despite the brand, if we ONLY have audio streams with no video
+        if (isAudioOnly(mp4Directories)) {
+            // Mark this as audio/mp4
+            metadata.set(HttpHeaders.CONTENT_TYPE, AUDIO_MP4.toString());
+        }
+
+        //the library's error strings quote document content: FULL-only, nothing survives redaction
+        ExceptionReporting reporting = ExceptionReporting.get(context);
+        if (reporting.getLevel() == ExceptionReporting.Level.FULL) {
+            for (String m : errorMessages) {
+                metadata.add(TikaCoreProperties.TIKA_META_EXCEPTION_WARNING,
+                        ExceptionUtils.truncate(m, reporting.getMaxLength()));
+            }
+        }
+        xhtml.endDocument();
     }
 
     private Set<String> processMp4Directories(Collection<Mp4Directory> mp4Directories,
@@ -159,11 +189,17 @@ public class MP4Parser implements Parser {
     }
 
     private void processMp4VideoDirectory(Mp4VideoDirectory mp4Directory, Metadata metadata) {
-        addInt(mp4Directory, metadata, Mp4VideoDirectory.TAG_HEIGHT, Metadata.IMAGE_LENGTH);
-        addInt(mp4Directory, metadata, Mp4VideoDirectory.TAG_WIDTH, Metadata.IMAGE_WIDTH);
+        addInt(mp4Directory, metadata, Mp4VideoDirectory.TAG_HEIGHT, TIFF.IMAGE_LENGTH);
+        addInt(mp4Directory, metadata, Mp4VideoDirectory.TAG_WIDTH, TIFF.IMAGE_WIDTH);
         if (mp4Directory.containsTag(Mp4VideoDirectory.TAG_COMPRESSOR_NAME)) {
             String compressor = mp4Directory.getString(Mp4VideoDirectory.TAG_COMPRESSOR_NAME);
             metadata.set(XMPDM.VIDEO_COMPRESSOR, compressor);
+        }
+        Float frameRate = mp4Directory.getFloatObject(Mp4VideoDirectory.TAG_FRAME_RATE);
+        if (frameRate != null) {
+            // set as the float's own string: set(Property, double) would widen it
+            // and print the double-rounding artefact (e.g. 29.969999...).
+            metadata.set(Video.FRAME_RATE, frameRate.toString());
         }
     }
 
@@ -195,9 +231,12 @@ public class MP4Parser implements Parser {
                                         Metadata metadata) {
         addInt(mp4SoundDirectory, metadata, Mp4SoundDirectory.TAG_AUDIO_SAMPLE_RATE,
                 XMPDM.AUDIO_SAMPLE_RATE);
+        addInt(mp4SoundDirectory, metadata, Mp4SoundDirectory.TAG_AUDIO_SAMPLE_SIZE,
+                Audio.BITS_PER_SAMPLE);
 
         try {
             int numChannels = mp4SoundDirectory.getInt(Mp4SoundDirectory.TAG_NUMBER_OF_CHANNELS);
+            metadata.set(Audio.CHANNELS, numChannels);
 
             if (numChannels == 1) {
                 metadata.set(XMPDM.AUDIO_CHANNEL_TYPE, "Mono");
@@ -296,10 +335,10 @@ public class MP4Parser implements Parser {
             }
         }
         MediaType type = typeHolder.orElse(MediaType.application("mp4"));
-        if (metadata.getValues(Metadata.CONTENT_TYPE) == null) {
-            metadata.set(Metadata.CONTENT_TYPE, type.toString());
+        if (metadata.getValues(HttpHeaders.CONTENT_TYPE) == null) {
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
         } else if (! type.equals(APPLICATION_MP4)) { //todo check for specialization?
-            metadata.set(Metadata.CONTENT_TYPE, type.toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
         }
         if (type.getType().equals("audio") && ! StringUtils.isBlank(majorBrand)) {
             metadata.set(XMPDM.AUDIO_COMPRESSOR, majorBrand.trim());

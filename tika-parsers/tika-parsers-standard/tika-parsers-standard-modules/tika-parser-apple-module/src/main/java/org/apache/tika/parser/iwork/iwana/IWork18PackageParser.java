@@ -14,11 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.iwork.iwana;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -27,21 +25,31 @@ import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.compress.archivers.zip.ZipFile;
+import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.extractor.EmbeddedDocumentExtractor;
+import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
+import org.apache.tika.sax.XHTMLContentHandler;
 
 /**
- * For now, this parser isn't even registered.  It contains
- * code that will detect the newer 2018 .keynote, .numbers, .pages files.
+ * Detects the newer 2018 .keynote, .numbers, .pages files and emits their
+ * preview image as a thumbnail; the content itself is not parsed yet.
  */
+@TikaComponent
 public class IWork18PackageParser implements Parser {
 
     private final static Set<MediaType> supportedTypes = Collections.unmodifiableSet(
@@ -55,34 +63,39 @@ public class IWork18PackageParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         // Open the Zip stream
         // Use a File if we can, and an already open zip is even better
         ZipFile zipFile = null;
         ZipInputStream zipStream = null;
-        if (stream instanceof TikaInputStream) {
-            TikaInputStream tis = (TikaInputStream) stream;
-            Object container = ((TikaInputStream) stream).getOpenContainer();
-            if (container instanceof ZipFile) {
-                zipFile = (ZipFile) container;
-            } else if (tis.hasFile()) {
-                zipFile = ZipFile.builder().setFile(tis.getFile()).get();
-            } else {
-                zipStream = new ZipInputStream(stream);
-            }
+        Object container = tis.getOpenContainer();
+        if (container instanceof ZipFile) {
+            zipFile = (ZipFile) container;
+        } else if (tis.hasFile()) {
+            zipFile = ZipFile.builder().setFile(tis.getFile()).get();
+            //closed with the stream, as the zip container detector does it
+            tis.setOpenContainer(zipFile);
         } else {
-            zipStream = new ZipInputStream(stream);
+            zipStream = new ZipInputStream(tis);
         }
 
-        // For now, just detect
+        // Detect the type, and emit the document preview as the thumbnail;
+        // the content itself is not parsed yet
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
+        xhtml.startDocument();
         MediaType type = null;
         if (zipFile != null) {
-            Enumeration<? extends ZipEntry> entries = zipFile.getEntries();
+            Enumeration<? extends ZipArchiveEntry> entries = zipFile.getEntries();
             while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
+                ZipArchiveEntry entry = entries.nextElement();
                 if (type == null) {
                     type = IWork18DocumentType.detectIfPossible(entry);
+                }
+                if (isPreview(entry) && zipFile.canReadEntryData(entry)) {
+                    try (TikaInputStream previewStream = entryStream(zipFile, entry)) {
+                        handleThumbnail(entry, previewStream, xhtml, context);
+                    }
                 }
             }
         } else {
@@ -91,11 +104,47 @@ public class IWork18PackageParser implements Parser {
                 if (type == null) {
                     type = IWork18DocumentType.detectIfPossible(entry);
                 }
+                if (isPreview(entry)) {
+                    try (TikaInputStream previewStream =
+                                 TikaInputStream.get(CloseShieldInputStream.wrap(zipStream))) {
+                        handleThumbnail(entry, previewStream, xhtml, context);
+                    }
+                }
                 entry = zipStream.getNextEntry();
             }
         }
         if (type != null) {
-            metadata.add(Metadata.CONTENT_TYPE, type.toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
+        }
+        xhtml.endDocument();
+    }
+
+    /**
+     * The document preview, {@code preview.jpg} inside the package's
+     * document directory (e.g. {@code Presentation.key/preview.jpg}).
+     */
+    private static boolean isPreview(ZipEntry entry) {
+        String name = entry.getName();
+        return name.equals("preview.jpg") || name.endsWith("/preview.jpg");
+    }
+    /** Re-opened from the zip on rewind rather than cached: the entry is in the container already. */
+    private static TikaInputStream entryStream(ZipFile zipFile, ZipArchiveEntry entry) {
+        return TikaInputStream.get(() -> zipFile.getInputStream(entry), new TemporaryResources(), null);
+    }
+
+
+    private static void handleThumbnail(ZipEntry entry, TikaInputStream previewStream,
+                                        XHTMLContentHandler xhtml, ParseContext context)
+            throws IOException, SAXException {
+        EmbeddedDocumentExtractor extractor =
+                EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
+        Metadata embeddedMetadata = Metadata.newInstance(context);
+        embeddedMetadata.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
+                TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString());
+        embeddedMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, entry.getName());
+        embeddedMetadata.set(HttpHeaders.CONTENT_TYPE, "image/jpeg");
+        if (extractor.shouldParseEmbedded(embeddedMetadata, context)) {
+            extractor.parseEmbedded(previewStream, xhtml, embeddedMetadata, context, true);
         }
     }
 

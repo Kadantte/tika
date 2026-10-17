@@ -20,7 +20,7 @@
   <parent>
     <groupId>org.apache.tika</groupId>
     <artifactId>tika-parent</artifactId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
     <relativePath>../tika-parent/pom.xml</relativePath>
   </parent>
 
@@ -30,27 +30,42 @@
   <packaging>pom</packaging>
 
   <modules>
+    <module>tika-pipes-api</module>
+    <module>tika-pipes-core</module>
     <module>tika-httpclient-commons</module>
-    <module>tika-fetchers</module>
-    <module>tika-emitters</module>
-    <module>tika-pipes-iterators</module>
-    <module>tika-pipes-reporters</module>
+    <module>tika-pipes-reporter-commons</module>
+    <module>tika-pipes-iterator-commons</module>
+    <module>tika-pipes-plugins</module>
+    <module>tika-pipes-config-store-ignite</module>
+    <module>tika-pipes-fork-parser</module>
     <module>tika-async-cli</module>
+    <module>tika-pipes-integration-tests</module>
   </modules>
   <dependencies>
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>
       <artifactId>log4j-core</artifactId>
-      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>
       <artifactId>log4j-slf4j2-impl</artifactId>
-      <scope>test</scope>
     </dependency>
   </dependencies>
   <build>
     <plugins>
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>tika-pipes-integration-tests/src/test/resources/test-documents/file-list.txt</inputExclude>
+            <inputExclude>tika-pipes-integration-tests/src/test/resources/test-documents/testOverlappingText.pdf</inputExclude>
+            <inputExclude>tika-pipes-plugins/tika-pipes-csv/src/test/resources/test-simple.csv</inputExclude>
+            <inputExclude>tika-pipes-core/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>**/*.md</inputExclude> <!-- markdown files -->
+          </inputExcludes>
+        </configuration>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-checkstyle-plugin</artifactId>
@@ -87,6 +102,6 @@
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

@@ -1,0 +1,81 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Getting Started with the Java API
+
+== Consider a service first
+
+For most use cases, run Tika as a separate service rather than embedding it:
+xref:using-tika/server/index.adoc[tika-server] (REST) or
+xref:using-tika/grpc/index.adoc[tika-grpc]. A parser crash then cannot affect your application,
+you deploy from the official https://hub.docker.com/r/apache/tika[Docker images], you can call it
+from any language, and you upgrade Tika independently of your own release cycle.
+
+Embed the Java API when you need tight integration with Tika internals, cannot run a network
+service, or have customization requirements a service cannot express.
+
+== PipesForkParser
+
+If you do embed Tika, use `PipesForkParser` from `tika-pipes-fork-parser`. It parses in a separate
+JVM — process isolation, automatic restart after a crash, configurable timeouts — and is
+thread-safe, so one instance serves many threads.
+
+[source,xml,subs=attributes+]
+----
+<dependency>
+    <groupId>org.apache.tika</groupId>
+    <artifactId>tika-pipes-fork-parser</artifactId>
+    <version>{tika-version}</version>
+</dependency>
+----
+
+[source,java]
+----
+import java.nio.file.Path;
+import org.apache.tika.pipes.fork.PipesForkParser;
+import org.apache.tika.pipes.fork.PipesForkResult;
+
+Path file = Path.of("/path/to/document.pdf");
+
+try (PipesForkParser parser = new PipesForkParser()) {
+    PipesForkResult result = parser.parse(file);
+
+    if (result.isSuccess()) {
+        String content = result.getContent();
+        // process content...
+    } else {
+        // handle failure
+    }
+}
+----
+
+See
+https://github.com/apache/tika/blob/main/tika-example/src/main/java/org/apache/tika/example/PipesForkParserExample.java[PipesForkParserExample.java]
+in the `tika-example` module for embedded documents, custom configuration, error handling and batch
+processing. `PipesForkParser` reads local files only; for other sources and destinations, or for
+a whole iterator-to-emitter pipeline, see xref:using-tika/java-api/pipes.adoc[Tika Pipes from Java].
+
+== Without process isolation
+
+WARNING: Calling parsers directly — `AutoDetectParser` and friends — on untrusted content can
+cause OutOfMemoryErrors, infinite loops, and crashes that take down your whole application. Never
+run Tika in the same JVM as critical infrastructure.
+
+If you go that route, your application owns the isolation: Tika cannot enforce a parse timeout, a
+memory limit, a process kill, or a crash recovery without a separate process. Read
+xref:advanced/robustness.adoc[The Robustness of Apache Tika] and the
+https://tika.apache.org/security-model.html[Apache Tika Security Model] first.

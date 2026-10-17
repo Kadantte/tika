@@ -14,273 +14,377 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core.resource;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.tika.server.core.resource.TikaResource.fillMetadata;
-import static org.apache.tika.server.core.resource.TikaResource.fillParseContext;
 
-import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.POST;
 import jakarta.ws.rs.PUT;
-import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriInfo;
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVPrinter;
-import org.apache.commons.io.FilenameUtils;
-import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.input.UnsynchronizedByteArrayInputStream;
-import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
-import org.apache.commons.lang3.StringUtils;
-import org.apache.commons.lang3.mutable.MutableInt;
+import jakarta.ws.rs.core.StreamingOutput;
+import org.apache.cxf.jaxrs.ext.multipart.Attachment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.xml.sax.ContentHandler;
-import org.xml.sax.SAXException;
-import org.xml.sax.helpers.DefaultHandler;
 
-import org.apache.tika.exception.TikaMemoryLimitException;
-import org.apache.tika.extractor.DefaultEmbeddedStreamTranslator;
-import org.apache.tika.extractor.EmbeddedDocumentExtractor;
-import org.apache.tika.extractor.EmbeddedStreamTranslator;
-import org.apache.tika.io.BoundedInputStream;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.mime.MimeTypeException;
-import org.apache.tika.parser.DigestingParser;
 import org.apache.tika.parser.ParseContext;
-import org.apache.tika.parser.Parser;
-import org.apache.tika.sax.BodyContentHandler;
-import org.apache.tika.sax.RichTextContentHandler;
+import org.apache.tika.pipes.core.extractor.UnpackConfig;
 
-@Path("/unpack")
+/**
+ * JAX-RS resource for unpacking embedded documents from container files.
+ * <p>
+ * This endpoint uses process-isolated parsing via tika-pipes with ParseMode.UNPACK.
+ * Embedded documents are extracted and returned as a zip archive.
+ * <p>
+ * <b>Endpoints:</b>
+ * <ul>
+ *   <li>PUT /unpack - Extract embedded documents (raw body)</li>
+ *   <li>POST /unpack - Extract with config (multipart: file + optional JSON config)</li>
+ *   <li>PUT /unpack/all - Extract embedded + container text/metadata</li>
+ *   <li>POST /unpack/all - Extract all with config (multipart)</li>
+ * </ul>
+ * <p>
+ * <b>Configuration:</b>
+ * <p>
+ * None required. The server wires up its own {@code __}-prefixed fetcher and emitter against
+ * temp directories it owns, confined by {@code basePath}. Those ids are reserved and a request
+ * that names one is rejected.
+ * <p>
+ * <b>Multipart Configuration (POST endpoints):</b>
+ * <p>
+ * Submit as multipart/form-data with:
+ * <ul>
+ *   <li>"file" part: the document to unpack</li>
+ *   <li>"config" part (optional): JSON configuration</li>
+ * </ul>
+ * <p>
+ * Example config JSON:
+ * <pre>
+ * {
+ *   "parse-context": {
+ *     "unpack-config": {
+ *       "suffixStrategy": "DETECTED",
+ *       "includeOriginal": true
+ *     },
+ *     "standard-unpack-selector": {
+ *       "includeMimeTypes": ["image/jpeg", "image/png"],
+ *       "excludeMimeTypes": ["application/pdf"]
+ *     },
+ *     "embedded-limits": {
+ *       "maxDepth": 5,
+ *       "maxCount": 100
+ *     }
+ *   }
+ * }
+ * </pre>
+ * <p>
+ * <b>Output format:</b>
+ * <p>
+ * The response is a Frictionless Data Package (datapackage.json manifest with SHA256 hashes,
+ * files under unpacked/):
+ * <pre>
+ * output.zip
+ * ├── datapackage.json      # Manifest with file list, SHA256 hashes, mimetypes
+ * ├── metadata.json         # Full RMETA metadata (unless includeMetadata=false)
+ * └── unpacked/
+ *     ├── 00000001.pdf
+ *     ├── 00000002.png
+ *     └── ...
+ * </pre>
+ * The pre-4.2 flat zip (files at the root, no manifest) is still available:
+ * <pre>
+ * {
+ *   "parse-context": {
+ *     "unpack-config": { "outputFormat": "REGULAR" }
+ *   }
+ * }
+ * </pre>
+ * <p>
+ * <b>Breaking Changes from Pre-4.0:</b>
+ * <ul>
+ *   <li>Parsing now runs in a separate process for memory safety</li>
+ *   <li>Configuration via HTTP headers is no longer supported; use multipart JSON config</li>
+ *   <li>Custom EmbeddedDocumentExtractor in ParseContext is ignored; use UnpackSelector</li>
+ *   <li>The unpackMaxBytes header is removed; use embedded-limits in config</li>
+ * </ul>
+ */
+@jakarta.ws.rs.Path("/unpack")
 public class UnpackerResource {
-    public static final String TEXT_FILENAME = "__TEXT__";
-    public static final String META_FILENAME = "__METADATA__";
-
-    public static final String UNPACK_MAX_BYTES_KEY = "unpackMaxBytes";
-
-    private static final long DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
     private static final Logger LOG = LoggerFactory.getLogger(UnpackerResource.class);
 
-    public static void metadataToCsv(Metadata metadata, OutputStream outputStream) throws IOException {
-        CSVPrinter writer = new CSVPrinter(new OutputStreamWriter(outputStream, UTF_8), CSVFormat.EXCEL);
+    private static final String HANDLER_TYPE_PARAM = "handler";
 
-        for (String name : metadata.names()) {
-            String[] values = metadata.getValues(name);
-            ArrayList<String> list = new ArrayList<>(values.length + 1);
-            list.add(name);
-            list.addAll(Arrays.asList(values));
-            writer.printRecord(list);
+    private final TikaResource tikaResource;
+
+    public UnpackerResource(TikaResource tikaResource) {
+        this.tikaResource = tikaResource;
+        // DIRECTORY can never serve /unpack, which returns one zip: fail at startup
+        UnpackConfig configured = tikaResource.newConfigUnpackConfig();
+        if (configured != null && configured.getOutputMode() == UnpackConfig.OUTPUT_MODE.DIRECTORY) {
+            throw new IllegalStateException(
+                    "unpack-config.outputMode DIRECTORY cannot serve /unpack, which returns one "
+                            + "zip. Set ZIPPED, or disable the unpack endpoint and use /pipes or "
+                            + "/async for per-file emission.");
+        }
+    }
+
+    /**
+     * Extracts embedded documents from a container file (simple PUT, no config).
+     * Returns a zip archive containing the extracted files.
+     *
+     * @param is input stream containing the document
+     * @param httpHeaders HTTP headers
+     * @param info URI info
+     * @return streaming zip response
+     */
+    @jakarta.ws.rs.Path("")
+    @PUT
+    @Produces("application/zip")
+    public Response unpack(InputStream is, @Context HttpHeaders httpHeaders) throws Exception {
+        ParseContext pc = tikaResource.createRequestContext();
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = TikaInputStream.get(is)) {
+            fillMetadata(null, metadata, httpHeaders.getRequestHeaders());
+            TikaResource.logRequest(LOG, "/unpack", metadata);
+            return doUnpack(tis, metadata, pc, false);
+        }
+    }
+
+    /**
+     * Extracts embedded documents with configuration (multipart POST).
+     * Accepts multipart/form-data with "file" and optional "config" parts.
+     *
+     * @param attachments multipart attachments
+     * @param httpHeaders HTTP headers
+     * @param info URI info
+     * @return streaming zip response
+     */
+    @jakarta.ws.rs.Path("")
+    @POST
+    @Consumes("multipart/form-data")
+    @Produces("application/zip")
+    public Response unpackWithConfig(List<Attachment> attachments,
+                                     @Context HttpHeaders httpHeaders) throws Exception {
+        ParseContext pc = tikaResource.createRequestContext();
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = tikaResource.setupMultipartConfig(attachments, metadata, pc)) {
+            rejectDirectoryMode(pc);
+            TikaResource.logRequest(LOG, "/unpack", metadata);
+            return doUnpack(tis, metadata, pc, false);
+        }
+    }
+
+    /**
+     * Extracts embedded documents plus original document and metadata (simple PUT).
+     * Returns a zip archive containing extracted files, original document, and metadata.
+     *
+     * @param is input stream containing the document
+     * @param httpHeaders HTTP headers
+     * @param info URI info
+     * @return streaming zip response
+     */
+    @jakarta.ws.rs.Path("/all")
+    @PUT
+    @Produces("application/zip")
+    public Response unpackAll(InputStream is, @Context HttpHeaders httpHeaders) throws Exception {
+        return unpackAll(is, httpHeaders, null);
+    }
+
+    /** As {@code /unpack/all}, with the handler for the metadata's {@code tk:content} in the path. */
+    @jakarta.ws.rs.Path("/all/{" + HANDLER_TYPE_PARAM + "}")
+    @PUT
+    @Produces("application/zip")
+    public Response unpackAll(InputStream is, @Context HttpHeaders httpHeaders,
+                              @jakarta.ws.rs.PathParam(HANDLER_TYPE_PARAM) String handlerTypeName)
+            throws Exception {
+        ParseContext pc = tikaResource.createRequestContext();
+        applyHandler(pc, handlerTypeName);
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = TikaInputStream.get(is)) {
+            fillMetadata(null, metadata, httpHeaders.getRequestHeaders());
+            TikaResource.logRequest(LOG, "/unpack/all", metadata);
+            return doUnpack(tis, metadata, pc, true);
+        }
+    }
+
+    /**
+     * Extracts embedded documents plus original/metadata with config (multipart POST).
+     * Accepts multipart/form-data with "file" and optional "config" parts.
+     *
+     * @param attachments multipart attachments
+     * @param httpHeaders HTTP headers
+     * @param info URI info
+     * @return streaming zip response
+     */
+    @jakarta.ws.rs.Path("/all")
+    @POST
+    @Consumes("multipart/form-data")
+    @Produces("application/zip")
+    public Response unpackAllWithConfig(List<Attachment> attachments,
+                                        @Context HttpHeaders httpHeaders) throws Exception {
+        return unpackAllWithConfig(attachments, httpHeaders, null);
+    }
+
+    /**
+     * The config-variant spelling, {@code POST /unpack/all/config}: the same as
+     * {@code POST /unpack/all}. 4.0 accepted it by accident (the wildcard route swallowed the
+     * segment) and documented it; kept so it does not turn into a handler named "config".
+     */
+    @jakarta.ws.rs.Path("/all/config")
+    @POST
+    @Consumes("multipart/form-data")
+    @Produces("application/zip")
+    public Response unpackAllConfig(List<Attachment> attachments, @Context HttpHeaders httpHeaders)
+            throws Exception {
+        return unpackAllWithConfig(attachments, httpHeaders, null);
+    }
+
+    /** As {@code POST /unpack/all/config}, with the sidecar handler named in the path, like {@code /rmeta/config/{handlerType}}. */
+    @jakarta.ws.rs.Path("/all/config/{" + HANDLER_TYPE_PARAM + "}")
+    @POST
+    @Consumes("multipart/form-data")
+    @Produces("application/zip")
+    public Response unpackAllConfig(List<Attachment> attachments, @Context HttpHeaders httpHeaders,
+                                    @jakarta.ws.rs.PathParam(HANDLER_TYPE_PARAM) String handlerTypeName)
+            throws Exception {
+        return unpackAllWithConfig(attachments, httpHeaders, handlerTypeName);
+    }
+
+    /** As {@code POST /unpack/all}, with the sidecar handler named in the path. */
+    @jakarta.ws.rs.Path("/all/{" + HANDLER_TYPE_PARAM + "}")
+    @POST
+    @Consumes("multipart/form-data")
+    @Produces("application/zip")
+    public Response unpackAllWithConfig(List<Attachment> attachments, @Context HttpHeaders httpHeaders,
+                                        @jakarta.ws.rs.PathParam(HANDLER_TYPE_PARAM) String handlerTypeName)
+            throws Exception {
+        ParseContext pc = tikaResource.createRequestContext();
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = tikaResource.setupMultipartConfig(attachments, metadata, pc)) {
+            rejectDirectoryMode(pc);
+            applyHandler(pc, handlerTypeName);
+            TikaResource.logRequest(LOG, "/unpack/all", metadata);
+            return doUnpack(tis, metadata, pc, true);
+        }
+    }
+
+    /**
+     * As {@code /unpack}, with the named preset's parse-context fragment applied.
+     * Takes no config part -- a preset never combines with request configuration.
+     */
+    @jakarta.ws.rs.Path("/preset/{presetName}")
+    @PUT
+    @Produces("application/zip")
+    public Response unpackWithPreset(InputStream is, @Context HttpHeaders httpHeaders,
+                                     @jakarta.ws.rs.PathParam("presetName") String presetName)
+            throws Exception {
+        ParseContext pc = tikaResource.createPresetContext(presetName);
+        rejectDirectoryMode(pc);
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = TikaInputStream.get(is)) {
+            fillMetadata(null, metadata, httpHeaders.getRequestHeaders());
+            TikaResource.logRequest(LOG, "/unpack", metadata);
+            return doUnpack(tis, metadata, pc, false);
+        }
+    }
+
+    /**
+     * As {@code /unpack/all}, with the named preset's parse-context fragment applied.
+     */
+    @jakarta.ws.rs.Path("/preset/{presetName}/all")
+    @PUT
+    @Produces("application/zip")
+    public Response unpackAllWithPreset(InputStream is, @Context HttpHeaders httpHeaders,
+                                        @jakarta.ws.rs.PathParam("presetName") String presetName)
+            throws Exception {
+        ParseContext pc = tikaResource.createPresetContext(presetName);
+        rejectDirectoryMode(pc);
+        Metadata metadata = tikaResource.newRequestMetadata();
+        try (TikaInputStream tis = TikaInputStream.get(is)) {
+            fillMetadata(null, metadata, httpHeaders.getRequestHeaders());
+            TikaResource.logRequest(LOG, "/unpack/all", metadata);
+            return doUnpack(tis, metadata, pc, true);
+        }
+    }
+
+    /** A request asking for DIRECTORY contradicts the one-zip transport: 400, not a silent pin. */
+    static void rejectDirectoryMode(ParseContext pc) {
+        UnpackConfig requested = pc.get(UnpackConfig.class);
+        if (requested != null && requested.getOutputMode() == UnpackConfig.OUTPUT_MODE.DIRECTORY) {
+            throw new jakarta.ws.rs.BadRequestException(
+                    "unpack-config.outputMode DIRECTORY emits each file as its own item; /unpack "
+                            + "returns one zip. Omit outputMode here, or use /pipes or /async.");
+        }
+    }
+
+    /** Same rule as /tika and /rmeta: a handler named in the path and the config part is a 400. */
+    private void applyHandler(ParseContext pc, String handlerTypeName) {
+        // a truncated preset URL parses as a handler; point at the real route instead
+        if ("preset".equals(handlerTypeName)) {
+            throw new jakarta.ws.rs.NotFoundException(
+                    "preset routes are PUT /unpack/preset/{name}[/all]");
+        }
+        tikaResource.applyExplicitFormat(pc, handlerTypeName,
+                handlerTypeName != null && !handlerTypeName.isBlank());
+    }
+
+    /**
+     * Core unpack logic using pipes-based parsing.
+     * The child process creates the zip file, and we stream it directly back.
+     *
+     * @param tis spooled input stream
+     * @param metadata document metadata
+     * @param pc parse context (may contain UnpackConfig, UnpackSelector, EmbeddedLimits)
+     * @param saveAll if true, include original document and metadata in the zip
+     * @return streaming response with the zip file
+     */
+    private Response doUnpack(TikaInputStream tis, Metadata metadata, ParseContext pc, boolean saveAll) throws Exception {
+        PipesParsingHelper helper = tikaResource.getPipesParsingHelper();
+        if (helper == null) {
+            throw new WebApplicationException("Pipes-based parsing is not enabled", Response.Status.SERVICE_UNAVAILABLE);
         }
 
-        writer.close();
-    }
-
-    @Path("/{id:(/.*)?}")
-    @PUT
-    @Produces({"application/zip", "application/x-tar"})
-    public Map<String, byte[]> unpack(InputStream is, @Context HttpHeaders httpHeaders, @Context UriInfo info) throws Exception {
-        return process(TikaResource.getInputStream(is, new Metadata(), httpHeaders, info), httpHeaders, info, false);
-    }
-
-    @Path("/all{id:(/.*)?}")
-    @PUT
-    @Produces({"application/zip", "application/x-tar"})
-    public Map<String, byte[]> unpackAll(InputStream is, @Context HttpHeaders httpHeaders, @Context UriInfo info) throws Exception {
-        return process(TikaResource.getInputStream(is, new Metadata(), httpHeaders, info), httpHeaders, info, true);
-    }
-
-    private Map<String, byte[]> process(InputStream is, @Context HttpHeaders httpHeaders, @Context UriInfo info, boolean saveAll) throws Exception {
-        Metadata metadata = new Metadata();
-        ParseContext pc = new ParseContext();
-        long unpackMaxBytes = DEFAULT_MAX_ATTACHMENT_BYTES;
-        String unpackMaxBytesString = httpHeaders
-                .getRequestHeaders()
-                .getFirst(UNPACK_MAX_BYTES_KEY);
-        if (!StringUtils.isBlank(unpackMaxBytesString)) {
-            unpackMaxBytes = Long.parseLong(unpackMaxBytesString);
-            if (unpackMaxBytes > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("Can't request value > than Integer" + ".MAX_VALUE : " + unpackMaxBytes);
-            } else if (unpackMaxBytes < 0) {
-                throw new IllegalArgumentException("Can't request value < 0: " + unpackMaxBytes);
+        // parseUnpack mutates this and so overrides the worker's own config; seed it from the
+        // config's unpack-config (a per-request instance) rather than from defaults. A config
+        // supplied by the request itself already sits in pc and wins, as before.
+        if (pc.get(UnpackConfig.class) == null) {
+            UnpackConfig fromConfig = tikaResource.newConfigUnpackConfig();
+            if (fromConfig != null) {
+                pc.set(UnpackConfig.class, fromConfig);
             }
         }
-        Parser parser = TikaResource.createParser();
-        if (parser instanceof DigestingParser) {
-            //no need to digest for unwrapping
-            parser = ((DigestingParser) parser).getWrappedParser();
-        }
-        fillMetadata(parser, metadata, httpHeaders.getRequestHeaders());
-        fillParseContext(httpHeaders.getRequestHeaders(), metadata, pc);
 
-        TikaResource.logRequest(LOG, "/unpack", metadata);
-        //even though we aren't currently parsing embedded documents,
-        //we need to add this to allow for "inline" use of other parsers.
-        pc.set(Parser.class, parser);
-        ContentHandler ch;
-        UnsynchronizedByteArrayOutputStream text = UnsynchronizedByteArrayOutputStream
-                .builder()
-                .get();
+        PipesParsingHelper.UnpackResult result = helper.parseUnpack(tis, metadata, pc, saveAll);
 
-        if (saveAll) {
-            ch = new BodyContentHandler(new RichTextContentHandler(new OutputStreamWriter(text, UTF_8)));
-        } else {
-            ch = new DefaultHandler();
-        }
-
-        Map<String, byte[]> files = new HashMap<>();
-        MutableInt count = new MutableInt();
-
-        pc.set(EmbeddedDocumentExtractor.class, new MyEmbeddedDocumentExtractor(count, files, unpackMaxBytes));
-
-        TikaResource.parse(parser, LOG, info.getPath(), is, ch, metadata, pc);
-
-        if (count.intValue() == 0 && !saveAll) {
+        Path zipFile = result.zipFile();
+        if (zipFile == null) {
+            // No embedded files were extracted
             throw new WebApplicationException(Response.Status.NO_CONTENT);
         }
 
-        if (saveAll) {
-            files.put(TEXT_FILENAME, text.toByteArray());
-
-            UnsynchronizedByteArrayOutputStream metaStream = UnsynchronizedByteArrayOutputStream
-                    .builder()
-                    .get();
-            metadataToCsv(metadata, metaStream);
-
-            files.put(META_FILENAME, metaStream.toByteArray());
-        }
-
-        return files;
-    }
-
-    private static class MyEmbeddedDocumentExtractor implements EmbeddedDocumentExtractor {
-        private final MutableInt count;
-        private final Map<String, byte[]> zout;
-
-        private final long unpackMaxBytes;
-        private final EmbeddedStreamTranslator embeddedStreamTranslator = new DefaultEmbeddedStreamTranslator();
-
-        MyEmbeddedDocumentExtractor(MutableInt count, Map<String, byte[]> zout, long unpackMaxBytes) {
-            this.count = count;
-            this.zout = zout;
-            this.unpackMaxBytes = unpackMaxBytes;
-        }
-
-        public boolean shouldParseEmbedded(Metadata metadata) {
-            return true;
-        }
-
-        @Override
-        public void parseEmbedded(TikaInputStream tis, ContentHandler contentHandler, Metadata metadata, boolean b) throws SAXException, IOException {
-            UnsynchronizedByteArrayOutputStream bos = UnsynchronizedByteArrayOutputStream
-                    .builder()
-                    .get();
-
-            BoundedInputStream bis = new BoundedInputStream(unpackMaxBytes, tis);
-            IOUtils.copy(bis, bos);
-            if (bis.hasHitBound()) {
-                throw new IOException(new TikaMemoryLimitException(
-                        "An attachment is longer than " + "'unpackMaxBytes' (default=100MB, actual=" + unpackMaxBytes + "). " + "If you need to increase this " +
-                                "limit, add a header to your request, such as: unpackMaxBytes: " + "1073741824.  There is a hard limit of 2GB."));
+        // Stream the zip file and clean up after streaming
+        StreamingOutput stream = output -> {
+            try {
+                Files.copy(zipFile, output);
+            } finally {
+                result.cleanup();
             }
-            byte[] data = bos.toByteArray();
+        };
 
-            String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
-            String contentType = metadata.get(org.apache.tika.metadata.HttpHeaders.CONTENT_TYPE);
-
-            if (name == null) {
-                name = Integer.toString(count.intValue());
-            }
-
-            if (!name.contains(".") && contentType != null) {
-                try {
-                    String ext = TikaResource
-                            .getConfig()
-                            .getMimeRepository()
-                            .forName(contentType)
-                            .getExtension();
-
-                    if (ext != null) {
-                        name += ext;
-                    }
-                } catch (MimeTypeException e) {
-                    LOG.warn("Unexpected MimeTypeException", e);
-                }
-            }
-            try (TikaInputStream is = TikaInputStream.get(data)) {
-                if (embeddedStreamTranslator.shouldTranslate(is, metadata)) {
-                    InputStream translated = embeddedStreamTranslator.translate(UnsynchronizedByteArrayInputStream.builder().setByteArray(data).get(), metadata);
-                    UnsynchronizedByteArrayOutputStream bos2 = UnsynchronizedByteArrayOutputStream
-                            .builder()
-                            .get();
-                    IOUtils.copy(translated, bos2);
-                    data = bos2.toByteArray();
-                }
-            }
-
-            final String finalName = getFinalName(name, zout);
-
-            if (data.length > 0) {
-                zout.put(finalName, data);
-                count.increment();
-            }
-        }
-
-        private String getFinalName(String name, Map<String, byte[]> zout) {
-            name = name.replaceAll("\u0000", " ");
-            String normalizedName = FilenameUtils.normalize(name);
-
-            if (normalizedName == null) {
-                normalizedName = FilenameUtils.getName(name);
-            }
-
-            if (normalizedName == null) {
-                normalizedName = count.toString();
-            }
-            //strip off initial C:/ or ~/ or /
-            int prefixLength = FilenameUtils.getPrefixLength(normalizedName);
-            if (prefixLength > -1) {
-                normalizedName = normalizedName.substring(prefixLength);
-            }
-            if (zout.containsKey(normalizedName)) {
-                return UUID
-                        .randomUUID()
-                        .toString() + "-" + normalizedName;
-            }
-            return normalizedName;
-        }
-
-/*        protected void copy(DirectoryEntry sourceDir, DirectoryEntry destDir)
-                throws IOException {
-            for (Entry entry : sourceDir) {
-                if (entry instanceof DirectoryEntry) {
-                    // Need to recurse
-                    DirectoryEntry newDir = destDir.createDirectory(entry.getName());
-                    copy((DirectoryEntry) entry, newDir);
-                } else {
-                    // Copy entry
-                    try (InputStream contents = new DocumentInputStream((DocumentEntry) entry)) {
-                        destDir.createDocument(entry.getName(), contents);
-                    }
-                }
-            }
-        }*/
+        return Response.ok(stream)
+                .type("application/zip")
+                .build();
     }
 }

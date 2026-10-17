@@ -1,0 +1,48 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.api.emitter;
+
+import java.util.List;
+
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
+
+public interface EmitData {
+    String getEmitKey();
+
+    List<Metadata> getMetadataList();
+
+    String getContainerStackTrace();
+
+    /**
+     * Raw UTF-8 content bytes, set only when the request opted in via
+     * {@code content-bytes-config} under {@code ParseMode.CONTENT_ONLY};
+     * the metadata then no longer carries {@code TIKA_CONTENT}. Null otherwise.
+     */
+    default byte[] getContentBytes() {
+        return null;
+    }
+
+    long getEstimatedSizeBytes();
+
+    /**
+     * Gets the ParseContext. This is not serialized over IPC - it's restored
+     * by PipesClient after deserialization from the original FetchEmitTuple.
+     * May return null if not set.
+     */
+    ParseContext getParseContext();
+}

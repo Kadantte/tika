@@ -18,10 +18,13 @@ package org.apache.tika.eval.app;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Types;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -35,6 +38,7 @@ import org.apache.tika.eval.app.db.TableInfo;
 import org.apache.tika.eval.app.io.ExtractReader;
 import org.apache.tika.eval.app.io.ExtractReaderException;
 import org.apache.tika.eval.app.io.IDBWriter;
+import org.apache.tika.eval.app.io.PipesReport;
 import org.apache.tika.eval.core.textstats.BasicTokenCountStatsCalculator;
 import org.apache.tika.eval.core.tokens.ContrastStatistics;
 import org.apache.tika.eval.core.tokens.TokenContraster;
@@ -43,7 +47,7 @@ import org.apache.tika.eval.core.tokens.TokenIntPair;
 import org.apache.tika.eval.core.util.ContentTags;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.pipes.fetcher.FetchKey;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
 
 public class ExtractComparer extends ProfilerBase {
 
@@ -54,7 +58,9 @@ public class ExtractComparer extends ProfilerBase {
     public static TableInfo COMPARISON_CONTAINERS =
             new TableInfo("containers", new ColInfo(Cols.CONTAINER_ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.FILE_PATH, Types.VARCHAR, FILE_PATH_MAX_LEN),
                     new ColInfo(Cols.FILE_EXTENSION, Types.VARCHAR, 12), new ColInfo(Cols.LENGTH, Types.BIGINT), new ColInfo(Cols.EXTRACT_FILE_LENGTH_A, Types.BIGINT),
-                    new ColInfo(Cols.EXTRACT_FILE_LENGTH_B, Types.BIGINT));
+                    new ColInfo(Cols.EXTRACT_FILE_LENGTH_B, Types.BIGINT),
+                    new ColInfo(Cols.PIPES_STATUS_A, Types.VARCHAR, PIPES_STATUS_MAX_LEN), new ColInfo(Cols.PIPES_MESSAGE_A, Types.VARCHAR, PIPES_MESSAGE_MAX_LEN),
+                    new ColInfo(Cols.PIPES_STATUS_B, Types.VARCHAR, PIPES_STATUS_MAX_LEN), new ColInfo(Cols.PIPES_MESSAGE_B, Types.VARCHAR, PIPES_MESSAGE_MAX_LEN));
     public static TableInfo CONTENT_COMPARISONS =
             new TableInfo("content_comparisons", new ColInfo(Cols.ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.TOP_10_UNIQUE_TOKEN_DIFFS_A, Types.VARCHAR, 1024),
                     new ColInfo(Cols.TOP_10_UNIQUE_TOKEN_DIFFS_B, Types.VARCHAR, 1024), new ColInfo(Cols.TOP_10_MORE_IN_A, Types.VARCHAR, 1024),
@@ -65,6 +71,8 @@ public class ExtractComparer extends ProfilerBase {
     public static TableInfo EMBEDDED_FILE_PATH_TABLE_B = new TableInfo("emb_path_b", ExtractProfiler.EMBEDDED_FILE_PATH_TABLE.getColInfos());
     public static TableInfo CONTENTS_TABLE_A = new TableInfo("contents_a", ExtractProfiler.CONTENTS_TABLE.getColInfos());
     public static TableInfo CONTENTS_TABLE_B = new TableInfo("contents_b", ExtractProfiler.CONTENTS_TABLE.getColInfos());
+    public static TableInfo ENCODINGS_TABLE_A = new TableInfo("encodings_a", ExtractProfiler.ENCODINGS_TABLE.getColInfos());
+    public static TableInfo ENCODINGS_TABLE_B = new TableInfo("encodings_b", ExtractProfiler.ENCODINGS_TABLE.getColInfos());
     public static TableInfo TAGS_TABLE_A = new TableInfo("tags_a", ExtractProfiler.TAGS_TABLE.getColInfos());
     public static TableInfo TAGS_TABLE_B = new TableInfo("tags_b", ExtractProfiler.TAGS_TABLE.getColInfos());
     public static TableInfo EXCEPTION_TABLE_A = new TableInfo("exceptions_a", ExtractProfiler.EXCEPTION_TABLE.getColInfos());
@@ -82,13 +90,22 @@ public class ExtractComparer extends ProfilerBase {
     private final Path extractsB;
     private final TokenContraster tokenContraster = new TokenContraster();
     private final ExtractReader extractReader;
+    private final PipesReport pipesReportA;
+    private final PipesReport pipesReportB;
 
     public ExtractComparer(Path inputDir, Path extractsA, Path extractsB, ExtractReader extractReader, IDBWriter writer) {
+        this(inputDir, extractsA, extractsB, extractReader, writer, null, null);
+    }
+
+    public ExtractComparer(Path inputDir, Path extractsA, Path extractsB, ExtractReader extractReader, IDBWriter writer,
+                           PipesReport pipesReportA, PipesReport pipesReportB) {
         super(writer);
         this.inputDir = inputDir;
         this.extractsA = extractsA;
         this.extractsB = extractsB;
         this.extractReader = extractReader;
+        this.pipesReportA = pipesReportA;
+        this.pipesReportB = pipesReportB;
     }
 
     public static void USAGE() throws IOException {
@@ -167,6 +184,8 @@ public class ExtractComparer extends ProfilerBase {
         long extractFileLengthB = getFileLength(fpsB.getExtractFile());
         contData.put(Cols.EXTRACT_FILE_LENGTH_B, extractFileLengthB > NON_EXISTENT_FILE_LENGTH ? Long.toString(extractFileLengthB) : "");
 
+        putPipesResult(contData, pipesReportA, fpsA, Cols.PIPES_STATUS_A, Cols.PIPES_MESSAGE_A);
+        putPipesResult(contData, pipesReportB, fpsB, Cols.PIPES_STATUS_B, Cols.PIPES_MESSAGE_B);
         writer.writeRow(COMPARISON_CONTAINERS, contData);
 
         if (extractExceptionA != null) {
@@ -187,6 +206,7 @@ public class ExtractComparer extends ProfilerBase {
         List<Integer> numAttachmentsB = countAttachments(metadataListB);
 
         String sharedDigestKey = findSharedDigestKey(metadataListA, metadataListB);
+        String emptyDigest = computeEmptyDigest(sharedDigestKey);
         Map<Class, Object> tokenStatsA = null;
         Map<Class, Object> tokenStatsB = null;
         //now get that metadata
@@ -203,8 +223,9 @@ public class ExtractComparer extends ProfilerBase {
                 writeTagData(fileId, contentTagsA, TAGS_TABLE_A);
 
                 writeProfileData(fpsA, i, contentTagsA, metadataA, fileId, containerID, numAttachmentsA, PROFILES_A);
+                writeEncodingData(fileId, metadataA, ENCODINGS_TABLE_A);
                 writeExceptionData(fileId, metadataA, EXCEPTION_TABLE_A);
-                int matchIndex = getMatch(i, sharedDigestKey, handledB, metadataListA, metadataListB);
+                int matchIndex = getMatch(i, sharedDigestKey, emptyDigest, handledB, metadataListA, metadataListB);
 
                 if (matchIndex > -1 && !handledB.contains(matchIndex)) {
                     metadataB = metadataListB.get(matchIndex);
@@ -214,6 +235,7 @@ public class ExtractComparer extends ProfilerBase {
                     contentTagsB = getContent(fpsB, metadataB);
                     writeTagData(fileId, contentTagsB, TAGS_TABLE_B);
                     writeProfileData(fpsB, i, contentTagsB, metadataB, fileId, containerID, numAttachmentsB, PROFILES_B);
+                    writeEncodingData(fileId, metadataB, ENCODINGS_TABLE_B);
                     writeExceptionData(fileId, metadataB, EXCEPTION_TABLE_B);
                 }
                 writeEmbeddedFilePathData(i, fileId, metadataA, metadataB);
@@ -259,6 +281,7 @@ public class ExtractComparer extends ProfilerBase {
                 String fileId = (i == 0) ? containerID : Integer.toString(ID.getAndIncrement());
                 writeTagData(fileId, contentTagsB, TAGS_TABLE_B);
                 writeProfileData(fpsB, i, contentTagsB, metadataB, fileId, containerID, numAttachmentsB, PROFILES_B);
+                writeEncodingData(fileId, metadataB, ENCODINGS_TABLE_B);
                 writeEmbeddedFilePathData(i, fileId, null, metadataB);
                 writeExceptionData(fileId, metadataB, EXCEPTION_TABLE_B);
 
@@ -357,7 +380,7 @@ public class ExtractComparer extends ProfilerBase {
      * @param metadataListB
      * @return
      */
-    private int getMatch(int aIndex, String sharedDigestKey, Set<Integer> handledB, List<Metadata> metadataListA, List<Metadata> metadataListB) {
+    private int getMatch(int aIndex, String sharedDigestKey, String emptyDigest, Set<Integer> handledB, List<Metadata> metadataListA, List<Metadata> metadataListB) {
         //TODO: could make this more robust
         if (metadataListB == null || metadataListB.size() == 0) {
             return -1;
@@ -367,16 +390,23 @@ public class ExtractComparer extends ProfilerBase {
             return 0;
         }
 
+        Metadata thisMetadata = metadataListA.get(aIndex);
+
         if (sharedDigestKey != null) {
             //first try to find matching digests
-            return findMatchingDigests(sharedDigestKey, handledB, metadataListA.get(aIndex), metadataListB);
+            int digestMatch = findMatchingDigests(sharedDigestKey, emptyDigest, handledB, thisMetadata, metadataListB);
+            if (digestMatch > -1) {
+                return digestMatch;
+            }
         }
 
-        //assume same embedded resource path.  Not always true!
-        Metadata thisMetadata = metadataListA.get(aIndex);
+        //try matching by embedded resource path
         String embeddedPath = thisMetadata.get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH);
         if (embeddedPath != null) {
             for (int j = 0; j < metadataListB.size(); j++) {
+                if (handledB.contains(j)) {
+                    continue;
+                }
                 String thatEmbeddedPath = metadataListB
                         .get(j)
                         .get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH);
@@ -394,9 +424,14 @@ public class ExtractComparer extends ProfilerBase {
         return -1;
     }
 
-    private int findMatchingDigests(String sharedDigestKey, Set<Integer> handledB, Metadata metadata, List<Metadata> metadataListB) {
+    private int findMatchingDigests(String sharedDigestKey, String emptyDigest, Set<Integer> handledB, Metadata metadata, List<Metadata> metadataListB) {
         String digestA = metadata.get(sharedDigestKey);
         if (digestA == null) {
+            return -1;
+        }
+        // Skip matching on the empty-content digest -- it's meaningless
+        // and causes false matches among unrelated zero-byte embedded docs
+        if (digestA.equalsIgnoreCase(emptyDigest)) {
             return -1;
         }
         String resourceName = metadata.get(TikaCoreProperties.FINAL_EMBEDDED_RESOURCE_PATH);
@@ -416,6 +451,34 @@ public class ExtractComparer extends ProfilerBase {
             }
         }
         return cand;
+    }
+
+    /**
+     * Computes the hex-encoded digest of empty (zero-byte) content for the
+     * algorithm identified by the shared digest key (e.g. "tk:digest:MD5").
+     * Returns null if the algorithm cannot be resolved.
+     */
+    private static String computeEmptyDigest(String sharedDigestKey) {
+        if (sharedDigestKey == null) {
+            return null;
+        }
+        String algo = sharedDigestKey.substring(DIGEST_KEY_PREFIX.length());
+        // Tika emits the MessageDigest name ("SHA-256"), but extracts may carry the
+        // hyphen-less spelling from an older release or a hand-written key.
+        if (algo.matches("(?i)SHA(\\d+)")) {
+            algo = algo.toUpperCase(Locale.ROOT).replaceFirst("SHA(\\d+)", "SHA-$1");
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance(algo);
+            byte[] emptyHash = md.digest(new byte[0]);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : emptyHash) {
+                sb.append(String.format(Locale.ROOT, "%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return null;
+        }
     }
 
     private void writeContrasts(Map<Cols, String> data, ContrastStatistics contrastStatistics) {

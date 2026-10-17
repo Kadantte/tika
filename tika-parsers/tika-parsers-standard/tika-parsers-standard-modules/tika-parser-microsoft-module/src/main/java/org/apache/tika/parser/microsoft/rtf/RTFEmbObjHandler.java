@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,13 +28,16 @@ import org.xml.sax.SAXException;
 
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.TikaMemoryLimitException;
+import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.RTFMetadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.EmbeddedContentHandler;
+import org.apache.tika.sax.XHTMLBalancingHandler;
 
 /**
  * This class buffers data from embedded objects and pictures.
@@ -60,7 +63,8 @@ class RTFEmbObjHandler {
 
     private static final String EMPTY_STRING = "";
     private final ContentHandler handler;
-    private final EmbeddedDocumentUtil embeddedDocumentUtil;
+    private final ParseContext context;
+    private final EmbeddedDocumentExtractor embeddedDocumentExtractor;
     private final UnsynchronizedByteArrayOutputStream os;
     private final int memoryLimitInKb;
 
@@ -80,24 +84,24 @@ class RTFEmbObjHandler {
     protected RTFEmbObjHandler(ContentHandler handler, Metadata metadata, ParseContext context,
                                int memoryLimitInKb) {
         this.handler = handler;
-        this.embeddedDocumentUtil = new EmbeddedDocumentUtil(context);
+        this.context = context;
+        this.embeddedDocumentExtractor = EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
         os = UnsynchronizedByteArrayOutputStream.builder().get();
         this.memoryLimitInKb = memoryLimitInKb;
     }
 
     protected void startPict() {
         state = EMB_STATE.PICT;
-        metadata = new Metadata();
+        metadata = Metadata.newInstance(context);
     }
 
     protected void startObjData() {
         state = EMB_STATE.OBJDATA;
-        metadata = new Metadata();
+        metadata = Metadata.newInstance(context);
     }
 
     protected void startSN() {
         sb.setLength(0);
-        sb.append(RTFMetadata.RTF_PICT_META_PREFIX);
     }
 
     protected void endSN() {
@@ -114,7 +118,9 @@ class RTFEmbObjHandler {
 
     //end metadata pair
     protected void endSP() {
-        metadata.add(sn, sv);
+        //sn is document-controlled (RTF shape-property name); may repeat
+        //across multiple {\sp...} pairs in one \pict group
+        metadata.add(RTFMetadata.PICT, sn, sv);
     }
 
     protected boolean getInObject() {
@@ -182,10 +188,10 @@ class RTFEmbObjHandler {
         if (state == EMB_STATE.OBJDATA) {
             RTFObjDataParser objParser = new RTFObjDataParser(memoryLimitInKb);
             try {
-                byte[] objBytes = objParser.parse(bytes, metadata, unknownFilenameCount);
+                byte[] objBytes = objParser.parse(bytes, metadata, context, unknownFilenameCount);
                 extractObj(objBytes, handler, metadata);
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordException(e, metadata);
+                EmbeddedDocumentUtil.recordException(e, metadata, context);
             }
         } else if (state == EMB_STATE.PICT) {
             String filePath = metadata.get(RTFMetadata.RTF_PICT_META_PREFIX + "wzDescription");
@@ -214,29 +220,44 @@ class RTFEmbObjHandler {
             return;
         }
 
-        metadata.set(Metadata.CONTENT_LENGTH, Integer.toString(bytes.length));
+        metadata.set(HttpHeaders.CONTENT_LENGTH, Integer.toString(bytes.length));
 
-        if (embeddedDocumentUtil.shouldParseEmbedded(metadata)) {
-            TikaInputStream stream = TikaInputStream.get(bytes);
-            if (metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY) == null) {
-                String extension = embeddedDocumentUtil.getExtension(stream, metadata);
-                if (inObject && state == EMB_STATE.PICT) {
-                    metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
-                            "thumbnail_" + thumbCount++ + extension);
-                    metadata.set(RTFMetadata.THUMBNAIL, "true");
-                } else {
-                    metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
-                            "file_" + unknownFilenameCount.getAndIncrement() + extension);
+        if (embeddedDocumentExtractor.shouldParseEmbedded(metadata, context)) {
+            try (TikaInputStream tis = TikaInputStream.get(bytes)) {
+                if (metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY) == null) {
+                    String extension = EmbeddedDocumentUtil.getExtension(tis, metadata, context);
+                    if (inObject && state == EMB_STATE.PICT) {
+                        metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
+                                EmbeddedDocumentUtil.EmbeddedResourcePrefix.THUMBNAIL.getPrefix()
+                                        + "-" + thumbCount++ + extension);
+                        metadata.set(RTFMetadata.THUMBNAIL, "true");
+                    } else {
+                        metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
+                                EmbeddedDocumentUtil.EmbeddedResourcePrefix.EMBEDDED.getPrefix()
+                                        + "-" + unknownFilenameCount.getAndIncrement()
+                                        + extension);
+                    }
+                    metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
                 }
-            }
-            try {
-                embeddedDocumentUtil
-                        .parseEmbedded(stream, new EmbeddedContentHandler(handler), metadata,
-                                true);
-            } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
-            } finally {
-                stream.close();
+                // Wrap the outer handler in a balancing handler so that if
+                // the embedded parser aborts mid-element (leaving <p>/<b>/etc
+                // open on the wire), we can drain those before propagating.
+                // Without this, the outer RTF parser's subsequent
+                // </b>/</p>/</body> sequence trips StrictXHTMLValidator on
+                // unbalanced nesting and surfaces as a misleading error at
+                // endDocument. Same shape as the SXWPF / Epub catch arms.
+                XHTMLBalancingHandler balancer = new XHTMLBalancingHandler(handler);
+                try {
+                    embeddedDocumentExtractor
+                            .parseEmbedded(tis, new EmbeddedContentHandler(balancer), metadata,
+                                    context, true);
+                } catch (IOException e) {
+                    balancer.drainOpenElements();
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
+                } catch (SAXException e) {
+                    balancer.drainOpenElements();
+                    EmbeddedDocumentUtil.recordException(e, metadata, context);
+                }
             }
         }
     }
@@ -248,7 +269,7 @@ class RTFEmbObjHandler {
     protected void reset() {
         state = EMB_STATE.NADA;
         os.reset();
-        metadata = new Metadata();
+        metadata = Metadata.newInstance(context);
         hi = -1;
         sv = EMPTY_STRING;
         sn = EMPTY_STRING;

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.language.translate.impl;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -33,6 +32,7 @@ import org.apache.cxf.jaxrs.client.WebClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 
 /**
@@ -43,6 +43,7 @@ import org.apache.tika.exception.TikaException;
  * from <a href="http://hayageek.com">hayageek.com</a>. Set your API key in
  * translator.google.properties.
  */
+@TikaComponent
 public class GoogleTranslator extends AbstractTranslator {
 
     private static final Logger LOG = LoggerFactory.getLogger(GoogleTranslator.class);

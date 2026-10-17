@@ -13,14 +13,12 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 package org.apache.tika.metadata;
 
 public interface PST {
 
     String PST_PREFIX = "pst:";
-    Property PST_FOLDER_PATH = Property.internalText(PST_PREFIX + "folderPath");
-    Property DESCRIPTOR_NODE_ID = Property.internalText(PST_PREFIX + "discriptorNodeId");
-    Property IS_VALID = Property.internalBoolean(PST_PREFIX + "isValid");
+    Property DESCRIPTOR_NODE_ID = Property.internalText(PST_PREFIX + "descriptor-node-id");
+    Property IS_VALID = Property.internalBoolean(PST_PREFIX + "is-valid");
 }

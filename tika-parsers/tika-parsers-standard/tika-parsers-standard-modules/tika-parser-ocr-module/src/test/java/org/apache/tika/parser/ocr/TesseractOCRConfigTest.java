@@ -21,14 +21,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.parser.CompositeParser;
 
 public class TesseractOCRConfigTest extends TikaTest {
@@ -40,7 +39,7 @@ public class TesseractOCRConfigTest extends TikaTest {
         assertEquals("1", config.getPageSegMode(), "Invalid default pageSegMode value");
         assertEquals(0, config.getMinFileSizeToOcr(), "Invalid default minFileSizeToOcr value");
         assertEquals(Integer.MAX_VALUE, config.getMaxFileSizeToOcr(), "Invalid default maxFileSizeToOcr value");
-        assertEquals(120, config.getTimeoutSeconds(), "Invalid default timeout value");
+        assertEquals(120_000, config.getTimeoutMillis(), "Invalid default timeout value");
         assertEquals(300, config.getDensity(), "Invalid default density value");
         assertEquals(4, config.getDepth(), "Invalid default depth value");
         assertEquals("gray", config.getColorspace(), "Invalid default colorpsace value");
@@ -51,18 +50,17 @@ public class TesseractOCRConfigTest extends TikaTest {
 
     @Test
     public void testPartialConfig() throws Exception {
-
-        InputStream stream = getResourceAsStream("/test-configs/tika-config-tesseract-partial.xml");
-
+        TikaLoader loader = TikaLoader.load(
+                getConfigPath(TesseractOCRConfigTest.class, "tika-config-tesseract-partial.json"));
         TesseractOCRParser parser =
-                (TesseractOCRParser) ((CompositeParser) new TikaConfig(stream).getParser())
+                (TesseractOCRParser) ((CompositeParser) loader.loadParsers())
                         .getAllComponentParsers().get(0);
         TesseractOCRConfig config = parser.getDefaultConfig();
         assertEquals("fra+deu", config.getLanguage(), "Invalid overridden language value");
         assertEquals("1", config.getPageSegMode(), "Invalid default pageSegMode value");
         assertEquals(1, config.getMinFileSizeToOcr(), "Invalid overridden minFileSizeToOcr value");
         assertEquals(Integer.MAX_VALUE, config.getMaxFileSizeToOcr(), "Invalid default maxFileSizeToOcr value");
-        assertEquals(240, config.getTimeoutSeconds(), "Invalid overridden timeout value");
+        assertEquals(240_000, config.getTimeoutMillis(), "Invalid overridden timeout value");
         assertEquals(200, config.getDensity(), "Invalid overridden density value");
         assertEquals(8, config.getDepth(), "Invalid overridden depth value");
         assertEquals("box", config.getFilter(), "Invalid overridden filter value");
@@ -72,11 +70,10 @@ public class TesseractOCRConfigTest extends TikaTest {
 
     @Test
     public void testFullConfig() throws Exception {
-
-        InputStream stream = getResourceAsStream("/test-configs/tika-config-tesseract-full.xml");
-
+        TikaLoader loader = TikaLoader.load(
+                getConfigPath(TesseractOCRConfigTest.class, "tika-config-tesseract-full.json"));
         TesseractOCRParser parser =
-                (TesseractOCRParser) ((CompositeParser) new TikaConfig(stream).getParser())
+                (TesseractOCRParser) ((CompositeParser) loader.loadParsers())
                         .getAllComponentParsers().get(0);
         TesseractOCRConfig config = parser.getDefaultConfig();
         assertEquals("ceb", config.getLanguage(), "Invalid overridden language value");
@@ -84,7 +81,7 @@ public class TesseractOCRConfigTest extends TikaTest {
         assertEquals(1, config.getMinFileSizeToOcr(), "Invalid overridden minFileSizeToOcr value");
         assertEquals(2000000, config.getMaxFileSizeToOcr(), "Invalid default maxFileSizeToOcr " +
                 "value");
-        assertEquals(240, config.getTimeoutSeconds(), "Invalid overridden timeout value");
+        assertEquals(240_000, config.getTimeoutMillis(), "Invalid overridden timeout value");
         assertEquals(200, config.getDensity(), "Invalid overridden density value");
         assertEquals(8, config.getDepth(), "Invalid overridden depth value");
         assertEquals("box", config.getFilter(), "Invalid overridden filter value");
@@ -97,7 +94,8 @@ public class TesseractOCRConfigTest extends TikaTest {
         List<String> validLanguages =
                 Arrays.asList("eng", "slk_frak", "chi_tra", "eng+fra", "tgk+chi_tra+slk_frak",
                         "chi_tra_vert", "tgk+chi_tra_vert+slk_frak", "eng+script/Arabic",
-                        "script/HanT_vert");
+                        "script/HanT_vert", "Latin", "eng+Latin", "Japanese_vert",
+                        "Canadian_Aboriginal");
 
         TesseractOCRConfig config = new TesseractOCRConfig();
 
@@ -111,7 +109,8 @@ public class TesseractOCRConfigTest extends TikaTest {
     public void testValidateInvalidLanguage() {
         List<String> invalidLanguages = Arrays.asList(
                 //"", allow empty string
-                "+", "en", "en+", "eng+fra+", "Arabic", "/script/Arabic", "rm -rf *");
+                "+", "en", "en+", "eng+fra+", "/script/Arabic", "latin1", "+eng",
+                "script/", "rm -rf *");
 
         TesseractOCRConfig config = new TesseractOCRConfig();
 
@@ -182,17 +181,17 @@ public class TesseractOCRConfigTest extends TikaTest {
 
     @Test
     public void testDataPathCheck() {
-        TesseractOCRParser parser = new TesseractOCRParser();
+        TesseractOCRConfig config = new TesseractOCRConfig();
         assertThrows(IllegalArgumentException.class, () -> {
-            parser.setTessdataPath("blah\u0000deblah");
+            config.setTessdataPath("blah\u0000deblah");
         });
     }
 
     @Test
     public void testPathCheck() {
-        TesseractOCRParser parser = new TesseractOCRParser();
+        TesseractOCRConfig config = new TesseractOCRConfig();
         assertThrows(IllegalArgumentException.class, () -> {
-            parser.setTesseractPath("blah\u0000deblah");
+            config.setTesseractPath("blah\u0000deblah");
         });
     }
 
@@ -248,29 +247,5 @@ public class TesseractOCRConfigTest extends TikaTest {
         assertThrows(IllegalArgumentException.class, () -> {
             config.setColorspace("someth!ng");
         });
-    }
-
-    @Test
-    public void testUpdatingConfigs() throws Exception {
-        TesseractOCRConfig configA = new TesseractOCRConfig();
-        configA.setLanguage("eng");
-        configA.setMinFileSizeToOcr(100);
-        configA.setOutputType(TesseractOCRConfig.OUTPUT_TYPE.TXT);
-        configA.addOtherTesseractConfig("k1", "a1");
-        configA.addOtherTesseractConfig("k2", "a2");
-
-        TesseractOCRConfig configB = new TesseractOCRConfig();
-        configB.setLanguage("fra");
-        configB.setMinFileSizeToOcr(1000);
-        configB.setOutputType(TesseractOCRConfig.OUTPUT_TYPE.HOCR);
-        configB.addOtherTesseractConfig("k1", "b1");
-        configB.addOtherTesseractConfig("k2", "b2");
-
-        TesseractOCRConfig clone = configA.cloneAndUpdate(configB);
-        assertEquals("fra", clone.getLanguage());
-        assertEquals(1000, clone.getMinFileSizeToOcr());
-        assertEquals(TesseractOCRConfig.OUTPUT_TYPE.HOCR, clone.getOutputType());
-        assertEquals("b1", clone.getOtherTesseractConfig().get("k1"));
-        assertEquals("b2", clone.getOtherTesseractConfig().get("k2"));
     }
 }

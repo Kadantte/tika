@@ -1,13 +1,13 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,11 +19,23 @@ package org.apache.tika.server.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.apache.cxf.jaxrs.JAXRSServerFactoryBean;
@@ -31,11 +43,12 @@ import org.apache.cxf.jaxrs.client.WebClient;
 import org.apache.cxf.jaxrs.lifecycle.ResourceProvider;
 import org.apache.cxf.jaxrs.lifecycle.SingletonResourceProvider;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import org.apache.tika.serialization.config.JsonConfigHelper;
 import org.apache.tika.server.core.resource.DetectorResource;
 import org.apache.tika.server.core.resource.MetadataResource;
 import org.apache.tika.server.core.resource.RecursiveMetadataResource;
-import org.apache.tika.server.core.resource.TikaResource;
 import org.apache.tika.server.core.resource.UnpackerResource;
 import org.apache.tika.server.core.writer.CSVMessageBodyWriter;
 import org.apache.tika.server.core.writer.JSONMessageBodyWriter;
@@ -51,21 +64,31 @@ public class StackTraceTest extends CXFTestBase {
     private static final String[] PATHS = new String[]{"/tika", "/rmeta", "/unpack", "/meta",};
     private static final int UNPROCESSEABLE = 422;
 
+    private static final String UNPACK_CONFIG_TEMPLATE = "/configs/cxf-unpack-test-template.json";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    @TempDir
+    private static Path unpackTempDir;
+
+
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         List<ResourceProvider> rCoreProviders = new ArrayList<>();
-        rCoreProviders.add(new SingletonResourceProvider(new MetadataResource()));
-        rCoreProviders.add(new SingletonResourceProvider(new RecursiveMetadataResource()));
-        rCoreProviders.add(new SingletonResourceProvider(new DetectorResource(new ServerStatus("", 0))));
-        rCoreProviders.add(new SingletonResourceProvider(new TikaResource()));
-        rCoreProviders.add(new SingletonResourceProvider(new UnpackerResource()));
+        rCoreProviders.add(new SingletonResourceProvider(new MetadataResource(tikaResource)));
+        rCoreProviders.add(new SingletonResourceProvider(new RecursiveMetadataResource(tikaResource)));
+        rCoreProviders.add(new SingletonResourceProvider(new DetectorResource(new ServerStatus(), tikaResource)));
+        rCoreProviders.add(new SingletonResourceProvider(tikaResource));
+        rCoreProviders.add(new SingletonResourceProvider(new UnpackerResource(tikaResource)));
         sf.setResourceProviders(rCoreProviders);
     }
 
     @Override
     protected void setUpProviders(JAXRSServerFactoryBean sf) {
         List<Object> providers = new ArrayList<>();
-        providers.add(new TikaServerParseExceptionMapper(true));
+        providers.add(new TikaServerParseExceptionMapper());
+        // production registers this too, and CXF hands it every WebApplicationException;
+        // without it here the 422/404 paths below are exercised in a different chain
+        providers.add(new CatchAllExceptionMapper(tikaResource.getExceptionReporting()));
         providers.add(new JSONMessageBodyWriter());
         providers.add(new CSVMessageBodyWriter());
         //providers.add(new XMPMessageBodyWriter());
@@ -74,47 +97,79 @@ public class StackTraceTest extends CXFTestBase {
         sf.setProviders(providers);
     }
 
+    @Override
+    protected InputStream getPipesConfigInputStream() throws IOException {
+        Path pluginsDir = Paths.get("target/plugins").toAbsolutePath();
+
+        Map<String, Object> replacements = new HashMap<>();
+        replacements.put("UNPACK_EMITTER_BASE_PATH", unpackTempDir.toAbsolutePath().toString());
+        replacements.put("PLUGINS_PATHS", pluginsDir.toString().replace("\\", "/"));
+        replacements.put("TIMEOUT_MILLIS", 60000L);
+
+        JsonNode config = JsonConfigHelper.loadFromResource(UNPACK_CONFIG_TEMPLATE,
+                CXFTestBase.class, replacements);
+        String json = MAPPER.writeValueAsString(config);
+        return new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Override
+    protected Path getUnpackEmitterBasePath() {
+        return unpackTempDir;
+    }
+
+    // /rmeta and /meta embed a container exception at 200 instead of throwing 422.
+    // /tika signals a partial parse with 422 but its body is content-only -- the
+    // exception is never exposed there; clients needing it use /rmeta.
+    // /unpack has no content body, so its 422 carries the container exception.
+
     @Test
     public void testEncrypted() throws Exception {
-        for (String path : PATHS) {
-            if ("/rmeta".equals(path)) {
-                continue;
-            }
-            String accept = "*/*";
-            if ("/tika".equals(path)) {
-                accept = "text/plain";
-            }
-            Response response = WebClient
-                    .create(endPoint + path)
-                    .accept(accept)
-                    .header("Content-Disposition", "attachment; filename=" + TEST_PASSWORD_PROTECTED)
-                    .put(ClassLoader.getSystemResourceAsStream(TEST_PASSWORD_PROTECTED));
-            assertNotNull(response, "null response: " + path);
-            assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: " + path);
-            String msg = getStringFromInputStream((InputStream) response.getEntity());
-            assertContains("org.apache.tika.exception.EncryptedDocumentException", msg);
+        Response response = WebClient
+                .create(endPoint + "/tika/text")
+                .header("Content-Disposition", "attachment; filename=" + TEST_PASSWORD_PROTECTED)
+                .put(ClassLoader.getSystemResourceAsStream(TEST_PASSWORD_PROTECTED));
+        assertNotNull(response, "null response: /tika/text");
+        assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: /tika/text");
+        String msg = getStringFromInputStream((InputStream) response.getEntity());
+        assertNotFound("EncryptedDocumentException", msg);
+        assertEquals("", msg.trim(), "content-only body: /tika/text");
+
+        response = WebClient
+                .create(endPoint + "/unpack")
+                .header("Content-Disposition", "attachment; filename=" + TEST_PASSWORD_PROTECTED)
+                .put(ClassLoader.getSystemResourceAsStream(TEST_PASSWORD_PROTECTED));
+        assertNotNull(response, "null response: /unpack");
+        assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: /unpack");
+        msg = getStringFromInputStream((InputStream) response.getEntity());
+        assertContains("org.apache.tika.exception.EncryptedDocumentException", msg);
+
+        // The failed unpack must not orphan its zip in the emitter dir (handedOff cleanup).
+        try (Stream<Path> files = Files.list(unpackTempDir)) {
+            List<Path> zips = files
+                    .filter(p -> p.getFileName().toString().endsWith(".zip"))
+                    .toList();
+            assertTrue(zips.isEmpty(), "orphaned unpack zips: " + zips);
         }
     }
 
     @Test
     public void testNullPointerOnTika() throws Exception {
-        for (String path : PATHS) {
-            if ("/rmeta".equals(path)) {
-                continue;
-            }
-            String accept = "*/*";
-            if ("/tika".equals(path)) {
-                accept = "text/plain";
-            }
-            Response response = WebClient
-                    .create(endPoint + path)
-                    .accept(accept)
-                    .put(ClassLoader.getSystemResourceAsStream(TEST_NULL));
-            assertNotNull(response);
-            assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: " + path);
-            String msg = getStringFromInputStream((InputStream) response.getEntity());
-            assertContains("Caused by: java.lang.NullPointerException: null pointer message", msg);
-        }
+        Response response = WebClient
+                .create(endPoint + "/tika/text")
+                .put(ClassLoader.getSystemResourceAsStream(TEST_NULL));
+        assertNotNull(response);
+        assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: /tika/text");
+        String msg = getStringFromInputStream((InputStream) response.getEntity());
+        assertNotFound("NullPointerException", msg);
+        assertContains("some content", msg);
+
+        response = WebClient
+                .create(endPoint + "/unpack")
+                .put(ClassLoader.getSystemResourceAsStream(TEST_NULL));
+        assertNotNull(response);
+        assertEquals(UNPROCESSEABLE, response.getStatus(), "unprocessable: /unpack");
+        msg = getStringFromInputStream((InputStream) response.getEntity());
+        assertContains("java.lang.NullPointerException: null pointer message", msg);
     }
 
     @Test
@@ -123,26 +178,27 @@ public class StackTraceTest extends CXFTestBase {
         //that don't have a parser
         //no stack traces for 415
         for (String path : PATHS) {
-
+            // Use path-based routing for /tika
+            String actualPath = "/tika".equals(path) ? "/tika/text" : path;
             Response response = WebClient
-                    .create(endPoint + path)
-                    .accept("*:*")
+                    .create(endPoint + actualPath)
                     .put(ClassLoader.getSystemResourceAsStream("test-documents/testDigilite.fdf"));
             if (path.equals("/unpack")) {
                 //"NO CONTENT"
-                assertEquals(204, response.getStatus(), "bad type: " + path);
+                assertEquals(204, response.getStatus(), "bad type: " + actualPath);
             } else {
-                assertEquals(200, response.getStatus(), "bad type: " + path);
-                assertNotNull(response, "null response: " + path);
+                assertEquals(200, response.getStatus(), "bad type: " + actualPath);
+                assertNotNull(response, "null response: " + actualPath);
             }
         }
     }
 
 
-    //For now, make sure that non-complete document
-    //still returns BAD_REQUEST.  We may want to
-    //make MetadataResource return the same types of parse
-    //exceptions as the others...
+    // Since TIKA-4825 the caller-supplied Content-Type is carried into detection, so an
+    // explicit application/mock+xml routes the (truncated) document to the mock parser,
+    // which cannot parse the incomplete XML. That container exception maps to 422 for the
+    // bare-field endpoint (which has no envelope to embed it in). Without a Content-Type the
+    // truncated bytes detect as generic XML and still yield NOT_FOUND -- see testMetaNoType.
     @Test
     public void testMeta() throws Exception {
         InputStream stream = ClassLoader.getSystemResourceAsStream(TEST_HELLO_WORLD);
@@ -152,7 +208,20 @@ public class StackTraceTest extends CXFTestBase {
                 .type("application/mock+xml")
                 .accept(MediaType.TEXT_PLAIN)
                 .put(copy(stream, 100));
-        assertEquals(Response.Status.BAD_REQUEST.getStatusCode(), response.getStatus());
+        assertEquals(422, response.getStatus());
+    }
+
+    // A truncated document with no forcing Content-Type isn't a process failure --
+    // NOT_FOUND (field missing), not BAD_REQUEST.
+    @Test
+    public void testMetaNoType() throws Exception {
+        InputStream stream = ClassLoader.getSystemResourceAsStream(TEST_HELLO_WORLD);
+
+        Response response = WebClient
+                .create(endPoint + "/meta" + "/Author")
+                .accept(MediaType.TEXT_PLAIN)
+                .put(copy(stream, 100));
+        assertEquals(Response.Status.NOT_FOUND.getStatusCode(), response.getStatus());
         String msg = getStringFromInputStream((InputStream) response.getEntity());
         assertEquals("Failed to get metadata field Author", msg);
     }

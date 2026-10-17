@@ -1,0 +1,326 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Pipes Configuration
+
+The `pipes` section of the JSON config controls the pipeline process itself:
+how many forked JVMs to run, timeouts, memory management, and parse behavior.
+
+[source,json]
+----
+{
+  "pipes": {
+    "numClients": 4,
+    "socketTimeoutMillis": 60000,
+    "maxFilesProcessedPerProcess": 100000,
+    "parseMode": "RMETA",
+    "forkedJvmArgs": ["-Xmx512m"]
+  }
+}
+----
+
+== Process Management
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`numClients`
+|_CPU-derived_
+|Number of parallel forked JVMs. Each processes one document at a time. Defaults to `+max(1, min((cores - 2) / 2, 4))+` -- roughly half the host's cores, capped at 4. The batch CLIs (`tika-app -i/-o`, `tika-async-cli`) override that to `2` when neither `-n` nor a config value is given -- see xref:using-tika/cli/index.adoc#_tika_pipes_processing[Tika Pipes Processing]. See xref:pipes/cpu-sizing.adoc[Forked-JVM CPU and Heap Sizing] for guidance on choosing this value relative to host CPU count.
+
+|`forkedJvmArgs`
+|`[]`
+|JVM arguments for forked processes (e.g., `["-Xmx512m", "-Xms256m"]`). Unless you supply your own, Tika auto-injects `-XX:ActiveProcessorCount` to right-size each fork's GC and JIT thread pools, and `-XX:MaxRAMPercentage` to keep the forks' combined heap ceiling under the host's memory; see xref:pipes/cpu-sizing.adoc[Forked-JVM CPU and Heap Sizing]. This is also where the fork's system properties go, e.g. `-Dtika.pipes.cacheMemoryBudgetBytes` below -- setting them on the parent JVM has no effect on the forks.
+
+|`javaPath`
+|`java`
+|Path to the Java executable for forked processes.
+
+|`maxFilesProcessedPerProcess`
+|`100000`
+|Restart forked processes after this many files. Prevents slow-building memory leaks in parsing libraries.
+
+|`tempDirectory`
+|_system default_
+|*Deprecated since 4.1, removal planned for 5.0.* Set `-Djava.io.tmpdir` on the parent JVM instead; see below. Still honored: each fork gets a subdirectory here, and the fork's whole `java.io.tmpdir` points at it. It never covered the host side -- tika-server's request-body spool and `PipesForkParser` use the parent's `java.io.tmpdir` -- nor any library that calls `File.createTempFile` itself.
+|===
+
+=== Where temporary files go
+
+Set `-Djava.io.tmpdir` on the parent JVM. It has to be a launch flag because of Tika's
+dependencies: POI, PDFBox and the rest create temp files through the JDK, which reads
+`java.io.tmpdir` once at JVM start, so nothing Tika sets at runtime reaches them.
+Tika, every library it calls, and its forked pipes servers all honor the flag: each fork gets a private subdirectory under it (its whole
+`java.io.tmpdir` points there, so spooled input, unpacked embedded files and JVM crash logs
+all land inside), and the parent deletes that subdirectory when the fork is torn down.
+Tika checks the directory exists and is writable at config load and refuses to start
+otherwise, rather than failing on the first document that spools.
+
+If the parent dies, a surviving fork deletes its own subdirectory as it exits. Only when the
+whole process family is killed at once (`SIGKILL` of the group, container stop) do
+subdirectories survive, with whatever the forks were spooling inside; Tika never deletes
+directories another process created. Point `java.io.tmpdir` at a disk-backed directory on a
+volume where filling it does not take out the OS, and apply your own retention to
+`pipes-server-*` there.
+
+[WARNING]
+====
+*DO NOT USE tmpfs* (`/dev/shm`, any RAM-backed filesystem) for `java.io.tmpdir`.
+
+Spool size is bounded by the input, not by any Tika setting: one large archive expanding
+into tmpfs can exhaust memory for every process on the host or get a container evicted,
+and a fork directory orphaned by a killed parent pins that RAM until someone deletes it.
+A slow run is recoverable; a lost host is not. If you must, give tmpfs a dedicated mount
+with `size=` so the failure is a refused write rather than a lost host.
+====
+
+=== Embedded-object cache memory budget
+
+Each fork holds a process-wide in-memory budget for stream caching (the rewind buffers used
+when digesting embedded documents, and the in-memory views parsers read random-access
+content from), so small embedded objects stay in RAM instead of spilling to a temp file at
+the per-object 1MB threshold. The default is a quarter of the fork's max heap, so raising
+`-Xmx` raises it; a value set via the system property is clamped to that same quarter-heap
+ceiling. The effective value and where it came from are logged at fork startup. Tune it with
+a system property in `forkedJvmArgs` (plain bytes, no unit suffix; `<=0` disables the
+budget and restores the per-object threshold):
+
+[source,json]
+----
+"forkedJvmArgs": ["-Xmx1g", "-Dtika.pipes.cacheMemoryBudgetBytes=134217728"]
+----
+
+Size `-Xmx` so that three quarters of it covers the parsing working set; the remaining
+quarter is what the budget may hold. It is a ceiling on live cached bytes, not a
+preallocation. In per-client mode every fork holds its own budget (`numClients` x a quarter
+of each fork's heap in aggregate). In shared-server mode all concurrent parses in the single
+forked server share one pool, so a single large document can take most of it and push its
+siblings to disk for a while. With no explicit heap flag the fork's heap is sized from the
+host (see `forkedJvmArgs`), and the budget scales with it -- on a large host that is
+several GB per fork by default.
+
+== Timeouts
+
+See also xref:pipes/timeouts.adoc[Timeouts] for the full timeout model.
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`socketTimeoutMillis`
+|`60000`
+|Maximum time (ms) to wait for data from a forked process. If no heartbeat or result is received within this window, the parse is considered hung. Also serves as the fork's idle-shutdown timer: a fork that receives no work for this long exits and is restarted transparently on next use.
+
+|`heartbeatIntervalMillis`
+|`1000`
+|Interval (ms) between heartbeats sent from the forked process. Must be significantly less than `socketTimeoutMillis`.
+
+|`startupTimeoutMillis`
+|`60000`
+|Socket read timeout (ms) applied to a freshly-connected fork until it completes its READY handshake, after which `socketTimeoutMillis` takes over. Raise it if plugin loading in the fork is slow. It does *not* bound how long the parent waits for the fork to connect in the first place — that wait is fixed at 60 s.
+
+|`maxTotalTaskTimeoutMillis`
+|`3600000`
+|Ceiling for *request-supplied* timeout limits: a per-request `timeout-limits` override may lower its timeouts freely but can never raise `totalTaskTimeoutMillis` or `progressTimeoutMillis` above this value (values over the cap are clamped with a warning). Limits set in the server's own `parse-context` — or in a preset a request selects — are trusted and not subject to this cap.
+
+|`maxWaitForClientMillis`
+|`60000`
+|Maximum time (ms) to wait for an available forked process when all are busy.
+|===
+
+== Parse Behavior
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`parseMode`
+|`RMETA`
+|How embedded documents are handled: `RMETA` (recursive metadata list), `CONCATENATE`, `CONTENT_ONLY`, `NO_PARSE`, `UNPACK`. See xref:pipes/parse-modes.adoc[Parse Modes].
+
+|`onParseException`
+|`EMIT`
+|What to do when a parse fails: `EMIT` (emit error metadata) or `SKIP` (silently skip). Set this
+per tuple, not here -- the effective value is the one on each `FetchEmitTuple`, and the iterators
+set `EMIT`. Nothing reads the value from this section.
+
+|`stopOnlyOnFatal`
+|`false`
+|When `false`, stop the pipeline on configuration errors (missing fetcher/emitter). When `true`, only stop on fatal initialization failures. Use `true` for server mode, `false` for batch mode.
+|===
+
+How much of a failure is written into `tk:exception:*` metadata and into a `PipesResult`
+message is set by `parse-context.exception-reporting`, not here -- see
+xref:advanced/setting-limits.adoc#_exception_reporting[Exception reporting].
+
+== Async / Emit Batching
+
+These settings control how parsed results are batched before sending to emitters.
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`numEmitters`
+|`1`
+|Number of emitter threads.
+
+|`queueSize`
+|`10000`
+|Size of the fetch/emit tuple queue.
+
+|`emitWithinMillis`
+|`10000`
+|Flush the emit batch if nothing has been emitted within this many milliseconds, even if the batch is not full.
+
+|`emitMaxEstimatedBytes`
+|`100000`
+|Flush the emit batch when the estimated size reaches this many bytes.
+
+|`emitIntermediateResults`
+|`false`
+|When `false`, only successfully-parsed tuples reach the emitter — files that crash, time out, or otherwise fail are dropped from the output. When `true`, every tuple is emitted, including failures (the metadata carries the exception). Turn this on if you need a complete record of what was attempted (audit, retry logic, chaos-monkey tests).
+|===
+
+[#payload-limits]
+== IPC and Inline Payload Limits
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`maxIpcPayloadBytes`
+|`104857600` (100 MB)
+|Maximum size in bytes of a single IPC message between the client and the fork. This limit is *bidirectional*: it applies both to parse results returned from the fork (FINISHED) and to requests sent from the client (NEW_REQUEST). Raising it lets very large documents pass over IPC; set the forked JVM `-Xmx` to at least approximately 3× this value to keep heap usage under control. Setting it too small (below the size of a typical `FetchEmitTuple`) will cause requests to be rejected silently as `UNSPECIFIED_CRASH`. The minimum accepted value is the serialized size of a `PAYLOAD_LIMIT_EXCEEDED` response (a few dozen bytes); values below that are rejected at config load time.
+
+|`maxInlineBytes`
+|`10485760` (10 MB)
+|Largest document carried inline to the fork instead of being written to a file first. A host that already holds the content (tika-server's `/tika`, `/rmeta`, `/meta`, `/detect`, `/unpack`; `PipesForkParser` with a non-file-backed stream) sends anything at or below this size inside the request and touches no disk at all; anything larger is written out once, to tika-server's dedicated input temp directory (the `\_\_tika-server` fetcher's `basePath`) or, for `PipesForkParser`, to the JVM's `java.io.tmpdir`. A stream already backed by a file always keeps its file, whatever the size. Set to `0` to spool every non-empty body (a zero-length body still rides inline, since the test is `size <= maxInlineBytes`). The cost of raising it is heap, not disk: the parent holds the payload and the frame containing a copy of it, and the child holds it again, so budget roughly `2 * maxInlineBytes * concurrent-requests` in the parent. Must leave room for the rest of the request inside `maxIpcPayloadBytes`; values that do not are rejected at config load time.
+|===
+
+== Emit Strategy
+
+`emitStrategy` controls whether parsed extracts are emitted directly from the forked PipesServer or passed back to the parent process first. The default is balanced for typical workloads — tune only if you have a memory or throughput problem.
+
+[source,json]
+----
+{
+  "pipes": {
+    "emitStrategy": {
+      "type": "DYNAMIC",
+      "thresholdBytes": 100000
+    }
+  }
+}
+----
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`type`
+|`DYNAMIC`
+|One of `DYNAMIC`, `EMIT_ALL`, `PASSBACK_ALL`. `DYNAMIC` switches per-extract based on size (see `thresholdBytes`). `EMIT_ALL` always emits from the forked process. `PASSBACK_ALL` always passes extracts back to the parent for emission.
+
+|`thresholdBytes`
+|`100000`
+|Only used when `type` is `DYNAMIC`. Extracts larger than this are emitted directly from the forked PipesServer; smaller ones are passed back to the parent. Setting `thresholdBytes` with type `EMIT_ALL` or `PASSBACK_ALL` is a config error.
+|===
+
+== Distributed Config Store
+
+For multi-host pipelines (e.g., shared-server clusters) you can store fetcher/emitter configuration in a distributed backend instead of memory. Most users should leave the defaults.
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`configStoreType`
+|`"memory"`
+|Backend for storing fetcher/emitter configurations. `"memory"` (default) is in-process; `"ignite"` uses Apache Ignite for shared state across nodes.
+
+|`configStoreParams`
+|`"{}"`
+|JSON object (as a string) with backend-specific parameters. Structure depends on `configStoreType`.
+|===
+
+== Shared Server Mode (Experimental)
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`useSharedServer`
+|`false`
+|When `true`, multiple clients share a single forked JVM instead of each having its own. Reduces memory overhead but sacrifices isolation -- one crash affects all in-flight requests. **Not recommended for production.**
+|===
+
+See xref:pipes/shared-server-mode.adoc[Shared Server Mode] for details.
+
+[#complete-examples]
+== Complete examples
+
+Worked-out end-to-end configs from the test tree, so the syntax stays current. The tests that
+cover them assert that the JSON *parses*; they do not instantiate every component, so a config
+can load cleanly and still name something that is missing from a release classpath.
+
+[#fs-pipeline]
+=== Filesystem-to-filesystem pipeline
+
+[source,json,subs=none]
+----
+include::example$pipes-fs-pipeline.json[]
+----
+
+icon:github[] https://github.com/apache/tika/blob/main/tika-pipes/tika-pipes-integration-tests/src/test/resources/configs/tika-config-basic.json[View source on GitHub]
+
+Tokens (`FETCHER_BASE_PATH`, `EMITTER_BASE_PATH`, `PLUGINS_PATHS`, `EMIT_INTERMEDIATE_RESULTS`) are substituted by the test harness — replace them with real values in production configs. The first three are paths; `EMIT_INTERMEDIATE_RESULTS` is the boolean `emitIntermediateResults` flag.
+
+[#emit-all]
+=== Emit-all variant
+
+[source,json,subs=none]
+----
+include::example$pipes-emit-all.json[]
+----
+
+icon:github[] https://github.com/apache/tika/blob/main/tika-pipes/tika-pipes-integration-tests/src/test/resources/configs/tika-config-emit-all.json[View source on GitHub]
+
+[#shared-server-example]
+=== Shared-server (YOLO) mode
+
+[source,json,subs=none]
+----
+include::example$pipes-shared-server.json[]
+----
+
+icon:github[] https://github.com/apache/tika/blob/main/tika-pipes/tika-pipes-integration-tests/src/test/resources/configs/tika-config-shared-server.json[View source on GitHub]
+
+See xref:pipes/shared-server-mode.adoc[Shared Server Mode] for the trade-offs.
+
+[#config-template]
+=== Tika Pipes config template
+
+[source,json,subs=none]
+----
+include::example$pipes-config-template.json[]
+----
+
+icon:github[] https://github.com/apache/tika/blob/main/tika-pipes/tika-async-cli/src/main/resources/config-template.json[View source on GitHub]
+
+For per-plugin pipeline examples (S3, OpenSearch, JDBC, Kafka, etc.), see the relevant page under xref:pipes/plugins/index.adoc[Plugins].

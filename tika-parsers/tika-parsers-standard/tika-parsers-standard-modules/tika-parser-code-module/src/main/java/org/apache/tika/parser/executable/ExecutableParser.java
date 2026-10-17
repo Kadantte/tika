@@ -18,6 +18,7 @@ package org.apache.tika.parser.executable;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.Serializable;
 import java.sql.Date;
 import java.util.Arrays;
 import java.util.Collections;
@@ -28,8 +29,14 @@ import org.apache.commons.io.IOUtils;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
+import org.apache.tika.config.ParseContextConfig;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.EndianUtils;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.MachineMetadata;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -41,6 +48,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
 /**
  * Parser for executable files. Currently supports ELF and PE
  */
+@TikaComponent
 public class ExecutableParser implements Parser, MachineMetadata {
     /**
      * Serial version UID
@@ -75,31 +83,50 @@ public class ExecutableParser implements Parser, MachineMetadata {
                             MACH_O_DYLINKER, MACH_O_BUNDLE, MACH_O_DYLIB_STUB, MACH_O_DSYM,
                             MACH_O_KEXT_BUNDLE)));
 
+    private static final String CONFIG_KEY = "executable-parser";
+
+    private ExecutableParserConfig defaultConfig = new ExecutableParserConfig();
+
+    public ExecutableParser() {
+    }
+
+    public ExecutableParser(ExecutableParserConfig config) {
+        this.defaultConfig = config;
+    }
+
+    public ExecutableParser(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, ExecutableParserConfig.class));
+    }
+
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public ExecutableParserConfig getDefaultConfig() {
+        return defaultConfig;
+    }
+
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        // We only do metadata, for now
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        // We only do metadata (plus icons for PE files), for now
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         // What kind is it?
         byte[] first4 = new byte[4];
-        IOUtils.readFully(stream, first4);
+        IOUtils.readFully(tis, first4);
 
         if (first4[0] == (byte) 'M' && first4[1] == (byte) 'Z') {
-            parsePE(xhtml, metadata, stream, first4);
+            parsePE(xhtml, metadata, tis, first4, context);
         } else if (first4[0] == (byte) 0x7f && first4[1] == (byte) 'E' && first4[2] == (byte) 'L' &&
                 first4[3] == (byte) 'F') {
-            parseELF(xhtml, metadata, stream, first4);
+            parseELF(xhtml, metadata, tis, first4);
         } else if ((first4[0] == (byte) 0xCF || first4[0] == (byte) 0xCE) &&
                 first4[1] == (byte) 0xFA && first4[2] == (byte) 0xED && first4[3] == (byte) 0xFE) {
-            parseMachO(xhtml, metadata, stream, first4);
+            parseMachO(xhtml, metadata, tis, first4);
         } else if (first4[0] == (byte) 0xFE && first4[1] == (byte) 0xED &&
                 first4[2] == (byte) 0xFA &&
                 (first4[3] == (byte) 0xCF || first4[3] == (byte) 0xCE)) {
-            parseMachO(xhtml, metadata, stream, first4);
+            parseMachO(xhtml, metadata, tis, first4);
         }
 
 
@@ -108,39 +135,75 @@ public class ExecutableParser implements Parser, MachineMetadata {
     }
 
     /**
-     * Parses a DOS or Windows PE file
+     * Parses a DOS or Windows PE file, extracting metadata only.
+     *
+     * @deprecated since 4.2.0, use
+     * {@link #parsePE(XHTMLContentHandler, Metadata, TikaInputStream, byte[], ParseContext)},
+     * which also extracts the icons as embedded documents. That is the one
+     * {@link #parse} calls, so overriding this method no longer changes what
+     * a parse does.
      */
-    public void parsePE(XHTMLContentHandler xhtml, Metadata metadata, InputStream stream,
+    @Deprecated
+    public void parsePE(XHTMLContentHandler xhtml, Metadata metadata, InputStream tis,
                         byte[] first4) throws TikaException, IOException {
-        metadata.set(Metadata.CONTENT_TYPE, PE_EXE.toString());
+        parsePEHeader(metadata, tis);
+    }
+
+    /**
+     * Parses a DOS or Windows PE file, extracting metadata and, unless
+     * {@link ExecutableParserConfig#isExtractIcons()} says otherwise, the icon
+     * resources as embedded documents. A configuration in the context, an
+     * {@link ExecutableParserConfig} or JSON under "executable-parser", takes
+     * precedence over the parser's own.
+     */
+    public void parsePE(XHTMLContentHandler xhtml, Metadata metadata, TikaInputStream tis,
+                        byte[] first4, ParseContext context)
+            throws TikaException, IOException, SAXException {
+        CoffHeader header = parsePEHeader(metadata, tis);
+        ExecutableParserConfig config = ParseContextConfig.getConfig(context, CONFIG_KEY,
+                ExecutableParserConfig.class, defaultConfig);
+        if (header != null && config.isExtractIcons()) {
+            PEIconExtractor.extract(tis, header, xhtml, metadata, context);
+        }
+    }
+
+    /**
+     * Reads the MS-DOS stub and the COFF header into metadata.
+     *
+     * @return the header fields the resource walk needs, or null if this is
+     * not a PE file
+     */
+    private CoffHeader parsePEHeader(Metadata metadata, InputStream tis)
+            throws TikaException, IOException {
+        metadata.set(HttpHeaders.CONTENT_TYPE, PE_EXE.toString());
         metadata.set(PLATFORM, PLATFORM_WINDOWS);
 
         // Skip over the MS-DOS bit
         byte[] msdosSection = new byte[0x3c - 4];
-        IOUtils.readFully(stream, msdosSection);
+        IOUtils.readFully(tis, msdosSection);
 
         // Grab the PE header offset
-        int peOffset = EndianUtils.readIntLE(stream);
+        int peOffset = EndianUtils.readIntLE(tis);
 
         // Reasonability check - while it may go anywhere, it's normally in the first few kb
-        if (peOffset > 4096 || peOffset < 0x3f) {
-            return;
+        if (peOffset > 4096 || peOffset < 0x40) {
+            return null;
         }
 
         // Skip the rest of the MS-DOS stub (if PE), until we reach what should
         //  be the PE header (if this is a PE executable)
-        stream.skip(peOffset - 0x40);
+        IOUtils.skipFully(tis, peOffset - 0x40);
 
         // Read the PE header
         byte[] pe = new byte[24];
-        IOUtils.readFully(stream, pe);
+        IOUtils.readFully(tis, pe);
 
         // Check it really is a PE header
         if (pe[0] == (byte) 'P' && pe[1] == (byte) 'E' && pe[2] == 0 && pe[3] == 0) {
             // Good, has a valid PE signature
         } else {
             // Old style MS-DOS
-            return;
+            return null;
         }
 
         // Read the header values
@@ -251,15 +314,46 @@ public class ExecutableParser implements Parser, MachineMetadata {
                 metadata.set(MACHINE_TYPE, MACHINE_UNKNOWN);
                 break;
         }
+        return new CoffHeader(peOffset + pe.length, sizeOptHdrs, numSectors);
+    }
+
+    /**
+     * @param end the file offset right after the COFF header
+     */
+    record CoffHeader(long end, int sizeOptHdrs, int numSections) {
+    }
+
+    /**
+     * Configuration of {@link ExecutableParser}. One set on the
+     * {@link ParseContext}, as an object or as JSON under "executable-parser",
+     * takes the parser's place for that parse.
+     */
+    public static class ExecutableParserConfig implements Serializable {
+
+        private static final long serialVersionUID = 5210478935624115573L;
+
+        private boolean extractIcons = true;
+
+        /**
+         * Whether icons of PE files (EXE/DLL) are extracted as embedded
+         * <code>.ico</code> documents. Defaults to true.
+         */
+        public boolean isExtractIcons() {
+            return extractIcons;
+        }
+
+        public void setExtractIcons(boolean extractIcons) {
+            this.extractIcons = extractIcons;
+        }
     }
 
     /**
      * Parses a Unix ELF file
      */
-    public void parseELF(XHTMLContentHandler xhtml, Metadata metadata, InputStream stream,
+    public void parseELF(XHTMLContentHandler xhtml, Metadata metadata, InputStream tis,
                          byte[] first4) throws TikaException, IOException {
         // Byte 5 is the architecture
-        int architecture = stream.read();
+        int architecture = tis.read();
         if (architecture == 1) {
             metadata.set(ARCHITECTURE_BITS, "32");
         } else if (architecture == 2) {
@@ -267,7 +361,7 @@ public class ExecutableParser implements Parser, MachineMetadata {
         }
 
         // Byte 6 is the endian-ness
-        int endian = stream.read();
+        int endian = tis.read();
         if (endian == 1) {
             metadata.set(ENDIAN, Endian.LITTLE.getName());
         } else if (endian == 2) {
@@ -275,12 +369,12 @@ public class ExecutableParser implements Parser, MachineMetadata {
         }
 
         // Byte 7 is the elf version
-        int elfVer = stream.read();
+        int elfVer = tis.read();
 
         // Byte 8 is the OS, if set (lots of compilers don't)
         // Byte 9 is the OS (specific) ABI version
-        int os = stream.read();
-        int osVer = stream.read();
+        int os = tis.read();
+        int osVer = tis.read();
         if (os > 0 || osVer > 0) {
             switch (os) {
                 case 0:
@@ -336,43 +430,43 @@ public class ExecutableParser implements Parser, MachineMetadata {
 
         // Bytes 10-16 are padding and lengths
         byte[] padLength = new byte[7];
-        IOUtils.readFully(stream, padLength);
+        IOUtils.readFully(tis, padLength);
 
         // Bytes 16-17 are the object type (LE/BE)
         int type;
         if (endian == 1) {
-            type = EndianUtils.readUShortLE(stream);
+            type = EndianUtils.readUShortLE(tis);
         } else {
-            type = EndianUtils.readUShortBE(stream);
+            type = EndianUtils.readUShortBE(tis);
         }
         switch (type) {
             case 1:
-                metadata.set(Metadata.CONTENT_TYPE, ELF_OBJECT.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, ELF_OBJECT.toString());
                 break;
 
             case 2:
-                metadata.set(Metadata.CONTENT_TYPE, ELF_EXECUTABLE.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, ELF_EXECUTABLE.toString());
                 break;
 
             case 3:
-                metadata.set(Metadata.CONTENT_TYPE, ELF_SHAREDLIB.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, ELF_SHAREDLIB.toString());
                 break;
 
             case 4:
-                metadata.set(Metadata.CONTENT_TYPE, ELF_COREDUMP.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, ELF_COREDUMP.toString());
                 break;
 
             default:
-                metadata.set(Metadata.CONTENT_TYPE, ELF_GENERAL.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, ELF_GENERAL.toString());
                 break;
         }
 
         // Bytes 18-19 are the machine (EM_*)
         int machine;
         if (endian == 1) {
-            machine = EndianUtils.readUShortLE(stream);
+            machine = EndianUtils.readUShortLE(tis);
         } else {
-            machine = EndianUtils.readUShortBE(stream);
+            machine = EndianUtils.readUShortBE(tis);
         }
         switch (machine) {
             case 2:
@@ -432,7 +526,7 @@ public class ExecutableParser implements Parser, MachineMetadata {
     /**
      * Parses a Mach-O file
      */
-    public void parseMachO(XHTMLContentHandler xhtml, Metadata metadata, InputStream stream,
+    public void parseMachO(XHTMLContentHandler xhtml, Metadata metadata, InputStream tis,
                            byte[] first4) throws TikaException, IOException {
         var isLE = first4[3] == (byte) 0xFE;
         if (isLE) {
@@ -443,8 +537,8 @@ public class ExecutableParser implements Parser, MachineMetadata {
 
         // Bytes 5-8 are the CPU type and architecture bits
         var cpuType = isLE
-                ? EndianUtils.readIntLE(stream)
-                : EndianUtils.readIntBE(stream);
+                ? EndianUtils.readIntLE(tis)
+                : EndianUtils.readIntBE(tis);
         if ((cpuType >> 24) == 1) {
             metadata.set(ARCHITECTURE_BITS, "64");
         }
@@ -481,49 +575,49 @@ public class ExecutableParser implements Parser, MachineMetadata {
 
         // Bytes 9-12 are the CPU subtype
         var cpuSubtype = isLE
-                ? EndianUtils.readIntLE(stream)
-                : EndianUtils.readIntBE(stream);
+                ? EndianUtils.readIntLE(tis)
+                : EndianUtils.readIntBE(tis);
 
         // Bytes 13-16 are the file type
         var fileType = isLE
-                ? EndianUtils.readIntLE(stream)
-                : EndianUtils.readIntBE(stream);
+                ? EndianUtils.readIntLE(tis)
+                : EndianUtils.readIntBE(tis);
         switch (fileType) {
             case 0x1:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_OBJECT.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_OBJECT.toString());
                 break;
             case 0x2:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_EXECUTABLE.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_EXECUTABLE.toString());
                 break;
             case 0x3:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_FVMLIB.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_FVMLIB.toString());
                 break;
             case 0x4:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_CORE.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_CORE.toString());
                 break;
             case 0x5:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_PRELOAD.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_PRELOAD.toString());
                 break;
             case 0x6:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_DYLIB.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_DYLIB.toString());
                 break;
             case 0x7:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_DYLINKER.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_DYLINKER.toString());
                 break;
             case 0x8:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_BUNDLE.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_BUNDLE.toString());
                 break;
             case 0x9:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_DYLIB_STUB.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_DYLIB_STUB.toString());
                 break;
             case 0xa:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_DSYM.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_DSYM.toString());
                 break;
             case 0xb:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O_KEXT_BUNDLE.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O_KEXT_BUNDLE.toString());
                 break;
             default:
-                metadata.set(Metadata.CONTENT_TYPE, MACH_O.toString());
+                metadata.set(HttpHeaders.CONTENT_TYPE, MACH_O.toString());
                 break;
         }
     }

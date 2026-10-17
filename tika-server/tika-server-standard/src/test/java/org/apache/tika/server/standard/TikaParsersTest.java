@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.standard;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -29,10 +28,10 @@ import jakarta.ws.rs.core.Response;
 import org.apache.cxf.jaxrs.JAXRSServerFactoryBean;
 import org.apache.cxf.jaxrs.client.WebClient;
 import org.apache.cxf.jaxrs.lifecycle.SingletonResourceProvider;
-import org.gagravarr.tika.OpusParser;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.parser.microsoft.ooxml.OOXMLParser;
+import org.apache.tika.parser.ogg.OpusParser;
 import org.apache.tika.parser.pkg.PackageParser;
 import org.apache.tika.server.core.CXFTestBase;
 import org.apache.tika.server.core.resource.TikaParsers;
@@ -45,7 +44,7 @@ public class TikaParsersTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(TikaParsers.class);
-        sf.setResourceProvider(TikaParsers.class, new SingletonResourceProvider(new TikaParsers()));
+        sf.setResourceProvider(TikaParsers.class, new SingletonResourceProvider(new TikaParsers(tikaResource)));
     }
 
     @Override
@@ -54,7 +53,7 @@ public class TikaParsersTest extends CXFTestBase {
 
     @Override
     protected InputStream getTikaConfigInputStream() {
-        return getClass().getResourceAsStream("/config/tika-config-for-server-tests.xml");
+        return getClass().getResourceAsStream("/configs/tika-config-for-server-tests.json");
     }
 
     protected String getPath(boolean withDetails) {
@@ -71,7 +70,6 @@ public class TikaParsersTest extends CXFTestBase {
                     .get();
 
             String text = getStringFromInputStream((InputStream) response.getEntity());
-            assertContains("org.apache.tika.parser.DefaultParser (Composite Parser)", text);
             assertContains(OpusParser.class.getName(), text);
             assertContains(PackageParser.class.getName(), text);
             assertContains(OOXMLParser.class.getName(), text);
@@ -100,7 +98,6 @@ public class TikaParsersTest extends CXFTestBase {
                     .get();
 
             String text = getStringFromInputStream((InputStream) response.getEntity());
-            assertContains("<h3>DefaultParser</h3>", text);
             assertContains("Composite", text);
 
             assertContains("<h4>OpusParser", text);
@@ -147,59 +144,54 @@ public class TikaParsersTest extends CXFTestBase {
             assertEquals("org.apache.tika.parser.CompositeParser", json.get("name"));
             assertEquals(Boolean.TRUE, json.get("composite"));
 
-            // At least 20 child parsers which aren't composite, except for CompositeExternalParser
-            List<Object> children = (List) json.get("children");
+            // At least 20 child parsers which aren't composite
+            List<Object> wrapper = (List) json.get("children");
+            Map<String, Object> firstItem = (Map) wrapper.get(0);
+            List<Object> children = (List) firstItem.get("children");
             assertTrue(children.size() >= 2);
             boolean hasOpus = false, hasOOXML = false, hasZip = false;
             int nonComposite = 0;
             int composite = 0;
+            assertTrue(children.size() > 50);
             for (Object o : children) {
                 Map<String, Object> child = (Map<String, Object>) o;
                 assertEquals(true, child.containsKey("name"));
                 assertEquals(true, child.containsKey("composite"));
 
-                List<Object> grandChildrenArr = (List) child.get("children");
-                if (grandChildrenArr == null) {
-                    continue;
+                if (child.get("composite") == Boolean.FALSE) {
+                    nonComposite++;
+                } else {
+                    composite++;
                 }
-                assertTrue(grandChildrenArr.size() > 50);
-                for (Object grandChildO : grandChildrenArr) {
-                    Map<String, Object> grandChildren = (Map<String, Object>) grandChildO;
 
-                    if (grandChildren.get("composite") == Boolean.FALSE) {
-                        nonComposite++;
-                    } else {
-                        composite++;
-                    }
-
-                    // Will only have mime types if requested
-                    if (grandChildren.get("composite") == Boolean.FALSE) {
-                        assertEquals(details, grandChildren.containsKey("supportedTypes"));
-                    }
-
-                    String name = (String) grandChildren.get("name");
-                    if (OpusParser.class
-                            .getName()
-                            .equals(name)) {
-                        hasOpus = true;
-                    }
-                    if (OOXMLParser.class
-                            .getName()
-                            .equals(name)) {
-                        hasOOXML = true;
-                    }
-                    if (PackageParser.class
-                            .getName()
-                            .equals(name)) {
-                        hasZip = true;
-                    }
+                // Will only have mime types if requested
+                if (child.get("composite") == Boolean.FALSE) {
+                    assertEquals(details, child.containsKey("supportedTypes"));
                 }
+
+                String name = (String) child.get("name");
+                if (OpusParser.class
+                        .getName()
+                        .equals(name)) {
+                    hasOpus = true;
+                }
+                if (OOXMLParser.class
+                        .getName()
+                        .equals(name)) {
+                    hasOOXML = true;
+                }
+                if (PackageParser.class
+                        .getName()
+                        .equals(name)) {
+                    hasZip = true;
+                }
+
             }
             assertEquals(true, hasOpus);
             assertEquals(true, hasOOXML);
             assertEquals(true, hasZip);
             assertTrue(nonComposite > 20);
-            assertTrue(composite == 0 || composite == 1); // if CompositeExternalParser is available it will be 1
+            assertEquals(0, composite);
         }
     }
 }

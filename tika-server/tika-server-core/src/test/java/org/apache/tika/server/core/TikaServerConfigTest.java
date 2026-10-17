@@ -18,13 +18,12 @@ package org.apache.tika.server.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 import org.apache.commons.cli.CommandLine;
@@ -33,27 +32,24 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
-import org.apache.tika.config.TikaConfigTest;
+import org.apache.tika.TikaTest;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.utils.ProcessUtils;
 
-public class TikaServerConfigTest {
+public class TikaServerConfigTest extends TikaTest {
 
     @Test
     public void testBasic() throws Exception {
         Set<String> settings = new HashSet<>();
         CommandLineParser parser = new DefaultParser();
         CommandLine emptyCommandLine = parser.parse(new Options(), new String[]{});
-        Path path = Paths.get(TikaConfigTest.class
-                .getResource("/configs/tika-config-server.xml")
-                .toURI());
+        Path path = getConfigPath(getClass(), "tika-config-server.json");
         TikaServerConfig config = TikaServerConfig.load(path, emptyCommandLine, settings);
-        assertEquals(-1, config.getMaxRestarts());
-        assertEquals(54321, config.getTaskTimeoutMillis());
-        assertEquals(true, config.isEnableUnsecureFeatures());
-
-        assertTrue(settings.contains("taskTimeoutMillis"));
-        assertTrue(settings.contains("enableUnsecureFeatures"));
+        assertTrue(config.isAllowPipes());
+        assertTrue(config.isAllowPerRequestConfig());
     }
 
     @Test
@@ -61,33 +57,25 @@ public class TikaServerConfigTest {
         Set<String> settings = new HashSet<>();
         CommandLineParser parser = new DefaultParser();
         CommandLine emptyCommandLine = parser.parse(new Options(), new String[]{});
-        Path path = Paths.get(TikaConfigTest.class
-                .getResource("/configs/tika-config-server-fetchers-emitters.xml")
-                .toURI());
+        Path path = getConfigPath(getClass(), "tika-config-server-fetchers-emitters.json");
         TikaServerConfig config = TikaServerConfig.load(path, emptyCommandLine, settings);
-        assertEquals(-1, config.getMaxRestarts());
-        assertEquals(54321, config.getTaskTimeoutMillis());
-        assertEquals(true, config.isEnableUnsecureFeatures());
-        assertEquals(1, config
-                .getSupportedFetchers()
-                .size());
-        assertEquals(1, config
-                .getSupportedEmitters()
-                .size());
-        assertTrue(config
-                .getSupportedFetchers()
-                .contains("fsf"));
-        assertTrue(config
-                .getSupportedEmitters()
-                .contains("fse"));
+        assertTrue(config.isAllowPipes());
+        assertTrue(config.isAllowPerRequestConfig());
+    }
+
+    /** Documented defaults: 1 GiB request cap, 60s /async queue pause. */
+    @Test
+    public void testDocumentedDefaults() {
+        TikaServerConfig config = new TikaServerConfig();
+        assertEquals(1024L * 1024 * 1024, config.getMaxRequestSizeBytes());
+        assertEquals(TikaServerConfig.DEFAULT_MAX_QUEUE_PAUSE_MILLIS, config.getMaxQueuePauseMillis());
+        assertEquals(60000L, TikaServerConfig.DEFAULT_MAX_QUEUE_PAUSE_MILLIS);
     }
 
     @Test
     public void testPorts() throws Exception {
         CommandLineParser parser = new DefaultParser();
-        Path path = Paths.get(TikaConfigTest.class
-                .getResource("/configs/tika-config-server.xml")
-                .toURI());
+        Path path = getConfigPath(getClass(), "tika-config-server.json");
         CommandLine commandLine = parser.parse(new Options()
                 .addOption(Option
                         .builder("p")
@@ -98,14 +86,68 @@ public class TikaServerConfigTest {
                         .builder("c")
                         .longOpt("config")
                         .hasArg()
-                        .get()), new String[]{"-p", "9994-9999", "-c", ProcessUtils.escapeCommandLine(path
+                        .get()), new String[]{"-p", "9994", "-c", ProcessUtils.escapeCommandLine(path
                 .toAbsolutePath()
                 .toString())});
         TikaServerConfig config = TikaServerConfig.load(commandLine);
-        int[] ports = config.getPorts();
-        assertEquals(6, ports.length);
-        assertEquals(9994, ports[0]);
-        assertEquals(9999, ports[5]);
+    }
+
+    @Test
+    public void testPipesEndpointRequiresAllowPipes() throws Exception {
+        // Selecting /pipes (or /async) without allowPipes must fail at config load,
+        // forcing an explicit opt-in.
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-pipes-no-flags.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains("allowPipes", ex.getMessage());
+        assertContains("pipes", ex.getMessage());
+    }
+
+    @Test
+    public void testEndpointsWithCapabilitiesLoad() throws Exception {
+        // tika-config-server-basic.json selects rmeta/status/tika together with
+        // allowPipes + allowPerRequestConfig, so it must load without error.
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-basic.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaServerConfig config = TikaServerConfig.load(commandLine);
+        assertTrue(config.isAllowPipes());
+        assertTrue(config.isAllowPerRequestConfig());
+    }
+
+    @Test
+    public void testStatusEndpointDoesNotRequireAllowPipes() throws Exception {
+        // status is a plain opt-in endpoint: selecting it (without allowPipes) must
+        // load without error, unlike the pipes/async endpoints.
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-status-no-flags.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaServerConfig config = TikaServerConfig.load(commandLine);
+        assertFalse(config.isAllowPipes());
+        assertFalse(config.isAllowPerRequestConfig());
     }
 
     @Test
@@ -113,9 +155,8 @@ public class TikaServerConfigTest {
         Set<String> settings = new HashSet<>();
         CommandLineParser parser = new DefaultParser();
         CommandLine emptyCommandLine = parser.parse(new Options(), new String[]{});
-        Path path = Paths.get(TikaConfigTest.class
-                .getResource("/configs/tika-config-server-tls.xml")
-                .toURI());
+        Path path = getConfigPath(getClass(), "tika-config-server-tls.json");
+
         TikaServerConfig config = TikaServerConfig.load(path, emptyCommandLine, settings);
         TlsConfig tlsConfig = config.getTlsConfig();
         assertTrue(tlsConfig.isActive());
@@ -129,25 +170,128 @@ public class TikaServerConfigTest {
         assertEquals("/something/or/other2", tlsConfig.getTrustStoreFile());
     }
 
-    @Test
-    public void testInterpolation() throws Exception {
-        List<String> input = new ArrayList<>();
-        System.setProperty("logpath", "qwertyuiop");
-        System.setProperty("logslash", "qwerty\\uiop");
-        try {
-            input.add("-Dlogpath=\"${sys:logpath}\"");
-            input.add("-Dlogpath=no-interpolation");
-            input.add("-Xlogpath=\"${sys:logpath}\"");
-            input.add("-Dlogpath=\"${sys:logslash}\"");
+    // The four cases below exercise TLS config validation through the CommandLine-based
+    // TikaServerConfig.load() overload, rather than the Path-based overload testTlsConfig()
+    // above uses.
 
-            List<String> output = TikaServerConfig.interpolateSysProps(input);
-            assertEquals("-Dlogpath=\"qwertyuiop\"", output.get(0));
-            assertEquals("-Dlogpath=no-interpolation", output.get(1));
-            assertEquals("-Xlogpath=\"${sys:logpath}\"", output.get(2));
-            assertEquals("-Dlogpath=\"qwerty\\uiop\"", output.get(3));
-        } finally {
-            System.clearProperty("logpath");
-            System.clearProperty("logslash");
-        }
+    @Test
+    public void testClientAuthRequiredWithoutTrustStoreRefusesToLoad() throws Exception {
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-tls-client-auth-no-truststore.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains("client authentication", ex.getMessage());
+        assertContains("no trust store", ex.getMessage());
+    }
+
+    @Test
+    public void testPartialTrustStoreConfigRefusesToLoad() throws Exception {
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-tls-partial-truststore.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains("Partial truststore configuration", ex.getMessage());
+    }
+
+    @Test
+    public void testMissingKeyStoreFileRefusesToLoad() throws Exception {
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-tls-missing-keystore.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains("keyStoreFile does not exist", ex.getMessage());
+    }
+
+    @Test
+    public void testClientAuthRequiredWithValidTrustStoreLoadsSuccessfully() throws Exception {
+        CommandLineParser parser = new DefaultParser();
+        Path path = getConfigPath(getClass(), "tika-config-server-tls-client-auth-valid.json");
+        CommandLine commandLine = parser.parse(new Options()
+                .addOption(Option
+                        .builder("c")
+                        .longOpt("config")
+                        .hasArg()
+                        .get()), new String[]{"-c", ProcessUtils.escapeCommandLine(path
+                .toAbsolutePath()
+                .toString())});
+        TikaServerConfig config = TikaServerConfig.load(commandLine);
+        assertTrue(config.getTlsConfig().isClientAuthenticationRequired());
+    }
+    private static Options metricsOptions() {
+        return new Options()
+                .addOption(Option.builder("c").longOpt("config").hasArg().get())
+                .addOption(Option.builder("p").longOpt("port").hasArg().get())
+                .addOption(Option.builder().longOpt("metricsPort").hasArg().get());
+    }
+
+    @Test
+    public void testMetricsOffByDefault() throws Exception {
+        TikaServerConfig config = TikaServerConfig.load(
+                new DefaultParser().parse(metricsOptions(), new String[]{}));
+        assertNull(config.getMetricsPort());
+    }
+
+    @Test
+    public void testMetricsFromJson() throws Exception {
+        Path path = getConfigPath(getClass(), "tika-config-server-metrics.json");
+        TikaServerConfig config = TikaServerConfig.load(new DefaultParser().parse(metricsOptions(),
+                new String[]{"-c", ProcessUtils.escapeCommandLine(path.toAbsolutePath().toString())}));
+        assertEquals(9404, config.getMetricsPort());
+    }
+
+    @Test
+    public void testMetricsPortFromCommandLine() throws Exception {
+        TikaServerConfig config = TikaServerConfig.load(new DefaultParser().parse(metricsOptions(),
+                new String[]{"-p", "9998", "--metricsPort", "9500"}));
+        assertEquals(9500, config.getMetricsPort());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"abc, --metricsPort", "65536, 0-65535", "-1, 0-65535"})
+    public void testMetricsPortRejected(String value, String expectedMessage) throws Exception {
+        CommandLine commandLine = new DefaultParser().parse(metricsOptions(),
+                new String[]{"--metricsPort", value});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains(expectedMessage, ex.getMessage());
+    }
+
+    @Test
+    public void testMetricsPortZeroIsEphemeral() throws Exception {
+        assertEquals(0, TikaServerConfig.load(new DefaultParser().parse(metricsOptions(),
+                new String[]{"--metricsPort", "0"})).getMetricsPort());
+    }
+
+    @Test
+    public void testMetricsPortMustDifferFromServerPort() throws Exception {
+        CommandLine commandLine = new DefaultParser().parse(metricsOptions(),
+                new String[]{"-p", "9998", "--metricsPort", "9998"});
+        TikaConfigException ex = assertThrows(TikaConfigException.class,
+                () -> TikaServerConfig.load(commandLine));
+        assertContains("metricsPort", ex.getMessage());
     }
 }

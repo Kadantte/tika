@@ -1,0 +1,93 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.bundle.internal;
+
+import java.util.ArrayList;
+import java.util.Hashtable;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.Constants;
+import org.osgi.framework.ServiceRegistration;
+
+import org.apache.tika.config.ServiceLoader;
+import org.apache.tika.detect.DefaultDetector;
+import org.apache.tika.detect.Detector;
+import org.apache.tika.detect.EncodingDetector;
+import org.apache.tika.language.detect.LanguageDetector;
+import org.apache.tika.metadata.filter.MetadataFilter;
+import org.apache.tika.mime.MediaTypeRegistry;
+import org.apache.tika.mime.MimeTypes;
+import org.apache.tika.parser.DefaultParser;
+import org.apache.tika.parser.Parser;
+
+/**
+ * Registers Tika Parser and Detector services, and the bundle's EncodingDetector,
+ * LanguageDetector and MetadataFilter providers, when the bundle starts in an OSGi container.
+ */
+public class BundleActivator implements org.osgi.framework.BundleActivator {
+
+    // the provider types tika-core's TikaActivator merges into its dynamic ServiceLoader
+    private static final Class<?>[] PROVIDER_TYPES = {
+            EncodingDetector.class, LanguageDetector.class, MetadataFilter.class};
+
+    private ServiceRegistration detectorService;
+    private ServiceRegistration parserService;
+    private final List<ServiceRegistration> providerServices = new ArrayList<>();
+
+    @Override
+    public void start(BundleContext context) throws Exception {
+        //a registered service must not itself consume dynamic services, or it finds itself
+        ServiceLoader loader = new ServiceLoader(BundleActivator.class.getClassLoader(), false);
+        detectorService = context.registerService(Detector.class.getName(),
+                new DefaultDetector(MimeTypes.getDefaultMimeTypes(), loader), new Hashtable<>());
+        Parser parser = new DefaultParser(MediaTypeRegistry.getDefaultRegistry(), loader);
+        parserService = context.registerService(Parser.class.getName(),
+                parser, new Hashtable<>());
+
+        // tika-core cannot see providers in this bundle, so register each one, ranked in
+        // classpath order (core's own first), so tika-core's defaults match the classpath
+        ServiceLoader coreLoader = new ServiceLoader(Parser.class.getClassLoader(), false);
+        for (Class<?> type : PROVIDER_TYPES) {
+            Map<String, Object> providers = new LinkedHashMap<>();
+            for (Object p : coreLoader.loadStaticServiceProviders(type)) {
+                providers.putIfAbsent(p.getClass().getName(), p);
+            }
+            for (Object p : loader.loadStaticServiceProviders(type)) {
+                providers.putIfAbsent(p.getClass().getName(), p);
+            }
+            int rank = providers.size();
+            for (Object p : providers.values()) {
+                Hashtable<String, Object> props = new Hashtable<>();
+                props.put(Constants.SERVICE_RANKING, rank--);
+                providerServices.add(context.registerService(type.getName(), p, props));
+            }
+        }
+    }
+
+    @Override
+    public void stop(BundleContext context) throws Exception {
+        for (ServiceRegistration registration : providerServices) {
+            registration.unregister();
+        }
+        providerServices.clear();
+        parserService.unregister();
+        detectorService.unregister();
+    }
+}

@@ -1,0 +1,361 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.config.loader;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.tika.config.ServiceLoader;
+import org.apache.tika.detect.EncodingDetector;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.mime.MediaType;
+import org.apache.tika.mime.MediaTypeRegistry;
+import org.apache.tika.parser.AbstractEncodingDetectorParser;
+import org.apache.tika.parser.CompositeParser;
+import org.apache.tika.parser.DefaultParser;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.Parser;
+import org.apache.tika.parser.ParserDecorator;
+import org.apache.tika.parser.RenderingParser;
+import org.apache.tika.parser.enricher.CompositeContentEnricher;
+import org.apache.tika.parser.enricher.ContentEnrichers;
+import org.apache.tika.parser.enricher.EnrichingParser;
+import org.apache.tika.renderer.Renderer;
+import org.apache.tika.utils.ParserUtils;
+
+/**
+ * Loader for parsers with support for:
+ * <ul>
+ *   <li>SPI fallback via "default-parser" marker with exclusions</li>
+ *   <li>Mime type filtering decorations (_mime-include, _mime-exclude)</li>
+ *   <li>EncodingDetector, Renderer and content-enricher dependency injection</li>
+ * </ul>
+ */
+public class ParserLoader extends AbstractSpiComponentLoader<Parser> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ParserLoader.class);
+
+    public ParserLoader() {
+        super("parsers", "default-parser", Parser.class);
+    }
+
+    @Override
+    protected Parser loadComponent(String name, JsonNode configNode,
+                                    LoaderContext context) throws TikaConfigException {
+        try {
+            // Extract framework config (decorations like _mime-include/_mime-exclude)
+            FrameworkConfig framework = FrameworkConfig.extract(
+                    configNode, context.getObjectMapper());
+
+            // Instantiate the parser
+            Parser parser = context.instantiate(name, framework.getComponentConfigNode());
+
+            // Apply mime filtering decorations if present
+            if (framework.getDecoration() != null && framework.getDecoration().hasFiltering()) {
+                parser = applyMimeFiltering(parser, framework.getDecoration());
+            }
+
+            return parser;
+        } catch (IOException e) {
+            throw new TikaConfigException("Failed to load parser: " + name, e);
+        }
+    }
+
+    @Override
+    protected Parser createDefaultComposite(Set<Class<? extends Parser>> exclusions,
+                                             LoaderContext context) {
+        return new DefaultParser(
+                TikaLoader.getMediaTypeRegistry(),
+                new ServiceLoader(context.getClassLoader()),
+                exclusions);
+    }
+
+    @Override
+    protected Set<String> getAllowedMarkerKeys() {
+        // ParserLoader honors framework mime-filter decorators on default-parser
+        // in addition to the standard "exclude" key.
+        return Set.of("exclude", "_mime-include", "_mime-exclude");
+    }
+
+    @Override
+    protected Parser decorateDefaultComposite(Parser parser, JsonNode configNode,
+                                               LoaderContext context) throws TikaConfigException {
+        if (configNode == null) {
+            return parser;
+        }
+
+        try {
+            FrameworkConfig framework = FrameworkConfig.extract(
+                    configNode, context.getObjectMapper());
+
+            if (framework.getDecoration() != null && framework.getDecoration().hasFiltering()) {
+                return applyMimeFiltering(parser, framework.getDecoration());
+            }
+        } catch (IOException e) {
+            throw new TikaConfigException("Failed to apply mime filtering to default-parser", e);
+        }
+
+        return parser;
+    }
+
+    @Override
+    protected Parser wrapInComposite(List<Parser> parsers, LoaderContext context) {
+        return new CompositeParser(TikaLoader.getMediaTypeRegistry(), parsers);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    protected Class<? extends Parser> unwrapClass(Parser component) {
+        if (component instanceof ParserDecorator pd) {
+            return (Class<? extends Parser>) pd.getWrappedParser().getClass();
+        }
+        return component.getClass();
+    }
+
+    @Override
+    protected Parser postProcess(Parser parser, LoaderContext context)
+            throws TikaConfigException {
+        EncodingDetector encodingDetector = context.getEncodingDetector();
+        Renderer renderer = context.getRenderer();
+        injectDependenciesRecursively(parser, encodingDetector, renderer);
+        return parser;
+    }
+
+    /**
+     * Content enrichers are settled once, over the whole tree: the configured list, or
+     * with none, one engine per type resolved from the enrichers among the loaded parsers.
+     * Either way every {@link EnrichingParser} gets a composite (possibly empty), the
+     * effective engines are logged, and every engine under {@code "parsers"}, the deprecated
+     * shape, is called out with what the entry does today.
+     */
+    @Override
+    protected Parser finish(Parser root, LoaderContext context) throws TikaConfigException {
+        CompositeContentEnricher configured = context.getContentEnrichers();
+        CompositeContentEnricher enrichers =
+                configured != null ? configured : ContentEnrichers.resolve(root);
+        logEnrichers(enrichers, configured != null);
+        for (Parser engine : enginesUnderParsers(root)) {
+            warnEngineUnderParsers(engine, root, enrichers, configured != null);
+        }
+        if (configured != null) {
+            for (Map.Entry<List<Parser>, Set<MediaType>> e
+                    : overlappingTextRecognizers(configured).entrySet()) {
+                LOG.warn("Several text recognizers claim {}: {}; all of them run and their "
+                        + "text is concatenated. Keep one per type with _mime-include or "
+                        + "_mime-exclude on the entries.", e.getValue(), names(e.getKey()));
+            }
+        }
+        injectContentEnrichers(root, enrichers);
+        return root;
+    }
+
+    /**
+     * Configured text recognizers that share a media type, keyed by the recognizers and
+     * mapped to the types they share. Two transcriptions of one image is almost never
+     * intended; a recognizer beside an annotator is.
+     */
+    static Map<List<Parser>, Set<MediaType>> overlappingTextRecognizers(
+            CompositeContentEnricher enrichers) {
+        Map<List<Parser>, Set<MediaType>> overlaps = new LinkedHashMap<>();
+        for (MediaType type : new TreeSet<>(enrichers.getSupportedTypes())) {
+            List<Parser> recognizers = new ArrayList<>();
+            for (Parser member : enrichers.getEnrichers(type)) {
+                if (ContentEnrichers.asTextRecognizer(member) != null
+                        || enrichers.isLegacyClaimant(member)) {
+                    recognizers.add(member);
+                }
+            }
+            if (recognizers.size() > 1) {
+                overlaps.computeIfAbsent(recognizers, k -> new TreeSet<>()).add(type);
+            }
+        }
+        return overlaps;
+    }
+
+    private static String names(List<Parser> parsers) {
+        List<String> names = new ArrayList<>();
+        for (Parser p : parsers) {
+            names.add(ParserUtils.getParserClassname(p));
+        }
+        return names.toString();
+    }
+
+    /** Engines (enrichers) named directly under {@code "parsers"}: the deprecated 4.0 shape. */
+    static List<Parser> enginesUnderParsers(Parser root) {
+        List<Parser> engines = new ArrayList<>();
+        if (!(root instanceof CompositeParser composite) || root instanceof DefaultParser) {
+            return engines;
+        }
+        for (Parser member : composite.getAllComponentParsers()) {
+            if (ContentEnrichers.isEnricher(member)) {
+                engines.add(member);
+            }
+        }
+        return engines;
+    }
+
+    /** The types the composite dispatches to this member as their parser. */
+    static Set<MediaType> parsedTypes(Parser root, Parser member) {
+        Set<MediaType> parsed = new TreeSet<>();
+        if (!(root instanceof CompositeParser composite)) {
+            return parsed;
+        }
+        ParseContext empty = new ParseContext();
+        Map<MediaType, Parser> dispatch = composite.getParsers(empty);
+        MediaTypeRegistry registry = composite.getMediaTypeRegistry();
+        for (MediaType type : member.getSupportedTypes(empty)) {
+            if (dispatch.get(registry.normalize(type)) == member) {
+                parsed.add(type);
+            }
+        }
+        return parsed;
+    }
+
+    /**
+     * One WARN per engine under "parsers": the deprecation, then what the entry does today. A
+     * deprecated engine class is left to its own WARN, which already says where to go.
+     */
+    private void warnEngineUnderParsers(Parser engine, Parser root,
+                                        CompositeContentEnricher enrichers,
+                                        boolean listConfigured) {
+        if (unwrapClass(engine).isAnnotationPresent(Deprecated.class)) {
+            return;
+        }
+        String name = ParserUtils.getParserClassname(engine);
+        boolean recognizer = ContentEnrichers.asTextRecognizer(engine) != null;
+        String role = recognizer ? "text recognizer" : "annotator";
+        String lead = name + " is named under \"parsers\", which is deprecated for engines since "
+                + "4.1.0 and unsupported in 4.2.0: configure it under \"engines\" and "
+                + (recognizer ? "name it in \"text-recognizers\". "
+                        : "bind it with \"inference\" (or name it in \"text-recognizers\" to run it on "
+                        + "every image). ");
+        Set<MediaType> advertised = engine.getSupportedTypes(new ParseContext());
+        if (advertised.isEmpty()) {
+            LOG.warn("{}It advertises no media types (engine unavailable, or configured to skip) "
+                    + "and never runs; to turn recognition off, set \"text-recognizers\": [].",
+                    lead);
+            return;
+        }
+        Set<MediaType> parsed = parsedTypes(root, engine);
+        Set<MediaType> enriching = new TreeSet<>();
+        for (MediaType type : enrichers.getSupportedTypes()) {
+            if (enrichers.getEnrichers(type).contains(engine)) {
+                enriching.add(type);
+            }
+        }
+        if (!parsed.isEmpty()) {
+            LOG.warn("{}Today it is the parser for {}{}; in 4.2.0 the default parser keeps those "
+                    + "types and the engine is invoked on their images and rendered pages.", lead,
+                    parsed, enriching.isEmpty() ? "" : " and the " + role + " for " + enriching);
+        } else if (!enriching.isEmpty()) {
+            LOG.warn("{}It is never dispatched to as a parser (every type it advertises is claimed "
+                    + "by another parser); it acts only as the {} for {}.", lead, role, enriching);
+        } else {
+            LOG.warn("{}It never runs: every type it advertises is claimed by another parser and "
+                    + "{}.", lead, listConfigured ? "\"text-recognizers\" does not name it"
+                    : "another engine is preferred for those types");
+        }
+    }
+
+    private static void logEnrichers(CompositeContentEnricher enrichers, boolean configured) {
+        if (enrichers.isEmpty()) {
+            LOG.info("text recognizers: none{}; images and rendered pages are not enriched",
+                    configured ? " (\"text-recognizers\": [])"
+                            : " found among the loaded parsers");
+            return;
+        }
+        Map<Parser, Set<MediaType>> byEngine = new IdentityHashMap<>();
+        for (MediaType type : enrichers.getSupportedTypes()) {
+            for (Parser member : enrichers.getEnrichers(type)) {
+                byEngine.computeIfAbsent(member, k -> new TreeSet<>()).add(type);
+            }
+        }
+        for (Map.Entry<Parser, Set<MediaType>> e : byEngine.entrySet()) {
+            LOG.info("text recognizer {} for {}{}", ParserUtils.getParserClassname(e.getKey()),
+                    e.getValue(), configured ? ""
+                            : " (found among the loaded parsers; name it under "
+                            + "\"text-recognizers\" to pin it)");
+        }
+    }
+
+    private static void injectContentEnrichers(Parser parser,
+                                               CompositeContentEnricher enrichers) {
+        if (parser instanceof EnrichingParser ep) {
+            ep.setContentEnrichers(enrichers);
+        }
+        if (parser instanceof CompositeParser cp) {
+            for (Parser child : cp.getAllComponentParsers()) {
+                injectContentEnrichers(child, enrichers);
+            }
+        } else if (parser instanceof ParserDecorator pd) {
+            injectContentEnrichers(pd.getWrappedParser(), enrichers);
+        }
+    }
+
+    /**
+     * Recursively inject dependencies into a parser and its children.
+     */
+    private void injectDependenciesRecursively(Parser parser, EncodingDetector encodingDetector,
+                                                Renderer renderer) {
+        if (encodingDetector != null && parser instanceof AbstractEncodingDetectorParser aedp) {
+            aedp.setEncodingDetector(encodingDetector);
+        }
+        if (renderer != null && parser instanceof RenderingParser rp) {
+            rp.setRenderer(renderer);
+        }
+        if (parser instanceof CompositeParser cp) {
+            for (Parser child : cp.getAllComponentParsers()) {
+                injectDependenciesRecursively(child, encodingDetector, renderer);
+            }
+        } else if (parser instanceof ParserDecorator pd) {
+            injectDependenciesRecursively(pd.getWrappedParser(), encodingDetector, renderer);
+        }
+    }
+
+    /**
+     * Apply mime type filtering to a parser.
+     * Uses ParserDecorator.withMimeFilters() which creates a MimeFilteringDecorator
+     * that the serializer knows how to handle for round-trip support.
+     */
+    private Parser applyMimeFiltering(Parser parser,
+                                       FrameworkConfig.ParserDecoration decoration)
+            throws TikaConfigException {
+        Set<MediaType> includeTypes = new HashSet<>();
+        Set<MediaType> excludeTypes = new HashSet<>();
+
+        for (String mimeStr : decoration.getMimeInclude()) {
+            includeTypes.add(ComponentInstantiator.parseFilterType(mimeStr));
+        }
+
+        for (String mimeStr : decoration.getMimeExclude()) {
+            excludeTypes.add(ComponentInstantiator.parseFilterType(mimeStr));
+        }
+
+        return ParserDecorator.withMimeFilters(parser, includeTypes, excludeTypes);
+    }
+}

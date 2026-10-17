@@ -14,19 +14,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import java.io.IOException;
 
-import org.apache.tika.langdetect.optimaize.OptimaizeLangDetector;
 import org.apache.tika.language.detect.LanguageDetector;
 import org.apache.tika.language.detect.LanguageResult;
 
 public class LanguageDetectorExample {
 
     public String detectLanguage(String text) throws IOException {
-        LanguageDetector detector = new OptimaizeLangDetector().loadModels();
+        LanguageDetector detector = LanguageDetector.getDefaultLanguageDetector().loadModels();
         LanguageResult result = detector.detect(text);
         return result.getLanguage();
     }

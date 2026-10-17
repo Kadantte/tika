@@ -17,18 +17,19 @@
 package org.apache.tika.parser.txt;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.util.Collections;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.detect.AutoDetectReader;
 import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.AbstractEncodingDetectorParser;
@@ -48,6 +49,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * <dd><code>text/plain; charset=...</code></dd>
  * </dl>
  */
+@TikaComponent(spi = false)
 public class TXTParser extends AbstractEncodingDetectorParser {
 
     /**
@@ -71,15 +73,16 @@ public class TXTParser extends AbstractEncodingDetectorParser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         // Automatically detect the character encoding
-        try (AutoDetectReader reader = new AutoDetectReader(CloseShieldInputStream.wrap(stream),
+        tis.setCloseShield();
+        try (AutoDetectReader reader = new AutoDetectReader(tis,
                 metadata, getEncodingDetector(context))) {
             //try to get detected content type; could be a subclass of text/plain
             //such as vcal, etc.
-            String incomingMime = metadata.get(Metadata.CONTENT_TYPE);
+            String incomingMime = metadata.get(HttpHeaders.CONTENT_TYPE);
             MediaType mediaType = MediaType.TEXT_PLAIN;
             if (incomingMime != null) {
                 MediaType tmpMediaType = MediaType.parse(incomingMime);
@@ -89,23 +92,32 @@ public class TXTParser extends AbstractEncodingDetectorParser {
             }
             Charset charset = reader.getCharset();
             MediaType type = new MediaType(mediaType, charset);
-            metadata.set(Metadata.CONTENT_TYPE, type.toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
             // deprecated, see TIKA-431
-            metadata.set(Metadata.CONTENT_ENCODING, charset.name());
+            metadata.set(HttpHeaders.CONTENT_ENCODING, charset.name());
 
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
             xhtml.startDocument();
-
-            xhtml.startElement("p");
-            char[] buffer = new char[4096];
-            int n = reader.read(buffer);
-            while (n != -1) {
-                xhtml.characters(buffer, 0, n);
-                n = reader.read(buffer);
+            // try/finally so any upstream exception (e.g., WriteLimitReached)
+            // still emits </p> and </body></html> instead of leaving the
+            // captured XHTML unterminated.
+            try {
+                xhtml.startElement("p");
+                try {
+                    char[] buffer = new char[4096];
+                    int n = reader.read(buffer);
+                    while (n != -1) {
+                        xhtml.characters(buffer, 0, n);
+                        n = reader.read(buffer);
+                    }
+                } finally {
+                    xhtml.endElement("p");
+                }
+            } finally {
+                xhtml.endDocument();
             }
-            xhtml.endElement("p");
-
-            xhtml.endDocument();
+        } finally {
+            tis.removeCloseShield();
         }
     }
 

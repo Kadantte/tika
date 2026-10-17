@@ -18,30 +18,33 @@ package org.apache.tika.parser.microsoft.rtf;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
+import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.Tika;
 import org.apache.tika.TikaTest;
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.extractor.ContainerExtractor;
 import org.apache.tika.extractor.ParserContainerExtractor;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.DublinCore;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
-import org.apache.tika.parser.AutoDetectParser;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 
 /**
@@ -55,10 +58,43 @@ public class RTFParserTest extends TikaTest {
         Metadata metadata = new Metadata();
         String content = getText("testRTF.rtf", metadata);
 
-        assertEquals("application/rtf", metadata.get(Metadata.CONTENT_TYPE));
-        assertEquals(1, metadata.getValues(Metadata.CONTENT_TYPE).length);
+        assertEquals("application/rtf", metadata.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(1, metadata.getValues(HttpHeaders.CONTENT_TYPE).length);
         assertContains("Test", content);
         assertContains("indexation Word", content);
+    }
+
+    @Test //TIKA-4744
+    public void testParInsideHyperlink() throws Exception {
+        // A \par inside a HYPERLINK's \fldrslt used to leave <a> on the SAX
+        // stack while endParagraph emitted </p>, tripping the strict
+        // validator with </p> vs <a>. The exception was masked by the
+        // finally's xhtml.endDocument() throwing </body> vs <p>; visible
+        // end-state was just "<p> open at endDocument". Closing pending <a>
+        // before </p> drops the link span at the paragraph break, which is
+        // the right XHTML rendering.
+        XMLResult r = getXML("testRTF_parInsideHyperlink.rtf");
+        // First paragraph contains the link text, properly closed.
+        assertContains("<a href=\"#target\">line1</a>", r.xml);
+        // Second paragraph picks up the post-\par text without an open <a>.
+        assertContains("line2", r.xml);
+    }
+
+    @Test //TIKA-4744
+    public void testNestedHyperlinkPageRef() throws Exception {
+        // A HYPERLINK field with a PAGEREF \field nested inside its \fldrslt
+        // used to leak: the nested \fldinst would overwrite fieldState=3 with
+        // 1, so the outer fldrslt's group close skipped the </a> emission and
+        // <a> stayed open. The cascade surfaced at endDocument as the strict
+        // validator complaining </body> didn't match topmost <p>.
+        // getXML wraps the handler in StrictXHTMLValidator, so any imbalance
+        // would throw before the assertions.
+        XMLResult r = getXML("testRTF_nestedHyperlinkPageRef.rtf");
+        // PAGEREF result "42" should render INSIDE the outer hyperlink's <a>,
+        // not after a prematurely-closed </a>:
+        assertContains("<a href=\"#target\">42</a>", r.xml);
+        assertContains("Before", r.xml);
+        assertContains("after.", r.xml);
     }
 
     @Test
@@ -344,16 +380,13 @@ public class RTFParserTest extends TikaTest {
 
     @Test
     public void testTurningOffList() throws Exception {
-        try (InputStream is = getResourceAsStream(
-                "/org/apache/tika/parser/microsoft/rtf/ignoreListMarkup-tika-config.xml")) {
-            assertNotNull(is);
-            TikaConfig tikaConfig = new TikaConfig(is);
-            Parser p = new AutoDetectParser(tikaConfig);
-            String content = getXML("testRTFListMicrosoftWord.rtf", p).xml;
-            assertNotContained("<ol>", content);
-            assertNotContained("<ul>", content);
-            assertNotContained("<li>", content);
-        }
+        Parser p = TikaLoader.load(
+                getConfigPath(RTFParserTest.class, "ignoreListMarkup-tika-config.json"))
+                .loadAutoDetectParser();
+        String content = getXML("testRTFListMicrosoftWord.rtf", p).xml;
+        assertNotContained("<ol>", content);
+        assertNotContained("<ul>", content);
+        assertNotContained("<li>", content);
     }
 
     @Test
@@ -369,11 +402,12 @@ public class RTFParserTest extends TikaTest {
     @Test
     public void testBinControlWord() throws Exception {
         ByteCopyingHandler embHandler = new ByteCopyingHandler();
+        ParseContext context = new ParseContext();
         try (TikaInputStream tis = TikaInputStream
                 .get(getResourceAsStream("/test-documents/testBinControlWord.rtf"))) {
             ContainerExtractor ex = new ParserContainerExtractor();
-            assertEquals(true, ex.isSupported(tis));
-            ex.extract(tis, ex, embHandler);
+            assertEquals(true, ex.isSupported(tis, context));
+            ex.extract(tis, ex, embHandler, context);
         }
         assertEquals(1, embHandler.bytes.size());
 
@@ -392,9 +426,28 @@ public class RTFParserTest extends TikaTest {
         assertEquals("1", xml.metadata.get(Office.PAGE_COUNT));
         assertEquals("70", xml.metadata.get(Office.WORD_COUNT));
         assertEquals("401", xml.metadata.get(Office.CHARACTER_COUNT));
-        //RTFParser's legacy behavior is to apply local timezone to dates/times.
-        //This needs to be flexible enough to pass in various time-zones TIKA-4043
-        assertTrue(xml.metadata.get(TikaCoreProperties.CREATED).startsWith("2010-10-"));
+        assertEquals("2010-10-13T02:55:00", xml.metadata.get(TikaCoreProperties.CREATED));
+    }
+
+    @Test
+    public void testCreationDateFields() throws Exception {
+        assertEquals("2012-03-04T05:06:00", created("{\\creatim\\yr2012\\mo3\\dy4\\hr5\\min6}"));
+        assertEquals("2012-03-04", created("{\\creatim\\yr2012\\mo3\\dy4}"));   // no time: date-only
+        assertEquals("2012-03-04T05:00:00", created("{\\creatim\\yr2012\\mo3\\dy4\\hr5}"));
+        assertNull(created("{\\creatim}"));                            // was a negative year
+        assertNull(created("{\\creatim\\yr0\\mo0\\dy0\\hr0\\min0}"));
+        assertNull(created("{\\creatim\\yr2012\\mo13\\dy40}"));        // was rolled over into 2013
+        // no leak from an earlier date group
+        assertNull(created("{\\printim\\yr2011\\mo1\\dy1}{\\creatim}"));
+    }
+
+    private String created(String infoGroups) throws Exception {
+        String rtf = "{\\rtf1\\ansi{\\info" + infoGroups + "}hello}";
+        Metadata metadata = new Metadata();
+        try (TikaInputStream tis = TikaInputStream.get(rtf.getBytes(StandardCharsets.US_ASCII))) {
+            new RTFParser().parse(tis, new DefaultHandler(), metadata, new ParseContext());
+        }
+        return metadata.get(TikaCoreProperties.CREATED);
     }
 
     // TIKA-1192
@@ -425,12 +478,13 @@ public class RTFParserTest extends TikaTest {
         skipTypes.add(MediaType.parse("image/emf"));
         skipTypes.add(MediaType.parse("image/wmf"));
 
+        ParseContext context = new ParseContext();
         TrackingHandler tracker = new TrackingHandler(skipTypes);
         try (TikaInputStream tis = TikaInputStream
                 .get(getResourceAsStream("/test-documents/testRTFEmbeddedLink.rtf"))) {
             ContainerExtractor ex = new ParserContainerExtractor();
-            assertEquals(true, ex.isSupported(tis));
-            ex.extract(tis, ex, tracker);
+            assertEquals(true, ex.isSupported(tis, context));
+            ex.extract(tis, ex, tracker, context);
         }
         //should gracefully skip link and not throw NPE, IOEx, etc
         assertEquals(0, tracker.filenames.size());
@@ -439,8 +493,8 @@ public class RTFParserTest extends TikaTest {
         try (TikaInputStream tis = TikaInputStream
                 .get(getResourceAsStream("/test-documents/testRTFEmbeddedLink.rtf"))) {
             ContainerExtractor ex = new ParserContainerExtractor();
-            assertEquals(true, ex.isSupported(tis));
-            ex.extract(tis, ex, tracker);
+            assertEquals(true, ex.isSupported(tis, context));
+            ex.extract(tis, ex, tracker, context);
         }
         //should gracefully skip link and not throw NPE, IOEx, etc
         assertEquals(2, tracker.filenames.size());
@@ -451,16 +505,13 @@ public class RTFParserTest extends TikaTest {
         //test that memory allocation of the bin element is limited
         //via the config file.  Unfortunately, this test file's bin embedding contains 10 bytes
         //so we had to set the config to 0.
-        try (InputStream is = getResourceAsStream(
-                "/org/apache/tika/parser/microsoft/rtf/tika-config.xml")) {
-            assertNotNull(is);
-            TikaConfig tikaConfig = new TikaConfig(is);
-            Parser p = new AutoDetectParser(tikaConfig);
-            List<Metadata> metadataList = getRecursiveMetadata("testBinControlWord.rtf", p);
-            assertEquals(1, metadataList.size());
-            assertContains("TikaMemoryLimitException", metadataList.get(0)
-                    .get(TikaCoreProperties.TIKA_META_EXCEPTION_EMBEDDED_STREAM));
-        }
+        Parser p = TikaLoader.load(
+                getConfigPath(RTFParserTest.class, "tika-config.json"))
+                .loadAutoDetectParser();
+        List<Metadata> metadataList = getRecursiveMetadata("testBinControlWord.rtf", p);
+        assertEquals(1, metadataList.size());
+        assertContains("TikaMemoryLimitException", metadataList.get(0)
+                .get(TikaCoreProperties.TIKA_META_EXCEPTION_EMBEDDED_STREAM));
     }
 
     @Test

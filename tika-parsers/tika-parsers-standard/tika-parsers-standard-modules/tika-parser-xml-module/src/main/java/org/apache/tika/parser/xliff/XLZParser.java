@@ -17,7 +17,6 @@
 package org.apache.tika.parser.xliff;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.Set;
@@ -25,10 +24,13 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
+import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
@@ -40,6 +42,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
 /**
  * Parser for XLZ Archives.
  */
+@TikaComponent
 public class XLZParser implements Parser {
 
     /**
@@ -71,27 +74,22 @@ public class XLZParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler baseHandler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler baseHandler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         ZipFile zipFile = null;
         ZipInputStream zipStream = null;
-        if (stream instanceof TikaInputStream) {
-            TikaInputStream tis = (TikaInputStream) stream;
-            Object container = ((TikaInputStream) stream).getOpenContainer();
-            if (container instanceof ZipFile) {
-                zipFile = (ZipFile) container;
-            } else if (tis.hasFile()) {
-                zipFile = new ZipFile(tis.getFile());
-            } else {
-                zipStream = new ZipInputStream(stream);
-            }
+        Object container = tis.getOpenContainer();
+        if (container instanceof ZipFile) {
+            zipFile = (ZipFile) container;
+        } else if (tis.hasFile()) {
+            zipFile = new ZipFile(tis.getFile());
         } else {
-            zipStream = new ZipInputStream(stream);
+            zipStream = new ZipInputStream(tis);
         }
 
         // Prepare to handle the content
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(baseHandler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(baseHandler, metadata, context);
         EndDocumentShieldingContentHandler handler = new EndDocumentShieldingContentHandler(xhtml);
         if (zipFile != null) {
             try {
@@ -122,7 +120,11 @@ public class XLZParser implements Parser {
         }
         while (entry != null) {
             if (entry.getName().contains(XLF)) {
-                xliffParser.parse(zipStream, handler, metadata, context);
+                // Wrap in CloseShieldInputStream so closing TikaInputStream won't close zipStream
+                try (TikaInputStream tisZip =
+                             TikaInputStream.get(CloseShieldInputStream.wrap(zipStream))) {
+                    xliffParser.parse(tisZip, handler, metadata, context);
+                }
             }
             entry = zipStream.getNextEntry();
         }
@@ -136,7 +138,10 @@ public class XLZParser implements Parser {
         while (entries.hasMoreElements()) {
             ZipEntry entry = entries.nextElement();
             if (entry.getName().contains(XLF)) {
-                xliffParser.parse(zipFile.getInputStream(entry), handler, metadata, context);
+                try (TikaInputStream tisZip = TikaInputStream.get(
+                        () -> zipFile.getInputStream(entry), new TemporaryResources(), null)) {
+                    xliffParser.parse(tisZip, handler, metadata, context);
+                }
             }
         }
     }

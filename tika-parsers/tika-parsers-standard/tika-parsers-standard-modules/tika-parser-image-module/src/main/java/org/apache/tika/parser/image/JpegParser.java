@@ -24,14 +24,18 @@ import java.util.Set;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.CacheMemoryBudget;
 import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
-import org.apache.tika.parser.xmp.JempboxExtractor;
 
+@TikaComponent
 public class JpegParser extends AbstractImageParser {
 
     /**
@@ -41,6 +45,20 @@ public class JpegParser extends AbstractImageParser {
 
     private static final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.image("jpeg"));
+
+    private final ImageMetadataConfig defaultConfig;
+
+    public JpegParser() {
+        this(new ImageMetadataConfig());
+    }
+
+    public JpegParser(ImageMetadataConfig config) {
+        this.defaultConfig = config;
+    }
+
+    public JpegParser(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, ImageMetadataConfig.class));
+    }
 
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
@@ -53,8 +71,14 @@ public class JpegParser extends AbstractImageParser {
         TemporaryResources tmp = new TemporaryResources();
         try {
             TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
-            new ImageMetadataExtractor(metadata).parseJpeg(tis.getFile());
-            new JempboxExtractor(metadata).parse(tis);
+            // two sequential passes; rewind rather than spool between them
+            tis.enableRewind(parseContext.get(CacheMemoryBudget.class));
+            // XMP first so it is canonical; the metadata-extractor handlers (IPTC/EXIF) fill gaps.
+            ImageXmp.extractJpeg(tis, metadata, parseContext);
+            tis.rewind();
+            new ImageMetadataExtractor(metadata,
+                    ImageMetadataConfig.resolve(parseContext, "jpeg-parser", defaultConfig))
+                    .parseJpeg(tis);
         } finally {
             tmp.dispose();
         }

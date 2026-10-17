@@ -30,16 +30,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.xml.namespace.QName;
 
-import org.apache.commons.io.input.UnsynchronizedByteArrayInputStream;
-
 import org.apache.tika.Tika;
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.detect.TextDetector;
 import org.apache.tika.detect.XmlRootExtractor;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
 
 /**
  * This class is a MimeType repository. It gathers a set of MimeTypes and
@@ -55,12 +58,15 @@ import org.apache.tika.metadata.TikaCoreProperties;
  * (if available) to restore the stream back to the state it was before type
  * detection if it wants to process the stream based on the detected type.
  */
+@TikaComponent(spi = false)
 public final class MimeTypes implements Detector, Serializable {
 
     /**
      * Name of the {@link #rootMimeType root} type, application/octet-stream.
      */
     public static final String OCTET_STREAM = "application/octet-stream";
+    private static final MediaType TEXT_BASED_MESSAGE =
+            MediaType.parse("text/x-tika-text-based-message");
     /**
      * Name of the {@link #textMimeType text} type, text/plain.
      */
@@ -100,7 +106,8 @@ public final class MimeTypes implements Detector, Serializable {
     /**
      * All the registered MimeTypes indexed on their canonical names
      */
-    private final Map<MediaType, MimeType> types = new HashMap<>();
+    // ConcurrentHashMap: forName reads this outside the lock that mutates it
+    private final Map<MediaType, MimeType> types = new ConcurrentHashMap<>();
     /**
      * The patterns matcher
      */
@@ -292,10 +299,10 @@ public final class MimeTypes implements Detector, Serializable {
         // Finally, assume plain text if no control bytes are found
         try {
             TextDetector detector = new TextDetector(getMinLength());
-            UnsynchronizedByteArrayInputStream stream =
-                    UnsynchronizedByteArrayInputStream.builder().setByteArray(data).get();
-            MimeType type = forName(detector.detect(stream, new Metadata()).toString());
-            return Collections.singletonList(type);
+            try (TikaInputStream tis = TikaInputStream.get(data)) {
+                MimeType type = forName(detector.detect(tis, new Metadata(), new ParseContext()).toString());
+                return Collections.singletonList(type);
+            }
         } catch (Exception e) {
             return rootMimeTypeL;
         }
@@ -315,11 +322,23 @@ public final class MimeTypes implements Detector, Serializable {
      * @throws IOException if the stream can not be read
      */
     byte[] readMagicHeader(InputStream stream) throws IOException {
+        return readMagicHeader(stream, getMinLength());
+    }
+
+    /**
+     * Like {@link #readMagicHeader(InputStream)} but sized by {@code maxBytes} when the
+     * caller knows the stream is shorter than {@link #getMinLength()} -- avoids a fresh
+     * 64KB allocation per detection for every small (e.g. embedded) document.
+     */
+    byte[] readMagicHeader(InputStream stream, int maxBytes) throws IOException {
         if (stream == null) {
             throw new IllegalArgumentException("InputStream is missing");
         }
+        if (maxBytes == 0) {
+            return new byte[0];
+        }
 
-        byte[] bytes = new byte[getMinLength()];
+        byte[] bytes = new byte[maxBytes];
         int totalRead = 0;
 
         int lastRead = stream.read(bytes);
@@ -347,26 +366,27 @@ public final class MimeTypes implements Detector, Serializable {
      */
     public MimeType forName(String name) throws MimeTypeException {
         MediaType type = MediaType.parse(name);
-        if (type != null) {
-            MediaType normalisedType = registry.normalize(type);
-            MimeType mime = types.get(normalisedType);
-
-            if (mime == null) {
-                synchronized (this) {
-                    // Double check it didn't already get added while
-                    //  we were waiting for the lock
-                    mime = types.get(normalisedType);
-                    if (mime == null) {
-                        mime = new MimeType(type);
-                        add(mime);
-                        types.put(type, mime);
-                    }
-                }
-            }
-            return mime;
-        } else {
+        if (type == null) {
             throw new MimeTypeException("Invalid media type name: " + name);
         }
+        MediaType normalisedType = registry.normalize(type);
+        MimeType mime = types.get(normalisedType);
+
+        if (mime == null) {
+            synchronized (this) {
+                // Double check it didn't already get added while
+                //  we were waiting for the lock
+                mime = types.get(normalisedType);
+                if (mime == null) {
+                    mime = new MimeType(type);
+                    add(mime);
+                    // add() indexed the raw type; index the normalized key too, or an
+                    // aliased parameterized name would miss (and re-lock) on every call
+                    types.putIfAbsent(normalisedType, mime);
+                }
+            }
+        }
+        return mime;
     }
 
     /**
@@ -517,17 +537,27 @@ public final class MimeTypes implements Detector, Serializable {
      * @throws IOException if the document stream could not be read
      */
     @Override
-    public MediaType detect(InputStream input, Metadata metadata) throws IOException {
+    public MediaType detect(TikaInputStream tis, Metadata metadata, ParseContext parseContext)
+            throws IOException {
         List<MimeType> possibleTypes = null;
 
         // Get type based on magic prefix
-        if (input != null) {
-            input.mark(getMinLength());
+        if (tis != null) {
+            int toRead = getMinLength();
+            // Only a measured length may shrink the read: a lying declared
+            // Content-Length would silently truncate the magic prefix.
+            if (tis.hasReliableLength()) {
+                long known = tis.getLength() - tis.getPosition();
+                if (known >= 0 && known < toRead) {
+                    toRead = (int) known;
+                }
+            }
+            tis.mark(getMinLength());
             try {
-                byte[] prefix = readMagicHeader(input);
+                byte[] prefix = readMagicHeader(tis, toRead);
                 possibleTypes = getMimeType(prefix);
             } finally {
-                input.reset();
+                tis.reset();
             }
         }
 
@@ -538,21 +568,26 @@ public final class MimeTypes implements Detector, Serializable {
             boolean isHttp = false;
 
             // Deal with a URI or a path name in as the resource  name
-            try {
-                URI uri = new URI(resourceName);
-                String scheme = uri.getScheme();
-                isHttp = scheme != null && scheme.startsWith("http"); // http or https
-                String path = uri.getPath();
-                if (path != null) {
-                    int slash = path.lastIndexOf('/');
-                    if (slash + 1 < path.length()) {
-                        name = path.substring(slash + 1);
-                    }
-                }
-            } catch (URISyntaxException e) {
+            // A space guarantees URISyntaxException; skip the constructor (and its
+            // exception fill-in) for that common embedded-resource case.
+            if (resourceName.indexOf(' ') >= 0) {
                 name = resourceName;
+            } else {
+                try {
+                    URI uri = new URI(resourceName);
+                    String scheme = uri.getScheme();
+                    isHttp = scheme != null && scheme.startsWith("http"); // http or https
+                    String path = uri.getPath();
+                    if (path != null) {
+                        int slash = path.lastIndexOf('/');
+                        if (slash + 1 < path.length()) {
+                            name = path.substring(slash + 1);
+                        }
+                    }
+                } catch (URISyntaxException e) {
+                    name = resourceName;
+                }
             }
-
             if (name != null) {
                 MimeType hint = getMimeType(name);
 
@@ -568,7 +603,7 @@ public final class MimeTypes implements Detector, Serializable {
         }
 
         // Get type based on metadata hint (if available)
-        String typeName = metadata.get(Metadata.CONTENT_TYPE);
+        String typeName = metadata.get(HttpHeaders.CONTENT_TYPE);
         if (typeName != null) {
             try {
                 MimeType hint = forName(typeName);
@@ -597,9 +632,14 @@ public final class MimeTypes implements Detector, Serializable {
             return Collections.singletonList(hint);
         } else {
             for (final MimeType type : possibleTypes) {
-                if (hint.equals(type) ||
-                        registry.isSpecializationOf(hint.getType(), type.getType())) {
-                    // Use just this type
+                if (hint.equals(type)) {
+                    return Collections.singletonList(hint);
+                }
+                // a message type's magic is the verdict: prose named .emlx is not mail, though
+                // prose named .java is still java source (no magic can tell)
+                if (registry.isSpecializationOf(hint.getType(), type.getType())
+                        && !(MediaType.TEXT_PLAIN.equals(type.getType())
+                        && registry.isSpecializationOf(hint.getType(), TEXT_BASED_MESSAGE))) {
                     return Collections.singletonList(hint);
                 }
             }

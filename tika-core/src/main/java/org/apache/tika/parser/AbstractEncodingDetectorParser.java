@@ -16,22 +16,21 @@
  */
 package org.apache.tika.parser;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.DefaultEncodingDetector;
 import org.apache.tika.detect.EncodingDetector;
 
 
 /**
  * Abstract base class for parsers that use the AutoDetectReader and need
- * to use the {@link EncodingDetector} configured by {@link TikaConfig}
+ * to use an {@link EncodingDetector}.
  */
 public abstract class AbstractEncodingDetectorParser implements Parser {
 
 
-    private EncodingDetector encodingDetector;
+    // lazy: loaders replace it with the shared detector, and building one loads the models
+    private volatile EncodingDetector encodingDetector;
 
     public AbstractEncodingDetectorParser() {
-        encodingDetector = new DefaultEncodingDetector();
     }
 
     public AbstractEncodingDetectorParser(EncodingDetector encodingDetector) {
@@ -56,7 +55,17 @@ public abstract class AbstractEncodingDetectorParser implements Parser {
     }
 
     public EncodingDetector getEncodingDetector() {
-        return encodingDetector;
+        EncodingDetector detector = encodingDetector;
+        if (detector == null) {
+            synchronized (this) {
+                detector = encodingDetector;
+                if (detector == null) {
+                    detector = new DefaultEncodingDetector();
+                    encodingDetector = detector;
+                }
+            }
+        }
+        return detector;
     }
 
     public void setEncodingDetector(EncodingDetector encodingDetector) {

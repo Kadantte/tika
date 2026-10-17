@@ -26,19 +26,31 @@ import java.util.Locale;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.OutputLimits;
 import org.apache.tika.parser.ParseContext;
 
 /**
- * Basic factory for creating common types of ContentHandlers
+ * Basic factory for creating common types of ContentHandlers.
+ * <p>
+ * Implements {@link StreamingContentHandlerFactory} to support both in-memory
+ * content extraction and streaming output to an OutputStream.
  */
-public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteLimiter {
+@TikaComponent(defaultFor = ContentHandlerFactory.class)
+public class BasicContentHandlerFactory implements StreamingContentHandlerFactory, WriteLimiter {
 
-    private final HANDLER_TYPE type;
-    private final int writeLimit;
+    private HANDLER_TYPE type = HANDLER_TYPE.MARKDOWN;
+    private int writeLimit = -1;
+    private boolean throwOnWriteLimitReached = true;
+    private boolean validateXHTML = false;
+    private transient ParseContext parseContext;
 
-    private final boolean throwOnWriteLimitReached;
-
-    private final ParseContext parseContext;
+    /**
+     * No-arg constructor for bean-style configuration (e.g., Jackson deserialization).
+     * Creates a factory with MARKDOWN handler type, unlimited write, and throwOnWriteLimitReached=true.
+     */
+    public BasicContentHandlerFactory() {
+    }
 
     /**
      * Create a BasicContentHandlerFactory with {@link #throwOnWriteLimitReached} is true
@@ -70,18 +82,55 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
             throw new IllegalArgumentException("parse context must not be null if " +
                     "throwOnWriteLimitReached is false");
         }
-
     }
 
     /**
-     * Tries to parse string into handler type.  Returns default if string is null or
-     * parse fails.
-     * <p/>
-     * Options: xml, html, text, body, ignore (no content)
+     * When true, every handler produced by this factory is wrapped in a
+     * {@link StrictXHTMLValidator} so that any malformed XHTML event sequence
+     * emitted by a parser throws a {@link org.xml.sax.SAXException} at the
+     * offending event. Defaults to false. Intended for catching parser bugs
+     * in development / corpus scans; off in production for performance and
+     * because not every caller wants validation failures to surface as
+     * parser exceptions.
+     */
+    public void setValidateXHTML(boolean validateXHTML) {
+        this.validateXHTML = validateXHTML;
+    }
+
+    public boolean isValidateXHTML() {
+        return validateXHTML;
+    }
+
+    /**
+     * Creates a new BasicContentHandlerFactory configured from OutputLimits in the ParseContext.
+     * <p>
+     * If OutputLimits is present in the context, the factory will be configured with those
+     * limits (writeLimit, throwOnWriteLimit). Otherwise, default values are used.
      *
-     * @param handlerTypeName string to parse
-     * @param defaultType     type to return if parse fails
+     * @param type the handler type
+     * @param context the ParseContext (required if throwOnWriteLimit is false)
+     * @return a configured BasicContentHandlerFactory
+     */
+    public static BasicContentHandlerFactory newInstance(HANDLER_TYPE type, ParseContext context) {
+        OutputLimits limits = OutputLimits.get(context);
+        return new BasicContentHandlerFactory(type, limits.getWriteLimit(),
+                limits.isThrowOnWriteLimit(), context);
+    }
+
+    /** Accepted spellings, for error messages. */
+    // String.join defeats compile-time constant inlining into downstream jars
+    public static final String VALID_HANDLER_TYPE_NAMES =
+            String.join(", ", "text", "txt", "html", "xml", "body", "markdown", "md", "ignore");
+
+    /**
+     * Parses a string into a handler type.
+     * <p/>
+     * Options: xml, html, text/txt, body, ignore (no content), markdown/md
+     *
+     * @param handlerTypeName string to parse; null means "unspecified", which yields defaultType
+     * @param defaultType     type to return when handlerTypeName is null
      * @return handler type
+     * @throws IllegalArgumentException if handlerTypeName is non-null and not recognized
      */
     public static HANDLER_TYPE parseHandlerType(String handlerTypeName, HANDLER_TYPE defaultType) {
         if (handlerTypeName == null) {
@@ -102,20 +151,30 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
                 return HANDLER_TYPE.BODY;
             case "ignore":
                 return HANDLER_TYPE.IGNORE;
+            case "markdown":
+            case "md":
+                return HANDLER_TYPE.MARKDOWN;
             default:
-                return defaultType;
+                // A name we don't know is a caller mistake, not a request for the default:
+                // silently substituting one meant "/rmeta/txet" quietly returned the default
+                // handler's output and looked like it worked.
+                throw new IllegalArgumentException("Unrecognized handler type '" + handlerTypeName
+                        + "'. Valid types: " + VALID_HANDLER_TYPE_NAMES);
         }
     }
 
     @Override
-    public ContentHandler getNewContentHandler() {
+    public ContentHandler createHandler() {
+        return maybeValidate(createHandlerInner());
+    }
 
+    private ContentHandler createHandlerInner() {
         if (type == HANDLER_TYPE.BODY) {
             return new BodyContentHandler(
                     new WriteOutContentHandler(new ToTextContentHandler(), writeLimit,
                     throwOnWriteLimitReached, parseContext));
         } else if (type == HANDLER_TYPE.IGNORE) {
-            return new DefaultHandler();
+            return new NoOpContentHandler();
         }
         ContentHandler formatHandler = getFormatHandler();
         if (writeLimit < 0) {
@@ -123,6 +182,10 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
         }
         return new WriteOutContentHandler(formatHandler, writeLimit, throwOnWriteLimitReached,
                 parseContext);
+    }
+
+    private ContentHandler maybeValidate(ContentHandler h) {
+        return validateXHTML ? new StrictXHTMLValidator(h) : h;
     }
 
     private ContentHandler getFormatHandler() {
@@ -133,16 +196,21 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
                 return new ToHTMLContentHandler();
             case XML:
                 return new ToXMLContentHandler();
+            case MARKDOWN:
+                return new ToMarkdownContentHandler();
             default:
                 return new ToTextContentHandler();
         }
     }
 
     @Override
-    public ContentHandler getNewContentHandler(OutputStream os, Charset charset) {
+    public ContentHandler createHandler(OutputStream os, Charset charset) {
+        return maybeValidate(createHandlerInner(os, charset));
+    }
 
+    private ContentHandler createHandlerInner(OutputStream os, Charset charset) {
         if (type == HANDLER_TYPE.IGNORE) {
-            return new DefaultHandler();
+            return new NoOpContentHandler();
         }
         try {
             if (writeLimit > -1) {
@@ -160,6 +228,9 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
                     case XML:
                         return new WriteOutContentHandler(
                                 new ToXMLContentHandler(os, charset.name()), writeLimit);
+                    case MARKDOWN:
+                        return new WriteOutContentHandler(
+                                new ToMarkdownContentHandler(os, charset.name()), writeLimit);
                     default:
                         return new WriteOutContentHandler(
                                 new ToTextContentHandler(os, charset.name()), writeLimit);
@@ -174,6 +245,8 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
                         return new ToHTMLContentHandler(os, charset.name());
                     case XML:
                         return new ToXMLContentHandler(os, charset.name());
+                    case MARKDOWN:
+                        return new ToMarkdownContentHandler(os, charset.name());
                     default:
                         return new ToTextContentHandler(os, charset.name());
 
@@ -191,20 +264,97 @@ public class BasicContentHandlerFactory implements ContentHandlerFactory, WriteL
         return type;
     }
 
+    @Override
+    public String handlerTypeName() {
+        return type.name();
+    }
+
+    /**
+     * Sets the handler type.
+     * @param type the handler type
+     */
+    public void setType(HANDLER_TYPE type) {
+        this.type = type;
+    }
+
     /**
      * Common handler types for content.
      */
     public enum HANDLER_TYPE {
         BODY, IGNORE, //don't store content
-        TEXT, HTML, XML
+        TEXT, HTML, XML, MARKDOWN
     }
 
     public int getWriteLimit() {
         return writeLimit;
     }
 
+    /**
+     * Sets the write limit.
+     * @param writeLimit max characters to extract; -1 for unlimited
+     */
+    public void setWriteLimit(int writeLimit) {
+        this.writeLimit = writeLimit;
+    }
+
     @Override
     public boolean isThrowOnWriteLimitReached() {
         return throwOnWriteLimitReached;
+    }
+
+    /**
+     * Sets whether to throw an exception when write limit is reached.
+     * @param throwOnWriteLimitReached true to throw, false to silently stop
+     */
+    public void setThrowOnWriteLimitReached(boolean throwOnWriteLimitReached) {
+        this.throwOnWriteLimitReached = throwOnWriteLimitReached;
+    }
+
+    /**
+     * Sets the parse context for storing warnings when throwOnWriteLimitReached is false.
+     * @param parseContext the parse context
+     */
+    public void setParseContext(ParseContext parseContext) {
+        this.parseContext = parseContext;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        BasicContentHandlerFactory that = (BasicContentHandlerFactory) o;
+        return writeLimit == that.writeLimit &&
+                throwOnWriteLimitReached == that.throwOnWriteLimitReached &&
+                validateXHTML == that.validateXHTML &&
+                type == that.type;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = type != null ? type.hashCode() : 0;
+        result = 31 * result + writeLimit;
+        result = 31 * result + (throwOnWriteLimitReached ? 1 : 0);
+        result = 31 * result + (validateXHTML ? 1 : 0);
+        return result;
+    }
+
+    /**
+     * DefaultHandler, but with toString() returning "" instead of the default
+     * Object identity string. Callers that want to know whether a parse
+     * actually produced content can blank-check toString() directly -- no
+     * need to special-case DefaultHandler's class identity, which breaks the
+     * moment this handler is wrapped by a decorator (e.g. StrictXHTMLValidator
+     * when validateXHTML is set): ContentHandlerDecorator.toString() delegates
+     * to the wrapped handler, so the empty string still propagates through.
+     */
+    private static final class NoOpContentHandler extends DefaultHandler {
+        @Override
+        public String toString() {
+            return "";
+        }
     }
 }

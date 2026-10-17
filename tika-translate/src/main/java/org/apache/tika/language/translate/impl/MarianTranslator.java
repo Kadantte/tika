@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.language.translate.impl;
 
 
@@ -47,6 +46,7 @@ import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.utils.StringUtils;
 
@@ -57,6 +57,7 @@ import org.apache.tika.utils.StringUtils;
  *
  * @link https://marian-nmt.github.io/.
  */
+@TikaComponent
 public class MarianTranslator extends AbstractTranslator {
 
     private static final Logger LOG = LoggerFactory.getLogger(MarianTranslator.class);
@@ -131,15 +132,14 @@ public class MarianTranslator extends AbstractTranslator {
 
         StringBuilder translation = new StringBuilder();
         File tmpFile = Files.createTempFile(INPUT_TMP_NAME, ".tmp").toFile();
-        tmpFile.deleteOnExit();
-        try (OutputStreamWriter out = new OutputStreamWriter(new FileOutputStream(tmpFile),
-                Charset.defaultCharset())) {
-            out.append(text).append('\n').close();
-        }
-        File tmpTranslatedFile = Files.createTempFile(OUTPUT_TMP_NAME, ".tmp").toFile();
-        tmpTranslatedFile.deleteOnExit();
-
+        File tmpTranslatedFile = null;
         try {
+            try (OutputStreamWriter out = new OutputStreamWriter(new FileOutputStream(tmpFile),
+                    Charset.defaultCharset())) {
+                out.append(text).append('\n').close();
+            }
+            tmpTranslatedFile = Files.createTempFile(OUTPUT_TMP_NAME, ".tmp").toFile();
+
             String preProcessScript = config.getProperty("translator.marian.preprocess");
             executeScript(preProcessScript, tmpFile);
 
@@ -160,13 +160,23 @@ public class MarianTranslator extends AbstractTranslator {
 
         } catch (InterruptedException e) {
             throw new TikaException("Failed perform translation", e);
-        }
-
-        if (!tmpFile.delete() || !tmpTranslatedFile.delete()) {
-            throw new IOException("Failed to delete temporary files.");
+        } finally {
+            deleteQuietly(tmpFile);
+            deleteQuietly(tmpTranslatedFile);
         }
 
         return translation.toString();
+    }
+
+    private static void deleteQuietly(File file) {
+        if (file == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(file.toPath());
+        } catch (IOException e) {
+            LOG.warn("Failed to delete temporary file {}", file, e);
+        }
     }
 
     /**

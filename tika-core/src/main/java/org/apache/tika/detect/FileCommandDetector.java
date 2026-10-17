@@ -16,25 +16,19 @@
  */
 package org.apache.tika.detect;
 
-import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
-
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.io.BoundedInputStream;
-import org.apache.tika.io.TemporaryResources;
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.ExternalProcess;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.mime.MediaType;
-import org.apache.tika.parser.external.ExternalParser;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.utils.FileProcessResult;
 import org.apache.tika.utils.ProcessUtils;
 import org.apache.tika.utils.StringUtils;
@@ -54,6 +48,7 @@ import org.apache.tika.utils.StringUtils;
  * to true.  The default behavior is to store the value as {@link FileCommandDetector#FILE_MIME}
  * but rely on other detectors for the "active" mime used by Tika.
  */
+@TikaComponent(spi = false)
 public class FileCommandDetector implements Detector {
 
     //TODO: file has some diff mimes names for some very common mimes
@@ -61,13 +56,13 @@ public class FileCommandDetector implements Detector {
 
     public static Property FILE_MIME = Property.externalText("file:mime");
     private static final Logger LOGGER = LoggerFactory.getLogger(FileCommandDetector.class);
-    private static final long DEFAULT_TIMEOUT_MS = 6000;
+    private static final long DEFAULT_TIMEOUT_MILLIS = 6000;
     private static final String DEFAULT_FILE_COMMAND_PATH = "file";
     private static boolean HAS_WARNED = false;
     private Boolean hasFileCommand = null;
     private String fileCommandPath = DEFAULT_FILE_COMMAND_PATH;
     private int maxBytes = 1_000_000;
-    private long timeoutMs = DEFAULT_TIMEOUT_MS;
+    private long timeoutMillis = DEFAULT_TIMEOUT_MILLIS;
 
     private boolean useMime = false;
 
@@ -78,17 +73,18 @@ public class FileCommandDetector implements Detector {
 
     public static boolean checkHasFile(String fileCommandPath) {
         String[] commandline = new String[]{fileCommandPath, "-v"};
-        return ExternalParser.check(commandline);
+        return ProcessUtils.checkCommand(commandline);
     }
 
     /**
-     * @param input    document input stream, or <code>null</code>
+     * @param tis      document input stream, or <code>null</code>
      * @param metadata input metadata for the document
+     * @param parseContext the parse context
      * @return mime as identified by the file command or application/octet-stream otherwise
      * @throws IOException
      */
     @Override
-    public MediaType detect(InputStream input, Metadata metadata) throws IOException {
+    public MediaType detect(TikaInputStream tis, Metadata metadata, ParseContext parseContext) throws IOException {
         if (hasFileCommand == null) {
             hasFileCommand = checkHasFile(this.fileCommandPath);
         }
@@ -99,32 +95,22 @@ public class FileCommandDetector implements Detector {
             }
             return MediaType.OCTET_STREAM;
         }
-        TikaInputStream tis = TikaInputStream.cast(input);
-        if (tis != null) {
-            //spool the full file to disk, if called with a TikaInputStream
-            //and there is no underlying file
-            return detectOnPath(tis.getPath(), metadata);
+        if (tis == null) {
+            return MediaType.OCTET_STREAM;
         }
-
-        input.mark(maxBytes);
-        try (TemporaryResources tmp = new TemporaryResources()) {
-            Path tmpFile = tmp.createTempFile(metadata);
-            Files.copy(new BoundedInputStream(maxBytes, input), tmpFile, REPLACE_EXISTING);
-            return detectOnPath(tmpFile, metadata);
-        } finally {
-            input.reset();
-        }
+        //spool the full file to disk, if there is no underlying file
+        return detectOnPath(tis.getPath(), metadata, parseContext);
     }
 
-    private MediaType detectOnPath(Path path, Metadata metadata) throws IOException {
+    private MediaType detectOnPath(Path path, Metadata metadata, ParseContext parseContext) throws IOException {
 
         String[] args =
                 new String[]{ProcessUtils.escapeCommandLine(fileCommandPath), "-b", "--mime-type",
                         ProcessUtils.escapeCommandLine(path.toAbsolutePath().toString())};
         ProcessBuilder builder = new ProcessBuilder(args);
-        FileProcessResult result = ProcessUtils.execute(builder, timeoutMs, 10000, 10000);
+        FileProcessResult result = ProcessUtils.execute(builder, parseContext, timeoutMillis, 10000, 10000);
+        metadata.set(ExternalProcess.IS_TIMEOUT, result.isTimeout());
         if (result.isTimeout()) {
-            metadata.set(ExternalProcess.IS_TIMEOUT, true);
             return MediaType.OCTET_STREAM;
         }
         if (result.getExitValue() != 0) {
@@ -147,7 +133,6 @@ public class FileCommandDetector implements Detector {
         return MediaType.OCTET_STREAM;
     }
 
-    @Field
     public void setFilePath(String fileCommandPath) {
         //this opens up a potential command vulnerability.
         //Don't ever let an untrusted user set this.
@@ -155,7 +140,6 @@ public class FileCommandDetector implements Detector {
         checkHasFile(this.fileCommandPath);
     }
 
-    @Field
     public void setUseMime(boolean useMime) {
         this.useMime = useMime;
     }
@@ -170,14 +154,16 @@ public class FileCommandDetector implements Detector {
      *
      * @param maxBytes
      */
-    @Field
     public void setMaxBytes(int maxBytes) {
         this.maxBytes = maxBytes;
     }
 
-    @Field
-    public void setTimeoutMs(long timeoutMs) {
-        this.timeoutMs = timeoutMs;
+    public void setTimeoutMillis(long timeoutMillis) {
+        this.timeoutMillis = timeoutMillis;
+    }
+
+    public long getTimeoutMillis() {
+        return timeoutMillis;
     }
 
 }

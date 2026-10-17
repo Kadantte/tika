@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Timeout;
 
 import org.apache.tika.MultiThreadedTikaTest;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.OfficeOpenXMLCore;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -44,7 +45,7 @@ public class XML2003ParserTest extends MultiThreadedTikaTest {
         Metadata m = r.metadata;
         assertEquals("Allison, Timothy B.", m.get(TikaCoreProperties.CREATOR));
         assertEquals("16.00", m.get(OfficeOpenXMLCore.VERSION));
-        assertEquals("application/vnd.ms-spreadsheetml", m.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.ms-spreadsheetml", m.get(HttpHeaders.CONTENT_TYPE));
 
         String xml = r.xml;
         xml = xml.replaceAll("\\s+", " ");
@@ -61,6 +62,21 @@ public class XML2003ParserTest extends MultiThreadedTikaTest {
         txt = txt.replaceAll("\\s+", " ");
         assertContains("Col1 Col2 Col3 Col4 string 1 1.10", txt);
 
+    }
+
+    @Test //TIKA-4744
+    public void testTableInsideParagraph() throws Exception {
+        // WordML allows <w:tbl> nested inside <w:p>. The XHTML emission must
+        // close the <p> before opening the <table>, otherwise the inline
+        // <p> stays on the SAX stack while <tr>/<td> emit -- and the inner
+        // paragraphs inside cells trip the "close p before nested p" logic
+        // emitting </p> while <td> is topmost.
+        // getXML wraps the handler in StrictXHTMLValidator, so any imbalance
+        // would throw before the assertions.
+        XMLResult r = getXML("testWORDML_tableInsideParagraph.doc");
+        assertEquals("application/vnd.ms-wordml", r.metadata.get(HttpHeaders.CONTENT_TYPE));
+        // Structural sanity: tables emit with tbody and rows.
+        assertContains("<table><tbody>", r.xml);
     }
 
     @Test

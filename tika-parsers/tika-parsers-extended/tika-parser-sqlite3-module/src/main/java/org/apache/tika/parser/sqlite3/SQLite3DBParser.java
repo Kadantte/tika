@@ -17,10 +17,8 @@
 package org.apache.tika.parser.sqlite3;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -32,7 +30,6 @@ import java.util.Set;
 
 import org.sqlite.SQLiteConfig;
 
-import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
@@ -69,7 +66,7 @@ public class SQLite3DBParser extends AbstractDBParser {
     }
 
     @Override
-    protected Connection getConnection(InputStream stream, Metadata metadata, ParseContext context)
+    protected Connection getConnection(TikaInputStream stream, Metadata metadata, ParseContext context)
             throws IOException {
         String connectionString = getConnectionString(stream, metadata, context);
 
@@ -93,20 +90,10 @@ public class SQLite3DBParser extends AbstractDBParser {
     }
 
     @Override
-    protected String getConnectionString(InputStream is, Metadata metadata, ParseContext context)
+    protected String getConnectionString(TikaInputStream stream, Metadata metadata, ParseContext context)
             throws IOException {
-        TikaInputStream tis = TikaInputStream.cast(is);
-        //if this is a TikaInputStream, use that to spool is to disk or
-        //use original underlying file.
-        if (tis != null) {
-            Path dbFile = tis.getPath();
-            return "jdbc:sqlite:" + dbFile.toAbsolutePath().toString();
-        } else {
-            //if not TikaInputStream, create own tmpResources.
-            tmpFile = Files.createTempFile("tika-sqlite-tmp", "");
-            Files.copy(is, tmpFile, StandardCopyOption.REPLACE_EXISTING);
-            return "jdbc:sqlite:" + tmpFile.toAbsolutePath().toString();
-        }
+        Path dbFile = stream.getPath();
+        return "jdbc:sqlite:" + dbFile.toAbsolutePath();
     }
 
     @Override
@@ -142,15 +129,8 @@ public class SQLite3DBParser extends AbstractDBParser {
     }
 
     @Override
-    public JDBCTableReader getTableReader(Connection connection, String tableName,
-                                          ParseContext context) {
-        return new SQLite3TableReader(connection, tableName, new EmbeddedDocumentUtil(context));
-    }
-
-    @Override
-    protected JDBCTableReader getTableReader(Connection connection, String tableName,
-                                             EmbeddedDocumentUtil embeddedDocumentUtil) {
-        return new SQLite3TableReader(connection, tableName, embeddedDocumentUtil);
+    protected JDBCTableReader getTableReader(Connection connection, String tableName) {
+        return new SQLite3TableReader(connection, tableName);
     }
 
     @Override

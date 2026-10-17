@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.onenote.fsshttpb.streamobj.basic;
 
 import java.io.IOException;
@@ -104,6 +103,14 @@ public class CellID extends BasicObject {
     @Override
     public int hashCode() {
         return this.extendGUID1.hashCode() + this.extendGUID2.hashCode();
+    }
+
+    @Override
+    public String toString() {
+        return "CellID{" +
+                "extendGUID1=" + extendGUID1 +
+                ", extendGUID2=" + extendGUID2 +
+                '}';
     }
 
     /**

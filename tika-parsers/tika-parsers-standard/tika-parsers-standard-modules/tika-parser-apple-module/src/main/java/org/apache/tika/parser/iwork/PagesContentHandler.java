@@ -25,14 +25,16 @@ import org.xml.sax.Attributes;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
-import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 class PagesContentHandler extends DefaultHandler {
 
+    private static final KeyPrefix PAGES =
+            KeyPrefix.file("pages:", "Pages metadata element names with no mapped Property");
     private static String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     private final XHTMLContentHandler xhtml;
     private final Metadata metadata;
@@ -59,7 +61,9 @@ class PagesContentHandler extends DefaultHandler {
     @Override
     public void endDocument() throws SAXException {
         metadata.set(Office.PAGE_COUNT, String.valueOf(pageCount));
-        if (pageCount > 0) {
+        // Either sf:page-start or sl:page-group opens a <div>; close the
+        // last open one regardless of which counter tracked it.
+        if (pageCount + slPageCount > 0) {
             doFooter();
             xhtml.endElement("div");
         }
@@ -71,12 +75,7 @@ class PagesContentHandler extends DefaultHandler {
         if (parseProperty) {
             String value = parsePrimitiveElementValue(qName, attributes);
             if (value != null) {
-                Object metaDataKey = resolveMetaDataKey(metaDataLocalName);
-                if (metaDataKey instanceof Property) {
-                    metadata.set((Property) metaDataKey, value);
-                } else {
-                    metadata.add((String) metaDataKey, value);
-                }
+                writeMetaData(metaDataLocalName, value);
             }
         }
 
@@ -85,7 +84,17 @@ class PagesContentHandler extends DefaultHandler {
         } else if ("sf:metadata".equals(qName)) {
             inPart = DocumentPart.METADATA;
         } else if ("sf:page-start".equals(qName) || "sl:page-group".equals(qName)) {
-            if (pageCount > 0) {
+            // sf:p paragraphs can span page boundaries in iWork's XML schema.
+            // If a <p> is still open when the page changes, force-close it
+            // before the page <div> and reopen it in the new page so both
+            // pages have balanced tag pairs.
+            boolean reopenP = inPart == DocumentPart.PARSABLE_TEXT;
+            if (reopenP) {
+                xhtml.endElement("p");
+            }
+            // Use the combined counter so we close the prior <div> regardless
+            // of whether it was opened by sf:page-start or sl:page-group.
+            if (pageCount + slPageCount > 0) {
                 doFooter();
                 xhtml.endElement("div");
             }
@@ -96,6 +105,9 @@ class PagesContentHandler extends DefaultHandler {
                 pageCount++;
             }
             doHeader();
+            if (reopenP) {
+                xhtml.startElement("p");
+            }
         } else if ("sf:p".equals(qName)) {
             if (pageCount + slPageCount > 0) {
                 inPart = DocumentPart.PARSABLE_TEXT;
@@ -126,7 +138,7 @@ class PagesContentHandler extends DefaultHandler {
                 // We are in a footer
                 footers.hasAutoPageNumber = true;
                 footers.autoPageNumberFormat = attributes.getValue("sf:format");
-            } else {
+            } else if (headers != null) {
                 headers.hasAutoPageNumber = true;
                 headers.autoPageNumberFormat = attributes.getValue("sf:format");
             }
@@ -270,27 +282,28 @@ class PagesContentHandler extends DefaultHandler {
     }
 
     /**
-     * Returns a resolved key that is common in other document types or
-     * returns the specified metaDataLocalName if no common key could be found.
-     * The key could be a simple String key, or could be a {@link Property}
+     * Writes a metadata value under a common Property if the current element
+     * (tracked via {@code metaDataQName}) maps to one; otherwise appends it
+     * under the {@code pages:} prefix keyed by the element's local name,
+     * accumulating for the unmapped, potentially-repeating case.
      *
      * @param metaDataLocalName The localname of the element containing metadata
-     * @return a resolved key that is common in other document types
+     * @param value             The metadata value to write
      */
-    private Object resolveMetaDataKey(String metaDataLocalName) {
-        Object metaDataKey = metaDataLocalName;
+    private void writeMetaData(String metaDataLocalName, String value) {
         if ("sf:authors".equals(metaDataQName)) {
-            metaDataKey = TikaCoreProperties.CREATOR;
+            metadata.set(TikaCoreProperties.CREATOR, value);
         } else if ("sf:title".equals(metaDataQName)) {
-            metaDataKey = TikaCoreProperties.TITLE;
+            metadata.set(TikaCoreProperties.TITLE, value);
         } else if ("sl:SLCreationDateProperty".equals(metaDataQName)) {
-            metaDataKey = TikaCoreProperties.CREATED;
+            metadata.set(TikaCoreProperties.CREATED, value);
         } else if ("sl:SLLastModifiedDateProperty".equals(metaDataQName)) {
-            metaDataKey = TikaCoreProperties.MODIFIED;
+            metadata.set(TikaCoreProperties.MODIFIED, value);
         } else if ("sl:language".equals(metaDataQName)) {
-            metaDataKey = TikaCoreProperties.LANGUAGE;
+            metadata.set(TikaCoreProperties.LANGUAGE, value);
+        } else {
+            metadata.add(PAGES, metaDataLocalName, value);
         }
-        return metaDataKey;
     }
 
     /**

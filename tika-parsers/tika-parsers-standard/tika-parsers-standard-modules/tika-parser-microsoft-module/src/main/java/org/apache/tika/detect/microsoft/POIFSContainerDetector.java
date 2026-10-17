@@ -22,6 +22,9 @@ import static org.apache.tika.mime.MediaType.image;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -32,23 +35,27 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.input.CloseShieldInputStream;
+import org.apache.commons.io.input.UnsynchronizedByteArrayInputStream;
 import org.apache.poi.hssf.model.InternalWorkbook;
+import org.apache.poi.poifs.common.POIFSConstants;
 import org.apache.poi.poifs.filesystem.DirectoryEntry;
 import org.apache.poi.poifs.filesystem.DirectoryNode;
 import org.apache.poi.poifs.filesystem.DocumentInputStream;
 import org.apache.poi.poifs.filesystem.DocumentNode;
 import org.apache.poi.poifs.filesystem.Entry;
 import org.apache.poi.poifs.filesystem.POIFSFileSystem;
+import org.apache.poi.poifs.storage.BATBlock;
+import org.apache.poi.poifs.storage.HeaderBlock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.detect.Detector;
-import org.apache.tika.io.BoundedInputStream;
+import org.apache.tika.io.CacheMemoryBudget;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.microsoft.OfficeParser;
 
 /**
@@ -57,7 +64,9 @@ import org.apache.tika.parser.microsoft.OfficeParser;
  * This should work for all OLE2 documents, whether
  * they are ones supported by POI or not.
  */
+@TikaComponent
 public class POIFSContainerDetector implements Detector {
+
 
     /**
      * The OLE base file format
@@ -254,9 +263,12 @@ public class POIFSContainerDetector implements Detector {
 
     private static final Logger LOG = LoggerFactory.getLogger(POIFSContainerDetector.class);
 
+    /**
+     * Default constructor for SPI loading.
+     */
+    public POIFSContainerDetector() {
+    }
 
-    @Field
-    private int markLimit = -1;
 
     /**
      * Internal detection of the specific kind of OLE2 document, based on the
@@ -549,34 +561,20 @@ public class POIFSContainerDetector implements Detector {
         return names;
     }
 
-    /**
-     * If a TikaInputStream is passed in to {@link #detect(InputStream, Metadata)},
-     * and there is not an underlying file, this detector will spool up to {@link #markLimit}
-     * to disk.  If the stream was read in entirety (e.g. the spooled file is not truncated),
-     * this detector will open the file with POI and perform detection.
-     * If the spooled file is truncated, the detector will return {@link #OLE} (or
-     * {@link MediaType#OCTET_STREAM} if there's no OLE header).
-     * <p>
-     * As of Tika 1.21, this detector respects the legacy behavior of not performing detection
-     * on a non-TikaInputStream.
-     *
-     * @param markLimit
-     */
-    public void setMarkLimit(int markLimit) {
-        this.markLimit = markLimit;
-    }
 
-    private Set<String> getTopLevelNames(TikaInputStream stream) throws IOException {
-        // Force the document stream to a (possibly temporary) file
-        // so we don't modify the current position of the stream.
-        //If the markLimit is < 0, this will spool the entire file
-        //to disk if there is not an underlying file.
-        Path file = stream.getPath(markLimit);
+    private Set<String> getTopLevelNames(TikaInputStream stream, ParseContext context)
+            throws IOException {
+        if (!stream.hasFile()) {
+            Set<String> names = getTopLevelNamesInMemory(stream, context);
+            if (names != null) {
+                return names;
+            }
+        }
+        // random access over content that is not in memory: use the file
+        Path file = stream.getPath();
 
-        //if the stream was longer than markLimit, don't detect
         if (file == null) {
-            LOG.warn("File length exceeds marklimit. Skipping detection on this file. " +
-                    "If you need precise detection, consider increasing the marklimit or setting it to -1");
+            LOG.debug("Stream does not support file access; skipping POIFS detection");
             return Collections.emptySet();
         }
 
@@ -599,54 +597,157 @@ public class POIFSContainerDetector implements Detector {
         }
     }
 
-    public MediaType detect(InputStream input, Metadata metadata) throws IOException {
+    /**
+     * Opens the container from memory. POI's stream loader copies the object into its own
+     * heap array, sized from the header rather than the content, and keeps it for the
+     * container's lifetime -- so that allocation is reserved from the CacheMemoryBudget
+     * before it is made. Returns null, and the caller uses the file, when the content is not
+     * in memory, the budget has no room for the copy, or POI's stream loader rejects the
+     * object (it is stricter than the file loader on truncated objects).
+     * <p>
+     * None of this would be needed if POI could be handed the bytes it already has. Its API
+     * takes a File or FileChannel (no copy) or an InputStream (copy sized by the header) with
+     * nothing in between, and POIFSFileSystem._data is protected while readCoreContents() is
+     * private, so a subclass cannot supply a ByteArrayBackedDataSource either.
+     * <p>
+     * With no budget in the context there is no accounting at all, and a byte[]-backed
+     * stream has no spill threshold to bound it either, so the copy is capped outright:
+     * above {@link #MAX_UNBUDGETED_COPY} the file path -- which is what 4.0.0 always did --
+     * is used instead.
+     */
+    /**
+     * Ceiling on POI's in-memory copy when no CacheMemoryBudget is present to account for it.
+     * Embedded OLE2 objects are typically a few hundred KB; past this the file loader's lazy
+     * block reads cost less than the heap.
+     */
+    private static final long MAX_UNBUDGETED_COPY = 16L * 1024 * 1024;
+
+    /**
+     * BAT blocks a small object may reserve regardless of its length. Every valid header
+     * declares at least one, and writers round up; the unit is the sector size, so this is
+     * 256KB for 512-byte sectors and 16MB for 4K ones.
+     */
+    private static final int MIN_DECLARED_BAT_BLOCKS = 4;
+
+    /** Past this multiple of the bytes in hand the header is not describing this object. */
+    private static final int MAX_DECLARED_AMPLIFICATION = 16;
+
+    private Set<String> getTopLevelNamesInMemory(TikaInputStream stream, ParseContext context)
+            throws IOException {
+        CacheMemoryBudget budget = context == null ? null : context.get(CacheMemoryBudget.class);
+        // the budget decides how much the drain below keeps in memory
+        stream.enableRewind(budget);
+        POIFSFileSystem fs = null;
+        long reserved = 0;
+        try (SeekableByteChannel channel = stream.getSeekableByteChannel()) {
+            if (TikaInputStream.inMemoryContent(channel) == null) {
+                return null;
+            }
+            // POI allocates what the header declares. The bytes in hand are the truth: a
+            // header that declares more than they can account for is lying, and the file
+            // loader (block by block, no such allocation) is the only safe way to read it.
+            long copy = honestDeclaredSize(channel);
+            if (copy < 0) {
+                return null;
+            }
+            if (budget == null) {
+                if (copy > MAX_UNBUDGETED_COPY) {
+                    return null;
+                }
+            } else {
+                if (budget.tryReserve(copy) == 0) {
+                    return null;
+                }
+                reserved = copy;
+            }
+            // POI reads from wherever the channel sits; do not rely on it being fresh
+            channel.position(0);
+            fs = new POIFSFileSystem(Channels.newInputStream(channel));
+            Set<String> names = getTopLevelNames(fs.getRoot());
+            stream.setOpenContainer(fs);
+            fs = null;   // published: the stream owns it now, the finally must not close it
+            if (reserved > 0) {
+                long charged = reserved;
+                stream.addCloseableResource(() -> budget.release(charged));
+                reserved = 0;
+            }
+            return names;
+        } catch (SecurityException e) {
+            throw e;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        } finally {
+            if (reserved > 0) {
+                budget.release(reserved);
+            }
+            if (fs != null) {
+                closeQuietly(fs);
+            }
+        }
+    }
+
+    /**
+     * The heap POI's stream loader would allocate for this object -- sized from the header's
+     * declared BAT count, not the content -- or -1 when the header cannot be read or declares
+     * an implausible multiple of the bytes in hand.
+     * <p>
+     * The bound is on amplification, over a floor of a few BAT blocks. Real writers reserve
+     * BAT capacity ahead of use -- SolidWorks declares 26 BAT blocks where 16 would do, and
+     * small objects routinely declare several times their own length -- so "one BAT block of
+     * slack" rejects valid files. The floor is in sectors rather than bytes because a 4K-sector
+     * object cannot declare less than 4MB even when it is nearly empty. What must not get
+     * through is a 512-byte object declaring hundreds of MB, four orders of magnitude past
+     * anything a writer produces.
+     */
+    static long honestDeclaredSize(SeekableByteChannel channel) throws IOException {
+        byte[] header = new byte[POIFSConstants.SMALLER_BIG_BLOCK_SIZE];
+        long start = channel.position();
+        try {
+            channel.position(0);
+            ByteBuffer buffer = ByteBuffer.wrap(header);
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) {
+                // fill the header block
+            }
+            if (buffer.hasRemaining()) {
+                return -1;
+            }
+        } finally {
+            channel.position(start);
+        }
+        try {
+            HeaderBlock hb = new HeaderBlock(
+                    UnsynchronizedByteArrayInputStream.builder().setByteArray(header).get());
+            long declared = BATBlock.calculateMaximumSize(hb);
+            long sector = hb.getBigBlockSize().getBigBlockSize();
+            long batSpan = sector * hb.getBigBlockSize().getBATEntriesPerBlock();
+            long actual = channel.size();
+            long ceiling = Math.max(sector + MIN_DECLARED_BAT_BLOCKS * batSpan,
+                    actual * MAX_DECLARED_AMPLIFICATION);
+            return declared > ceiling ? -1 : declared;
+        } catch (IOException | RuntimeException e) {
+            return -1;
+        }
+    }
+
+    private static void closeQuietly(POIFSFileSystem fs) {
+        try {
+            fs.close();
+        } catch (IOException e) {
+            LOG.debug("failed to close abandoned POIFSFileSystem", e);
+        }
+    }
+
+    public MediaType detect(TikaInputStream tis, Metadata metadata, ParseContext parseContext) throws IOException {
         // Check if we have access to the document
-        if (input == null) {
+        if (tis == null) {
             return MediaType.OCTET_STREAM;
         }
 
-        TikaInputStream tis = TikaInputStream.cast(input);
-        if (tis != null) {
-            return handleTikaStream(tis, metadata);
-        }
-        if (isOleHeader(input)) {
-            if (markLimit < 0) {
-                return OLE;
-            }
-            return handleInputStream(input, metadata);
-        }
-        return MediaType.OCTET_STREAM;
+        return handleTikaStream(tis, metadata, parseContext);
     }
 
-    private MediaType handleInputStream(InputStream input, Metadata metadata) throws IOException {
-        if (markLimit < 0) {
-            return OLE;
-        }
-        BoundedInputStream bis = null;
-        try {
-            bis = new BoundedInputStream(markLimit, CloseShieldInputStream.wrap(input));
-            bis.mark(markLimit);
-            try (POIFSFileSystem poifs = new POIFSFileSystem(CloseShieldInputStream.wrap(bis))) {
-                if (bis.hasHitBound()) {
-                    return OLE;
-                }
-                Set<String> names = getTopLevelNames(poifs.getRoot());
-                return detect(names, poifs.getRoot());
-            } catch (SecurityException e) {
-                throw e;
-            } catch (IOException | RuntimeException e) {
-                //swallow
-                return OLE;
-            }
-        } finally {
-            if (bis != null) {
-                bis.reset();
-                bis.close();
-            }
-        }
-    }
-
-    private MediaType handleTikaStream(TikaInputStream tis, Metadata metadata) throws IOException {
+    private MediaType handleTikaStream(TikaInputStream tis, Metadata metadata, ParseContext context)
+            throws IOException {
         //try for an open container
         Set<String> names = tryOpenContainerOnTikaInputStream(tis, metadata);
 
@@ -655,10 +756,8 @@ public class POIFSContainerDetector implements Detector {
             return OCTET_STREAM;
         }
 
-        // If OLE, spool to disk
         if (names == null) {
-            // spool to disk and try detection
-            names = getTopLevelNames(tis);
+            names = getTopLevelNames(tis, context);
         }
 
         // Detect based on the names (as available)
@@ -680,13 +779,10 @@ public class POIFSContainerDetector implements Detector {
         }
     }
 
-
-    public static Set<String> tryOpenContainerOnTikaInputStream(InputStream input, Metadata metadata) {
+    public static Set<String> tryOpenContainerOnTikaInputStream(TikaInputStream tis, Metadata metadata) {
         // If this is a TikaInputStream wrapping an already
         // parsed NPOIFileSystem/DirectoryNode, just get the
         // names from the root:
-        TikaInputStream tis = TikaInputStream.cast(input);
-        Set<String> names = null;
         if (tis != null) {
             Object container = tis.getOpenContainer();
             if (container instanceof POIFSFileSystem) {

@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-parsers-extended</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
 
@@ -98,6 +98,11 @@ May the gods of dependency management fix this in the future.
     </dependency>
   </dependencies>
 
+  <properties>
+    <!-- TIKA-4816 metadata string-key ban, main sources; see tika-parent -->
+    <forbiddenapis.module.signaturesFile>${metadata.forbiddenapis.signaturesFile}</forbiddenapis.module.signaturesFile>
+  </properties>
+
   <build>
     <plugins>
       <!-- because of protobuf 3.25.6. The actual problem is in netcdf4. Might be a false alarm,
@@ -106,18 +111,18 @@ May the gods of dependency management fix this in the future.
       <plugin>
           <artifactId>maven-surefire-plugin</artifactId>
           <configuration>
-              <argLine>-Dcom.google.protobuf.use_unsafe_pre22_gencode</argLine>
+              <!-- this argLine replaces tika-parent's, so it has to repeat the tmpdir isolation -->
+              <argLine>-Dcom.google.protobuf.use_unsafe_pre22_gencode "-Djava.io.tmpdir=${tika.test.tmpdir}"</argLine>
           </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.rat</groupId>
         <artifactId>apache-rat-plugin</artifactId>
-        <version>${rat.version}</version>
         <configuration>
-          <excludes>
-            <exclude>src/test/resources/test-documents/**</exclude>
-            <exclude>src/test/resources/ground-truth/**</exclude>
-          </excludes>
+          <inputExcludes>
+            <inputExclude>src/test/resources/test-documents/**</inputExclude>
+            <inputExclude>src/test/resources/ground-truth/**</inputExclude>
+          </inputExcludes>
         </configuration>
       </plugin>
       <plugin>
@@ -145,6 +150,6 @@ May the gods of dependency management fix this in the future.
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

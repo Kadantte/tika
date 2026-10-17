@@ -20,13 +20,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.InputStream;
-
 import org.junit.jupiter.api.Test;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
@@ -36,12 +36,12 @@ public class DcXMLParserTest extends TikaTest {
 
     @Test
     public void testXMLParserAsciiChars() throws Exception {
-        try (InputStream input = getResourceAsStream("/test-documents/testXML.xml")) {
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testXML.xml")) {
             Metadata metadata = new Metadata();
             ContentHandler handler = new BodyContentHandler();
-            new DcXMLParser().parse(input, handler, metadata, new ParseContext());
+            new DcXMLParser().parse(tis, handler, metadata, new ParseContext());
 
-            assertEquals("application/xml", metadata.get(Metadata.CONTENT_TYPE));
+            assertEquals("application/xml", metadata.get(HttpHeaders.CONTENT_TYPE));
             assertEquals("Tika test document", metadata.get(TikaCoreProperties.TITLE));
             assertEquals("Rida Benjelloun", metadata.get(TikaCoreProperties.CREATOR));
 
@@ -72,9 +72,9 @@ public class DcXMLParserTest extends TikaTest {
 
     @Test
     public void testXMLParserNonAsciiChars() throws Exception {
-        try (InputStream input = getResourceAsStream("/test-documents/testXML.xml")) {
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testXML.xml")) {
             Metadata metadata = new Metadata();
-            new DcXMLParser().parse(input, new DefaultHandler(), metadata, new ParseContext());
+            new DcXMLParser().parse(tis, new DefaultHandler(), metadata, new ParseContext());
 
             final String expected =
                     "Archim\u00E8de et Lius \u00E0 Ch\u00E2teauneuf testing chars en \u00E9t\u00E9";

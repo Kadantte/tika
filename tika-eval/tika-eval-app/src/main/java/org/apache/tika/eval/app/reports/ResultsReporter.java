@@ -18,7 +18,6 @@ package org.apache.tika.eval.app.reports;
 
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -32,7 +31,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import javax.xml.parsers.DocumentBuilder;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
@@ -65,8 +63,8 @@ public class ResultsReporter {
                         "directory for the reports. " + "If not specified, will write to 'reports'" + "BEWARE: Will overwrite existing reports without warning!")
                 .addOption("rf", "reportsFile", true,
                         "xml specifying sql to call for the reports." + "If not specified, will use default reports in resources/tika-eval-*-config.xml")
-                .addOption("db", true, "default database (in memory H2). Specify a file name for the H2 database.")
-                .addOption("jdbc", true, "EXPERT: full jdbc connection string. Specify this or use -db <h2db_name>")
+                .addOption("d", "db", true, "default database (in memory H2). Specify a file name for the H2 database.")
+                .addOption("jdbc", true, "EXPERT: full jdbc connection string. Specify this or use -d <h2db_name>")
                 .addOption("jdbcdriver", true, "EXPERT: specify the jdbc driver class if all else fails")
                 .addOption("tablePrefix", true, "EXPERT: if not using the default tables, specify your table name prefix");
 
@@ -78,7 +76,7 @@ public class ResultsReporter {
 
     public static void USAGE() throws IOException {
         HelpFormatter helpFormatter = HelpFormatter.builder().get();
-        helpFormatter.printHelp("java -jar tika-eval-x.y.jar Report -db mydb [-rd myreports] [-rf myreports.xml]", "Tool: Report", ResultsReporter.OPTIONS,
+        helpFormatter.printHelp("java -jar tika-eval-x.y.jar Report -d mydb [-rd myreports] [-rf myreports.xml]", "Tool: Report", ResultsReporter.OPTIONS,
                 "Note: for h2 db, do not include the .mv.db at the end of the db name.", true);
     }
 
@@ -86,11 +84,7 @@ public class ResultsReporter {
 
         ResultsReporter r = new ResultsReporter();
 
-        DocumentBuilder docBuilder = XMLReaderUtils.getDocumentBuilder();
-        Document doc;
-        try (InputStream is = Files.newInputStream(p)) {
-            doc = docBuilder.parse(is);
-        }
+        Document doc = XMLReaderUtils.buildDOM(p);
         Node docElement = doc.getDocumentElement();
         assert (docElement
                 .getNodeName()
@@ -312,7 +306,13 @@ public class ResultsReporter {
             for (String sql : before) {
                 long start = System.currentTimeMillis();
                 LOG.info("processing 'before': {}", sql);
-                st.execute(sql);
+                try {
+                    st.execute(sql);
+                } catch (SQLException e) {
+                    // a db from an older tika-eval lacks newer columns/tables; keep going
+                    LOG.warn("'before' failed, skipping: {}", e.getMessage());
+                    continue;
+                }
                 if (!c.getAutoCommit()) {
                     c.commit();
                     LOG.info("committing");
@@ -321,8 +321,13 @@ public class ResultsReporter {
                 LOG.info("finished in {} ms", elapsed);
             }
             for (Report r : reports) {
-                r.writeReport(c, reportsDirectory);
+                try {
+                    r.writeReport(c, reportsDirectory);
+                } catch (SQLException e) {
+                    LOG.warn("report '{}' failed, skipping: {}", r.reportName, e.getMessage());
+                }
             }
+            MarkdownSummaryWriter.write(c, reportsDirectory);
             for (String sql : after) {
                 LOG.info("processing 'after': {}", sql);
                 long start = System.currentTimeMillis();

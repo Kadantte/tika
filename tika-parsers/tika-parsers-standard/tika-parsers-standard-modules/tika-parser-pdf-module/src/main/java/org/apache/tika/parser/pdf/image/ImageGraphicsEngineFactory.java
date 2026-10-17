@@ -41,4 +41,5 @@ public class ImageGraphicsEngineFactory implements Serializable {
         return new ImageGraphicsEngine(page, pageNumber, embeddedDocumentExtractor, pdfParserConfig,
                 processedInlineImages, imageCounter, xhtml, parentMetadata, parseContext);
     }
+
 }

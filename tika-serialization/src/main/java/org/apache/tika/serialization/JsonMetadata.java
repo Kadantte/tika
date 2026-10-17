@@ -20,22 +20,76 @@ package org.apache.tika.serialization;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
-import java.util.Arrays;
 
 import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonGenerator;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadConstraints;
-import org.apache.commons.io.input.CloseShieldReader;
-import org.apache.commons.io.output.CloseShieldWriter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.serialization.serdes.MetadataSerializer;
 
 public class JsonMetadata {
 
     static volatile boolean PRETTY_PRINT = false;
+
+    /**
+     * Default stream read constraints for metadata serialization.
+     */
+    private static final StreamReadConstraints DEFAULT_CONSTRAINTS = StreamReadConstraints
+            .builder()
+            .maxNestingDepth(10)
+            .maxStringLength(20_000_000)
+            .maxNumberLength(500)
+            .build();
+
+    private static volatile StreamReadConstraints streamReadConstraints = DEFAULT_CONSTRAINTS;
+    private static volatile ObjectMapper OBJECT_MAPPER;
+    private static volatile ObjectMapper PRETTY_SERIALIZER;
+
+    static {
+        rebuildObjectMappers();
+    }
+
+    private static void rebuildObjectMappers() {
+        JsonFactory factory = new JsonFactory();
+        factory.setStreamReadConstraints(streamReadConstraints);
+
+        // Use TikaModule which includes Metadata serializers
+        ObjectMapper mapper = new ObjectMapper(factory);
+        mapper.registerModule(new TikaModule());
+        OBJECT_MAPPER = mapper;
+
+        // Pretty printer needs custom serializer with sort flag
+        ObjectMapper prettyMapper = new ObjectMapper(factory);
+        SimpleModule prettySerializerModule = new SimpleModule();
+        prettySerializerModule.addSerializer(Metadata.class, new MetadataSerializer(true));
+        prettyMapper.registerModule(prettySerializerModule);
+        PRETTY_SERIALIZER = prettyMapper;
+    }
+
+    /**
+     * Sets the stream read constraints for JSON parsing of metadata.
+     * This affects all subsequent calls to {@link #fromJson(Reader)}.
+     * <p>
+     * Typically called by TikaLoader during initialization based on the
+     * "metadata-list" configuration section.
+     *
+     * @param constraints the constraints to use
+     */
+    public static synchronized void setStreamReadConstraints(StreamReadConstraints constraints) {
+        streamReadConstraints = constraints;
+        rebuildObjectMappers();
+    }
+
+    /**
+     * Gets the current stream read constraints.
+     *
+     * @return the current constraints
+     */
+    public static StreamReadConstraints getStreamReadConstraints() {
+        return streamReadConstraints;
+    }
 
     /**
      * Serializes a Metadata object to Json.  This does not flush or close the writer.
@@ -45,115 +99,30 @@ public class JsonMetadata {
      * @throws java.io.IOException if there is an IOException during writing
      */
     public static void toJson(Metadata metadata, Writer writer) throws IOException {
-        if (metadata == null) {
-            writer.write("null");
-            return;
+        if (PRETTY_PRINT) {
+            PRETTY_SERIALIZER
+                    .writerWithDefaultPrettyPrinter()
+                    .writeValue(writer, metadata);
+        } else {
+            OBJECT_MAPPER.writeValue(writer, metadata);
         }
-        long max = TikaConfig.getMaxJsonStringFieldLength();
-        try (JsonGenerator jsonGenerator = new JsonFactory()
-                .setStreamReadConstraints(StreamReadConstraints
-                        .builder()
-                        .maxStringLength(TikaConfig.getMaxJsonStringFieldLength())
-                        .build())
-                .createGenerator(CloseShieldWriter.wrap(writer))) {
-            if (PRETTY_PRINT) {
-                jsonGenerator.useDefaultPrettyPrinter();
-            }
-            writeMetadataObject(metadata, jsonGenerator, PRETTY_PRINT);
-        }
-    }
-
-    public static void writeMetadataObject(Metadata metadata, JsonGenerator jsonGenerator, boolean prettyPrint) throws IOException {
-        jsonGenerator.writeStartObject();
-        String[] names = metadata.names();
-        if (prettyPrint) {
-            Arrays.sort(names, new PrettyMetadataKeyComparator());
-        }
-        for (String n : names) {
-            String[] vals = metadata.getValues(n);
-            if (vals.length == 0) {
-                continue;
-            } else if (vals.length == 1) {
-                jsonGenerator.writeStringField(n, vals[0]);
-            } else if (vals.length > 1) {
-                jsonGenerator.writeArrayFieldStart(n);
-                for (String val : vals) {
-                    jsonGenerator.writeString(val);
-                }
-                jsonGenerator.writeEndArray();
-            }
-        }
-        jsonGenerator.writeEndObject();
     }
 
     /**
-     * Read metadata from reader.
-     * <p>
-     * This does not close the reader.
+     * Read metadata from reader. This does not close the reader.
      *
      * @param reader reader to read from
-     * @return Metadata or null if nothing could be read from the reader
+     * @return Metadata or null if reader is null
      * @throws IOException in case of parse failure or IO failure with Reader
      */
     public static Metadata fromJson(Reader reader) throws IOException {
-        Metadata m = null;
-        try (JsonParser jParser = new JsonFactory()
-                .setStreamReadConstraints(StreamReadConstraints
-                        .builder()
-                        .maxStringLength(TikaConfig.getMaxJsonStringFieldLength())
-                        .build())
-                .createParser(CloseShieldReader.wrap(reader))) {
-            m = readMetadataObject(jParser);
+        if (reader == null) {
+            return null;
         }
-        return m;
-    }
-
-    /**
-     * expects that jParser has not yet started on object or
-     * for jParser to be pointing to the start object.
-     *
-     * @param jParser
-     * @return
-     * @throws IOException
-     */
-    public static Metadata readMetadataObject(JsonParser jParser) throws IOException {
-        Metadata metadata = new Metadata();
-        JsonToken token = jParser.currentToken();
-        if (token == null) {
-            token = jParser.nextToken();
-            if (token != JsonToken.START_OBJECT) {
-                throw new IOException("expected start object, but got: " + token.name());
-            }
-            token = jParser.nextToken();
-        } else if (token == JsonToken.START_OBJECT) {
-            token = jParser.nextToken();
-        }
-
-        while (token != JsonToken.END_OBJECT) {
-            token = jParser.currentToken();
-            if (token != JsonToken.FIELD_NAME) {
-                throw new IOException("expected field name, but got: " + token.name());
-            }
-            String key = jParser.currentName();
-            token = jParser.nextToken();
-            if (token == JsonToken.START_ARRAY) {
-                while (jParser.nextToken() != JsonToken.END_ARRAY) {
-                    metadata.add(key, jParser.getText());
-                }
-            } else {
-                if (token != JsonToken.VALUE_STRING) {
-                    throw new IOException("expected string value, but found: " + token.name());
-                }
-                String value = jParser.getValueAsString();
-                metadata.set(key, value);
-            }
-            token = jParser.nextToken();
-        }
-        return metadata;
+        return OBJECT_MAPPER.readValue(reader, Metadata.class);
     }
 
     public static void setPrettyPrinting(boolean prettyPrint) {
         PRETTY_PRINT = prettyPrint;
     }
-
 }

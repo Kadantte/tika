@@ -1,0 +1,220 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Tika gRPC
+:toc:
+:toclevels: 3
+
+Tika gRPC parses documents over gRPC, for microservice architectures and polyglot environments.
+
+The service definition lives in `tika-grpc/src/main/proto/tika.proto`. Clients register a fetcher
+(`SaveFetcher`) and then submit `FetchAndParseRequest` messages, each returning a
+`FetchAndParseReply` with extracted metadata and content. Streaming variants
+(`FetchAndParseServerSideStreaming`, `FetchAndParseBiDirectionalStreaming`) return the same reply
+type.
+
+== Concurrency
+
+`FetchAndParse` and its streaming variants run on a pool of forked JVMs sized by
+`pipes.numClients` (default: derived from host cores, at most 4). A call that cannot get a fork
+within `pipes.maxWaitForClientMillis` (default 60s) returns the in-band reply status
+`CLIENT_UNAVAILABLE_WITHIN_MS` — at capacity, not failing. `pipes.useSharedServer: true` shares one
+JVM instead.
+
+== Command-line options
+
+[cols="1,3"]
+|===
+|Option |Description
+
+|`-p`, `--port`
+|Listen port. Default `50052`.
+
+|`-c`, `--config`
+|Tika config file.
+
+|`-l`, `--plugins`
+|Tika Pipes plugins config file.
+
+|`--plugin-roots`
+|Comma-separated plugin root directories; overrides the config file.
+
+|`-s`, `--secure`
+|Enable TLS. See <<_transport_security_tls,Transport Security>>.
+
+|`--cert-chain`
+|Server certificate chain file, e.g. `server.pem`.
+
+|`--private-key`
+|Server private key file, e.g. `server.key`.
+
+|`--private-key-password`
+|Password for the private key, if it is encrypted.
+
+|`--trust-cert-collection`
+|Root certificates used to verify client certificates, e.g. `ca.pem`. Required, and must be a
+readable file, when `--client-auth-required` is set.
+
+|`--client-auth-required`
+|Require mutual TLS. Implies `--secure`.
+
+|`-h`, `--help`
+|Display the help menu.
+|===
+
+[#_security]
+== Security
+
+[WARNING]
+====
+The primary rule is *trusted callers only*. tika-grpc is *even more exposed by default than
+tika-server*: no transport security, no per-caller authorization, and its core `FetchAndParse`
+surface always on. Anyone who can reach the gRPC port can fetch and parse whatever the server's
+configured fetchers can reach. Run it only behind strict network controls.
+
+Its most dangerous capabilities — runtime mutation of the fetcher/iterator store (for example
+`SaveFetcher`, which can read files and load code on the server host) and per-request parse
+configuration — are *off by default*, behind the flags in <<_capability_flags>>, mirroring
+tika-server's `allowPipes` / `allowPerRequestConfig`. Those flags are *defense in depth, not
+security boundaries*: they reduce what a caller can reach, but they are no substitute for network
+controls and mutual TLS, and they do not make it safe to expose tika-grpc to untrusted callers.
+====
+
+[#_capability_flags]
+=== Capability flags
+
+Both flags live in the `grpc` section of your tika-config and default to `false`. Out of the box
+the server only fetches and parses using the fetchers and pipes iterators declared in the config
+file, with the server's own parse configuration.
+
+[cols="1,3",options="header"]
+|===
+|Setting |Description
+
+|`allowPerRequestConfig`
+|When `true`, callers may attach per-request configuration to `FetchAndParse` requests
+(`parse_context_json` and `additional_fetch_config_json`), overriding the server's defaults for
+that request. Because this can reconfigure any pipeline component — fetcher, parser, timeouts —
+it is off by default. When `false`, a request carrying either field is rejected with
+`PERMISSION_DENIED`.
+
+|`allowComponentManagement`
+|When `true`, callers may add, modify and delete fetchers and pipes iterators at runtime
+(`SaveFetcher`, `DeleteFetcher`, `SavePipesIterator`, `DeletePipesIterator`) and read their stored
+configuration back (`GetFetcher`, `ListFetchers`, `GetPipesIterator`). Off by default for two
+reasons: mutations change what the server can reach for all subsequent requests (for example, a
+fetcher that escapes a configured base path), and the stored configs returned by the read RPCs may
+contain passwords, access keys and tokens. When `false`, the mutating RPCs are rejected with
+`PERMISSION_DENIED`, and the read RPCs return only component identity — id and class — never the
+config.
+|===
+
+Fetches run in the forked pipes workers, and each worker builds its own config store from the
+same settings. With the default in-memory `configStoreType`, a fetcher saved through
+`SaveFetcher` exists only in the gRPC JVM and every `FetchAndParse` that names it fails with
+`FETCHER_NOT_FOUND`. When `allowComponentManagement` is `true`, set `configStoreType` to `file`
+or `ignite` (see xref:pipes/configuration.adoc#_distributed_config_store[Distributed Config
+Store]) so the workers see the same store.
+
+Enable these only for trusted callers over a secured channel:
+
+[source,json]
+----
+{
+  "grpc": {
+    "allowPerRequestConfig": true,
+    "allowComponentManagement": true
+  }
+}
+----
+
+[#_transport_security_tls]
+=== Transport security (TLS)
+
+TLS is configured entirely through command-line flags; there is no JSON config for it. Three modes:
+
+*Insecure (default).* No `--secure` flag: plaintext and unauthenticated. This includes the
+`apache/tika-grpc` Docker image, whose entrypoint does not pass `--secure`. Trusted networks only.
+
+*Server (1-way) TLS.* The server authenticates to clients; clients are not authenticated.
+
+[source,bash]
+----
+java -jar tika-grpc-<version>.jar --secure \
+  --cert-chain server.pem --private-key server.key
+----
+
+*Mutual (2-way) TLS.* Additionally supply the CA used to verify client certificates, and require
+client authentication. `--client-auth-required` implies `--secure` — it is spelled out here for
+clarity.
+
+[source,bash]
+----
+java -jar tika-grpc-<version>.jar --secure \
+  --cert-chain server.pem --private-key server.key \
+  --trust-cert-collection ca.pem --client-auth-required
+----
+
+When running the Docker image, append these flags to the container command — they are forwarded to
+the server — and mount the certificate files into the container.
+
+=== Kubernetes and service meshes
+
+Kubernetes does not make tika-grpc safe on its own. Pod networking is flat by default: any pod can
+reach any other pod's port, traffic is unencrypted, and there is no authentication or authorization
+between pods. Two separate controls matter, and neither is applied automatically:
+
+* *Transport security.* A service mesh (Istio, Linkerd) with sidecar mTLS encrypts and authenticates
+  pod-to-pod traffic. Where the mesh provides this, you can run tika-grpc without `--secure` and let
+  the mesh handle transport security instead of the TLS flags above.
+* *Reachability.* A `NetworkPolicy` admitting only your trusted clients to the tika-grpc Service.
+  This is the control that actually mitigates the exposure: because tika-grpc has no per-caller
+  authorization, the set of pods that can reach the port is effectively the set of pods that can use
+  its enabled RPC surface.
+
+Mesh mTLS authenticates *who opened the connection*; it does not authorize *what that caller may
+do*. An authenticated-but-untrusted pod can still invoke whatever RPC surface is enabled — at
+minimum `FetchAndParse` against your configured fetchers, plus the component-management RPCs (and
+the config reads that can expose stored secrets) if `allowComponentManagement` is set. A
+`NetworkPolicy` is therefore required, not optional.
+
+== Per-request `ParseContext`
+
+`FetchAndParseRequest.parse_context_json` overrides the server's default `ParseContext` for one
+request. Keys are parse-context component names; values are their JSON configs.
+
+[source,json]
+----
+{
+  "basic-content-handler-factory": {"type": "HTML"},
+  "timeout-limits": {"progressTimeoutMillis": 30000}
+}
+----
+
+See `META-INF/tika/parse-context.idx` (generated at build time from `@TikaComponent` annotations)
+for the available component names.
+
+A few components are operator-only and never accepted from the wire —
+`exception-reporting` (xref:advanced/setting-limits.adoc#_exception_reporting[Exception
+reporting]) is one. A request naming one is rejected at the API boundary with
+`INVALID_ARGUMENT` and the reason, before the forked worker sees it. A misspelled or
+unregistered component name is refused the same way, so a typo is a client error rather
+than a silent fallback to the server's defaults.
+
+NOTE: This is disabled by default. A request setting `parse_context_json` or
+`additional_fetch_config_json` is rejected with `PERMISSION_DENIED` unless `allowPerRequestConfig`
+is enabled — see <<_capability_flags,Capability flags>>.

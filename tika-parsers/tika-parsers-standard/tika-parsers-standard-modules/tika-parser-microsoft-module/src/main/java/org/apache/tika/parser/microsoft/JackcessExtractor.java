@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft;
 
 
@@ -48,6 +47,7 @@ import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.OfficeOpenXMLExtended;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -76,13 +76,11 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
     final DateFormat shortDateTimeFormatter;
 
     final Parser htmlParser;
-    final ParseContext parseContext;
 
     protected JackcessExtractor(Metadata metadata, ParseContext context, Locale locale) {
         super(context, metadata);
         currencyFormatter = NumberFormat.getCurrencyInstance(locale);
         shortDateTimeFormatter = DateFormat.getDateInstance(DateFormat.SHORT, locale);
-        this.parseContext = context;
         Parser tmpHtmlParser =
                 EmbeddedDocumentUtil.tryToFindExistingLeafParser(JSoupParser.class, context);
         if (tmpHtmlParser == null) {
@@ -103,13 +101,13 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
         db.setDateTimeType(DateTimeType.DATE);
         PropertyMap dbp = db.getDatabaseProperties();
         for (PropertyMap.Property p : dbp) {
-            parentMetadata.add(JackcessParser.MDB_PROPERTY_PREFIX + p.getName(),
+            parentMetadata.add(JackcessParser.MDB_PROPERTY, p.getName(),
                     toString(p.getValue(), p.getType()));
         }
 
         PropertyMap up = db.getUserDefinedProperties();
         for (PropertyMap.Property p : up) {
-            parentMetadata.add(JackcessParser.USER_DEFINED_PROPERTY_PREFIX + p.getName(),
+            parentMetadata.add(JackcessParser.MDB_USER_PROPERTY, p.getName(),
                     toString(p.getValue(), p.getType()));
         }
 
@@ -138,7 +136,7 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
 
             for (PropertyMap.Property p : db.getSummaryProperties()) {
                 if (!found.contains(p.getName())) {
-                    parentMetadata.add(JackcessParser.SUMMARY_PROPERTY_PREFIX + p.getName(),
+                    parentMetadata.add(JackcessParser.MDB_SUMMARY_PROPERTY, p.getName(),
                             toString(p.getValue(), p.getType()));
                 }
             }
@@ -217,10 +215,10 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
             String v = toString(obj, c.getType());
             if (isRichText(c)) {
                 BodyContentHandler h = new BodyContentHandler();
-                Metadata m = new Metadata();
-                m.set(Metadata.CONTENT_TYPE, "text/html; charset=UTF-8");
+                Metadata m = Metadata.newInstance(context);
+                m.set(HttpHeaders.CONTENT_TYPE, "text/html; charset=UTF-8");
                 try (TikaInputStream tis = TikaInputStream.get(v.getBytes(UTF_8))) {
-                    htmlParser.parse(tis, h, m, parseContext);
+                    htmlParser.parse(tis, h, m, context);
                     handler.characters(h.toString());
                 } catch (SAXException e) {
                     WriteLimitReachedException.throwIfWriteLimitReached(e);
@@ -290,8 +288,6 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
             case GUID:
                 return value.toString();
             case COMPLEX_TYPE: //skip all these
-            case UNKNOWN_0D:
-            case UNKNOWN_11:
             case UNSUPPORTED_FIXEDLEN:
             case UNSUPPORTED_VARLEN:
             default:
@@ -327,7 +323,7 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
                 try {
                     tis = TikaInputStream.get(spc.getStream());
                 } catch (IOException e) {
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                     break;
                 }
                 if (tis != null) {
@@ -347,7 +343,7 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
                 try {
                     ocStream = TikaInputStream.get(oc.getStream());
                 } catch (IOException e) {
-                    EmbeddedDocumentUtil.recordException(e, parentMetadata);
+                    EmbeddedDocumentUtil.recordException(e, parentMetadata, context);
                 }
                 try {
                     handleEmbeddedResource(ocStream, null,//filename
@@ -373,14 +369,14 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
             try {
                 is = cc.getStream();
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                 return;
             }
 
             try {
                 fileSystem = new POIFSFileSystem(is);
             } catch (Exception e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                 return;
             }
 
@@ -415,4 +411,3 @@ class JackcessExtractor extends AbstractPOIFSExtractor {
     }
 
 }
-

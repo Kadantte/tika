@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,6 +34,6 @@ public class LanguageDetectorExampleTest {
     @Test
     public void testDetectLanguage() throws IOException {
         String text = "This is some text that should be identified as English.";
-        assertEquals("en", languageDetectorExample.detectLanguage(text));
+        assertEquals("eng", languageDetectorExample.detectLanguage(text));
     }
 }

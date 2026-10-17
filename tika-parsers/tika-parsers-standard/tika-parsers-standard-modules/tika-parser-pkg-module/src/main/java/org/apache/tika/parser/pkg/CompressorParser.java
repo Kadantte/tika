@@ -33,10 +33,13 @@ import static org.apache.tika.detect.zip.CompressorConstants.ZLIB;
 import static org.apache.tika.detect.zip.CompressorConstants.ZSTD;
 import static org.apache.tika.metadata.HttpHeaders.CONTENT_TYPE;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.channels.Channels;
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -49,6 +52,7 @@ import org.apache.commons.compress.compressors.CompressorStreamFactory;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.deflate.DeflateCompressorInputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipParameters;
 import org.apache.commons.compress.compressors.gzip.GzipUtils;
 import org.apache.commons.compress.compressors.lzma.LZMACompressorInputStream;
 import org.apache.commons.compress.compressors.pack200.Pack200CompressorInputStream;
@@ -56,26 +60,33 @@ import org.apache.commons.compress.compressors.snappy.FramedSnappyCompressorInpu
 import org.apache.commons.compress.compressors.snappy.SnappyCompressorInputStream;
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
 import org.apache.commons.compress.compressors.z.ZCompressorInputStream;
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.TikaMemoryLimitException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.FilenameUtils;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.FileSystem;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.StringUtils;
+import org.apache.tika.utils.TikaDates;
 
 /**
  * Parser for various compression formats.
  */
+@TikaComponent
 public class CompressorParser implements Parser {
 
     /**
@@ -83,11 +94,37 @@ public class CompressorParser implements Parser {
      */
     private static final long serialVersionUID = 2793565792967222459L;
 
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        private int memoryLimitInKb = 100000;
+        private boolean decompressConcatenated = false;
+
+        public int getMemoryLimitInKb() {
+            return memoryLimitInKb;
+        }
+
+        public void setMemoryLimitInKb(int memoryLimitInKb) {
+            this.memoryLimitInKb = memoryLimitInKb;
+        }
+
+        public boolean isDecompressConcatenated() {
+            return decompressConcatenated;
+        }
+
+        public void setDecompressConcatenated(boolean decompressConcatenated) {
+            this.decompressConcatenated = decompressConcatenated;
+        }
+    }
 
     private static Set<MediaType> SUPPORTED_TYPES;
     private static Map<String, String> MIMES_TO_NAME;
 
-    private boolean decompressConcatenated = false;
+    //pack200 archives start with the 4-byte magic 0xCAFED00D
+    private static final byte[] PACK200_MAGIC = {(byte) 0xCA, (byte) 0xFE, (byte) 0xD0, (byte) 0x0D};
+
+    private Config defaultConfig = new Config();
 
     static {
         Set<MediaType> TMP_SET = new HashSet<>(MediaType
@@ -127,7 +164,27 @@ public class CompressorParser implements Parser {
     }
 
 
-    private int memoryLimitInKb = 100000;//100MB
+    public CompressorParser() {
+    }
+
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public CompressorParser(Config config) {
+        this.defaultConfig = config;
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public CompressorParser(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
 
     /**
      * @param stream stream
@@ -167,77 +224,148 @@ public class CompressorParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         // At the end we want to close the compression stream to release
         // any associated resources, but the underlying document stream
         // should not be closed
-        if (stream.markSupported()) {
-            stream = CloseShieldInputStream.wrap(stream);
-        } else {
-            // Ensure that the stream supports the mark feature
-            stream = new BufferedInputStream(CloseShieldInputStream.wrap(stream));
-        }
+        // TikaInputStream always supports mark
+        tis.setCloseShield();
 
         CompressorInputStream cis;
+        boolean detected = false;
         try {
             CompressorParserOptions options =
-                    context.get(CompressorParserOptions.class, metadata1 -> decompressConcatenated);
+                    context.get(CompressorParserOptions.class,
+                        metadata1 -> defaultConfig.isDecompressConcatenated());
             CompressorStreamFactory factory =
                     new CompressorStreamFactory(options.decompressConcatenated(metadata),
-                            memoryLimitInKb);
+                            defaultConfig.getMemoryLimitInKb());
             //if we've already identified it via autodetect
             //trust that and go with the appropriate name
             //to avoid calling CompressorStreamFactory.detect() twice
             String name = getStreamName(metadata);
-            if (name != null) {
-                cis = factory.createCompressorInputStream(name, stream);
+            boolean pack200 = CompressorStreamFactory.PACK200.equals(name);
+            if (name == null) {
+                //No content-type hint: peek to see whether this is pack200 so we can route it
+                //through the workaround below. Anything else falls through to autodetect unchanged.
+                pack200 = isPack200(tis);
+            }
+            if (pack200) {
+                // TIKA-4221 / COMPRESS-721 workaround: commons-compress' Pack200CompressorInputStream
+                // reflects into java.io internals (FilterInputStream.in / FileInputStream.path) to
+                // bound its input, which throws InaccessibleObjectException on Java 17+. A
+                // TikaInputStream is a FilterInputStream, so it triggers this. Re-read via
+                // Channels.newInputStream (a ChannelInputStream) -- the one input type
+                // commons-compress does not reflect into -- without forcing in-memory content to
+                // disk. Pack200CompressorInputStream reads its input fully in the constructor
+                // (IN_MEMORY) and then serves bytes from an in-memory buffer, so the channel
+                // stream can be closed immediately afterward. Remove this once Tika depends on a
+                // commons-compress release that contains the COMPRESS-721 fix.
+                try (InputStream packStream = Channels.newInputStream(tis.getSeekableByteChannel())) {
+                    cis = factory.createCompressorInputStream(CompressorStreamFactory.PACK200,
+                            packStream);
+                }
+                if (name == null) {
+                    metadata.set(CONTENT_TYPE, PACK.toString());
+                }
+            } else if (name != null) {
+                cis = factory.createCompressorInputStream(name, tis);
             } else {
-                cis = factory.createCompressorInputStream(stream);
+                cis = factory.createCompressorInputStream(tis);
                 MediaType type = getMediaType(cis);
                 if (!type.equals(MediaType.OCTET_STREAM)) {
                     metadata.set(CONTENT_TYPE, type.toString());
                 }
             }
+            detected = true;
         } catch (CompressorException e) {
             if (e.getCause() instanceof MemoryLimitException) {
                 throw new TikaMemoryLimitException(e.getMessage());
             }
             throw new TikaException("Unable to uncompress document stream", e);
+        } finally {
+            // covers unchecked escapes too (e.g. InaccessibleObjectException from the
+            // pack200 reflection), which used to leave the shield stuck on
+            if (!detected) {
+                tis.removeCloseShield();
+            }
         }
 
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
-        xhtml.startDocument();
-
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         try {
-            Metadata entrydata = new Metadata();
-            String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
-            if (name != null) {
-                if (name.endsWith(".tbz") || name.endsWith(".tbz2")) {
-                    name = name.substring(0, name.lastIndexOf(".")) + ".tar";
-                } else if (name.endsWith(".bz") || name.endsWith(".bz2") || name.endsWith(".xz") ||
-                        name.endsWith(".zlib") || name.endsWith(".pack") || name.endsWith(".br")) {
-                    name = name.substring(0, name.lastIndexOf("."));
-                } else if (name.length() > 0) {
-                    name = GzipUtils.getUncompressedFileName(name);
-                }
-                entrydata.set(TikaCoreProperties.RESOURCE_NAME_KEY, name);
+            //inside the try: a handler that throws from startDocument() must still
+            //release cis and the shield
+            xhtml.startDocument();
+            Metadata entrydata = Metadata.newInstance(context);
+            boolean foundName = false;
+            if (cis instanceof GzipCompressorInputStream) {
+                foundName = extractGzipMetadata((GzipCompressorInputStream) cis, entrydata);
+            }
+            if (! foundName) {
+                setName(metadata, entrydata);
             }
 
             // Use the delegate parser to parse the compressed document
             EmbeddedDocumentExtractor extractor =
                     EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-            if (extractor.shouldParseEmbedded(entrydata)) {
-                try (TikaInputStream tis = TikaInputStream.get(cis)) {
-                    extractor.parseEmbedded(tis, xhtml, entrydata, true);
+            if (extractor.shouldParseEmbedded(entrydata, context)) {
+                try (TikaInputStream inner = TikaInputStream.get(cis)) {
+                    extractor.parseEmbedded(inner, xhtml, entrydata, context, true);
                 }
             }
         } finally {
-            cis.close();
+            //nested so a throw from cis.close() can't strand the shield; a stuck shield
+            //makes the caller's tis.close() a no-op and leaks its whole resource tree
+            try {
+                cis.close();
+            } finally {
+                tis.removeCloseShield();
+            }
         }
 
         xhtml.endDocument();
+    }
+
+    private boolean extractGzipMetadata(GzipCompressorInputStream gzcis, Metadata metadata) {
+        GzipParameters gzipParameters = gzcis.getMetaData();
+        if (gzipParameters == null) {
+            return false;
+        }
+        // MTIME 0 means no timestamp (RFC 1952)
+        Instant mtime = gzipParameters.getModificationInstant();
+        if (mtime != null && mtime.getEpochSecond() != 0 && TikaDates.inYearBounds(mtime)) {
+            metadata.set(FileSystem.MODIFIED, Date.from(mtime));
+        }
+        String name = gzipParameters.getFileName();
+        if (!StringUtils.isBlank(name)) {
+            metadata.set(TikaCoreProperties.INTERNAL_PATH, name);
+            metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, name);
+            return true;
+        }
+        //TODO: OS, comment
+        return false;
+    }
+
+    private void setName(Metadata parentMetadata, Metadata metadata) {
+        String name = parentMetadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
+        //if parent's name is blank stop now
+        if (StringUtils.isBlank(name)) {
+            return;
+        }
+
+        name = FilenameUtils.getName(name);
+
+        if (name.endsWith(".tgz") || name.endsWith(".tbz") || name.endsWith(".tbz2")) {
+            name = name.substring(0, name.lastIndexOf(".")) + ".tar";
+        } else if (name.endsWith(".bz") || name.endsWith(".gz") || name.endsWith(".bz2") || name.endsWith(".xz") || name.endsWith(".zlib") || name.endsWith(".pack") ||
+                name.endsWith(".br")) {
+            name = name.substring(0, name.lastIndexOf("."));
+        } else if (!name.isEmpty()) {
+            name = GzipUtils.getUncompressedFileName(name);
+        }
+        metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, name);
     }
 
     /**
@@ -247,29 +375,32 @@ public class CompressorParser implements Parser {
      * ind
      */
     private String getStreamName(Metadata metadata) {
-        String mimeString = metadata.get(Metadata.CONTENT_TYPE);
+        String mimeString = metadata.get(HttpHeaders.CONTENT_TYPE);
         if (mimeString == null) {
             return null;
         }
         return MIMES_TO_NAME.get(mimeString);
     }
 
-    @Field
-    public void setMemoryLimitInKb(int memoryLimitInKb) {
-        this.memoryLimitInKb = memoryLimitInKb;
+    /**
+     * Peeks at the stream signature to determine whether it is a pack200 archive, without
+     * consuming the stream. Used so pack200 can be routed through the COMPRESS-721 workaround in
+     * {@link #parse}.
+     *
+     * @param tis the input, which must support mark/reset (a TikaInputStream always does)
+     * @return {@code true} if the signature matches pack200
+     */
+    private static boolean isPack200(TikaInputStream tis) {
+        try {
+            byte[] sig = new byte[PACK200_MAGIC.length];
+            return tis.peek(sig) == PACK200_MAGIC.length && Arrays.equals(sig, PACK200_MAGIC);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
-    public int getMemoryLimitInKb() {
-        return this.memoryLimitInKb;
-    }
-
-    @Field
-    public void setDecompressConcatenated(boolean decompressConcatenated) {
-        this.decompressConcatenated = decompressConcatenated;
-    }
-
-    public boolean isDecompressConcatenated() {
-        return this.decompressConcatenated;
+    public Config getDefaultConfig() {
+        return defaultConfig;
     }
 
 }

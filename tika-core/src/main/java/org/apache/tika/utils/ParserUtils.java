@@ -18,15 +18,11 @@ package org.apache.tika.utils;
 
 import static org.apache.tika.metadata.TikaCoreProperties.EMBEDDED_EXCEPTION;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 
-import org.apache.tika.io.TemporaryResources;
-import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.ParserDecorator;
 
@@ -35,26 +31,12 @@ import org.apache.tika.parser.ParserDecorator;
  */
 public class ParserUtils {
 
-    public final static Property EMBEDDED_PARSER = Property.internalText(
-            TikaCoreProperties.TIKA_META_EXCEPTION_PREFIX + "embedded_parser");
-
-
     /**
      * Does a deep clone of a Metadata object.
      */
     public static Metadata cloneMetadata(Metadata m) {
         Metadata clone = new Metadata();
-
-        for (String n : m.names()) {
-            if (!m.isMultiValued(n)) {
-                clone.set(n, m.get(n));
-            } else {
-                String[] vals = m.getValues(n);
-                for (String val : vals) {
-                    clone.add(n, val);
-                }
-            }
-        }
+        clone.putAll(m);
         return clone;
     }
 
@@ -101,67 +83,19 @@ public class ParserUtils {
      * {@link Exception} wasn't immediately thrown (eg when several different
      * Parsers are used)
      */
+    public static void recordParserFailure(Parser parser, Throwable failure, Metadata metadata,
+                                           ParseContext context) {
+        metadata.add(EMBEDDED_EXCEPTION, ExceptionUtils.format(failure, context));
+        metadata.add(TikaCoreProperties.EMBEDDED_PARSER, getParserClassname(parser));
+    }
+
+    /**
+     * @deprecated since 4.1, removal planned for 5.0; use
+     * {@link #recordParserFailure(Parser, Throwable, Metadata, ParseContext)} so the
+     * configured {@link org.apache.tika.config.ExceptionReporting} applies
+     */
+    @Deprecated
     public static void recordParserFailure(Parser parser, Throwable failure, Metadata metadata) {
-        String trace = ExceptionUtils.getStackTrace(failure);
-        metadata.add(EMBEDDED_EXCEPTION, trace);
-        metadata.add(EMBEDDED_PARSER, getParserClassname(parser));
-    }
-
-    /**
-     * Ensures that the Stream will be able to be re-read, by buffering to
-     * a temporary file if required.
-     * Streams that are automatically OK include {@link TikaInputStream}s
-     * created from Files or InputStreamFactories, and {@link RereadableInputStream}.
-     */
-    public static InputStream ensureStreamReReadable(InputStream stream, TemporaryResources tmp,
-                                                     Metadata metadata)
-            throws IOException {
-        // If it's re-readable, we're done
-        if (stream instanceof RereadableInputStream) {
-            return stream;
-        }
-
-        // Make sure it's a TikaInputStream
-        TikaInputStream tstream = TikaInputStream.cast(stream);
-        if (tstream == null) {
-            tstream = TikaInputStream.get(stream, tmp, metadata);
-        }
-
-        // If it's factory based, it's ok
-        if (tstream.getInputStreamFactory() != null) {
-            return tstream;
-        }
-
-        // Ensure it's file based
-        tstream.getFile();
-        // Prepare for future re-reads
-        tstream.mark(-1);
-        return tstream;
-    }
-
-    /**
-     * Resets the given {@link TikaInputStream} (checked by
-     * {@link #ensureStreamReReadable(InputStream, TemporaryResources, Metadata)})
-     * so that it can be re-read again.
-     */
-    public static InputStream streamResetForReRead(InputStream stream, TemporaryResources tmp)
-            throws IOException {
-        // If re-readable, rewind to start
-        if (stream instanceof RereadableInputStream) {
-            ((RereadableInputStream) stream).rewind();
-            return stream;
-        }
-
-        // File or Factory based?
-        TikaInputStream tstream = (TikaInputStream) stream;
-        if (tstream.getInputStreamFactory() != null) {
-            // Just get a fresh one each time from the factory
-            return TikaInputStream.get(tstream.getInputStreamFactory(), tmp);
-        }
-
-        // File based, reset stream to beginning of File
-        tstream.reset();
-        tstream.mark(-1);
-        return tstream;
+        recordParserFailure(parser, failure, metadata, null);
     }
 }

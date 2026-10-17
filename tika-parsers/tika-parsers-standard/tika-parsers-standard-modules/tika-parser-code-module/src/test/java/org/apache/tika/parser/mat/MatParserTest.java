@@ -18,12 +18,12 @@ package org.apache.tika.parser.mat;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import java.io.InputStream;
-
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.ToXMLContentHandler;
@@ -43,7 +43,7 @@ public class MatParserTest extends TikaTest {
         assertEquals("PCWIN64", metadata.get("platform"));
         assertEquals("MATLAB 5.0 MAT-file", metadata.get("fileType"));
         assertEquals("IM", metadata.get("endian"));
-        assertEquals("Thu Feb 21 15:52:49 2013", metadata.get("createdOn"));
+        assertEquals("Thu Feb 21 15:52:49 2013", metadata.get(TikaCoreProperties.CREATED));
 
         assertContains("<li>[1x909  double array]</li>", content);
         assertContains("<p>c1:[1x1  struct array]</p>", content);
@@ -62,8 +62,8 @@ public class MatParserTest extends TikaTest {
         Metadata metadata = new Metadata();
         String path = "/test-documents/test_mat_text.mat";
 
-        try (InputStream stream = getResourceAsStream(path)) {
-            parser.parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream(path)) {
+            parser.parse(tis, handler, metadata, new ParseContext());
         }
 
         // Check Content

@@ -33,9 +33,11 @@ import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -49,6 +51,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * <p>
  * See <a href="https://en.wikipedia.org/wiki/Microsoft_Office_XML_formats">https://en.wikipedia.org/wiki/Microsoft_Office_XML_formats</a>
  */
+@TikaComponent
 public class WordMLParser extends AbstractXML2003Parser {
     //map between wordml and xhtml entities
     private static final Map<String, String> WORDML_TO_XHTML;
@@ -81,13 +84,13 @@ public class WordMLParser extends AbstractXML2003Parser {
 
         return new TeeContentHandler(super.getContentHandler(ch, metadata, context),
                 new WordMLHandler(ch), new HyperlinkHandler(ch, WORD_ML_URL),
-                new PictHandler(ch, metadata,
+                new PictHandler(ch, metadata, context,
                         EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context)));
     }
 
     @Override
     public void setContentType(Metadata metadata) {
-        metadata.set(Metadata.CONTENT_TYPE, MEDIA_TYPE.toString());
+        metadata.set(HttpHeaders.CONTENT_TYPE, MEDIA_TYPE.toString());
     }
 
     private static class WordMLHandler extends DefaultHandler {
@@ -119,12 +122,26 @@ public class WordMLParser extends AbstractXML2003Parser {
                         //close p if already in a p to prevent nested <p>
                         if (inP) {
                             handler.endElement(XHTMLContentHandler.XHTML, P, P);
+                            inP = false;
                         }
-                        inP = true;
+                    } else if (html.equals(TABLE) && inP) {
+                        // WordML allows <w:tbl> nested inside <w:p>. XHTML
+                        // does not allow a block-level table inside an
+                        // inline <p>: the inline <p> would still be on the
+                        // SAX stack when the table's <tr>/<td> children
+                        // (and their inner <w:p>'s) emit, and the next
+                        // "close p before nested p" event would land on top
+                        // of <td>/<tr> instead of <p>. Close the open <p>
+                        // before opening the table.
+                        handler.endElement(XHTMLContentHandler.XHTML, P, P);
+                        inP = false;
                     }
                     handler.startElement(XHTMLContentHandler.XHTML, html, html, EMPTY_ATTRS);
                     if (html.equals(TABLE)) {
                         handler.startElement(XHTMLContentHandler.XHTML, TBODY, TBODY, EMPTY_ATTRS);
+                    }
+                    if (P.equals(localName)) {
+                        inP = true;
                     }
                 }
                 if (BR.equals(localName)) {
@@ -179,16 +196,18 @@ public class WordMLParser extends AbstractXML2003Parser {
         final ContentHandler handler;
         final Base64 base64 = new Base64();
         byte[] rawBytes = null;
+        final ParseContext parseContext;
         EmbeddedDocumentExtractor embeddedDocumentExtractor;
         boolean inPict = false;
         boolean inBin = false;
         String pictName = null;
         String pictSource = null;
 
-        public PictHandler(ContentHandler handler, Metadata metadata,
+        public PictHandler(ContentHandler handler, Metadata metadata, ParseContext parseContext,
                            EmbeddedDocumentExtractor embeddedDocumentExtractor) {
             this.handler = handler;
             this.parentMetadata = metadata;
+            this.parseContext = parseContext;
             this.embeddedDocumentExtractor = embeddedDocumentExtractor;
         }
 
@@ -263,7 +282,7 @@ public class WordMLParser extends AbstractXML2003Parser {
                     rawBytes = base64.decode(buffer.toString());
                     success = true;
                 } catch (IllegalArgumentException e) {
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, parseContext);
                 } finally {
                     //reset
                     buffer.setLength(0);
@@ -276,16 +295,16 @@ public class WordMLParser extends AbstractXML2003Parser {
 
         private void handleEmbedded(boolean outputHtml) throws SAXException {
             if (rawBytes != null) {
-                try (TikaInputStream is = TikaInputStream.get(rawBytes)) {
-                    Metadata metadata = new Metadata();
+                try (TikaInputStream tis = TikaInputStream.get(rawBytes)) {
+                    Metadata metadata = Metadata.newInstance(parseContext);
                     if (pictName != null) {
                         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, pictName);
                     }
                     if (pictSource != null) {
                         metadata.set(TikaCoreProperties.ORIGINAL_RESOURCE_NAME, pictSource);
                     }
-                    if (embeddedDocumentExtractor.shouldParseEmbedded(metadata)) {
-                        embeddedDocumentExtractor.parseEmbedded(is, handler, metadata, outputHtml);
+                    if (embeddedDocumentExtractor.shouldParseEmbedded(metadata, parseContext)) {
+                        embeddedDocumentExtractor.parseEmbedded(tis, handler, metadata, parseContext, outputHtml);
                     }
                 } catch (IOException e) {
                     //log

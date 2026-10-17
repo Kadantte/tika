@@ -1,0 +1,282 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.inference;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import org.apache.tika.inference.locator.EmbeddedLocator;
+import org.apache.tika.inference.locator.Locators;
+import org.apache.tika.inference.locator.PaginatedLocator;
+import org.apache.tika.inference.locator.SpatialLocator;
+import org.apache.tika.inference.locator.TemporalLocator;
+import org.apache.tika.inference.locator.TextLocator;
+import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.inference.Modality;
+
+/**
+ * Serializes and deserializes a list of {@link Chunk} objects to/from JSON.
+ * Vectors are stored as base64-encoded big-endian float32 via
+ * {@link VectorSerializer}. Locators are nested under a {@code "locators"}
+ * object with optional {@code text}, {@code paginated}, {@code spatial},
+ * {@code temporal} and {@code embedded} arrays.
+ */
+public final class ChunkSerializer {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private ChunkSerializer() {
+    }
+
+    /**
+     * Serialize chunks to a JSON array string.
+     */
+    public static String toJson(List<Chunk> chunks) throws IOException {
+        ArrayNode array = MAPPER.createArrayNode();
+        for (Chunk chunk : chunks) {
+            ObjectNode node = array.addObject();
+            if (chunk.getText() != null) {
+                node.put("text", chunk.getText());
+            }
+            if (chunk.getVector() != null) {
+                node.put("vector", VectorSerializer.encode(chunk.getVector()));
+            }
+            if (chunk.getProducer() != null) {
+                node.put("producer", chunk.getProducer());
+            }
+            if (chunk.getModality() != null) {
+                node.put("modality", chunk.getModality().name().toLowerCase(Locale.ROOT));
+            }
+            if (chunk.getCorrelator() != null) {
+                node.put("correlator", chunk.getCorrelator());
+            }
+            serializeLocators(node, chunk.getLocators());
+        }
+        return MAPPER.writeValueAsString(array);
+    }
+
+    /**
+     * Reads any existing chunks from the metadata field, appends the
+     * new chunks, and writes the merged list back. This allows
+     * multiple components (text chunker, image embedder, etc.) to
+     * contribute to the same chunks array.
+     *
+     * @param metadata  the metadata to read from and write to
+     * @param newChunks chunks to append
+     */
+    public static void mergeInto(
+            org.apache.tika.metadata.Metadata metadata,
+            List<Chunk> newChunks) throws IOException {
+        mergeInto(metadata, newChunks, TikaCoreProperties.TIKA_CHUNKS.getName());
+    }
+
+    public static void mergeInto(
+            org.apache.tika.metadata.Metadata metadata,
+            List<Chunk> newChunks,
+            String fieldName) throws IOException {
+        List<Chunk> existing;
+        String current = metadata.get(fieldName);
+        if (current != null && !current.isEmpty()) {
+            existing = fromJson(current);
+        } else {
+            existing = new ArrayList<>();
+        }
+        existing.addAll(newChunks);
+        // Chunks are Tika-native output; the default field (tk:chunks) is reserved, so write trusted.
+        metadata.setTrusted(fieldName, toJson(existing));
+    }
+
+    /**
+     * Deserialize a JSON array string back to a list of chunks.
+     */
+    public static List<Chunk> fromJson(String json) throws IOException {
+        JsonNode array = MAPPER.readTree(json);
+        List<Chunk> chunks = new ArrayList<>();
+        for (JsonNode node : array) {
+            String text = node.has("text") ? node.get("text").asText() : null;
+            Locators locators = deserializeLocators(node.get("locators"));
+
+            Chunk chunk = new Chunk(text, locators);
+            if (node.hasNonNull("producer")) {
+                chunk.setProducer(node.get("producer").asText());
+            }
+            if (node.hasNonNull("modality")) {
+                chunk.setModality(modality(node.get("modality").asText()));
+            }
+            if (node.hasNonNull("correlator")) {
+                chunk.setCorrelator(node.get("correlator").asText());
+            }
+
+            JsonNode vectorNode = node.get("vector");
+            if (vectorNode != null && !vectorNode.isNull()) {
+                chunk.setVector(VectorSerializer.decode(vectorNode.asText()));
+            }
+            chunks.add(chunk);
+        }
+        return chunks;
+    }
+
+    // ---- locator serialization --------------------------------------------
+
+    /** A value this reader does not know (a newer writer's) reads as unsaid, not as a failure. */
+    private static Modality modality(String text) {
+        for (Modality m : Modality.values()) {
+            if (m.name().equalsIgnoreCase(text)) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    private static void serializeLocators(ObjectNode parent, Locators loc) {
+        if (loc == null || loc.isEmpty()) {
+            return;
+        }
+
+        ObjectNode locNode = parent.putObject("locators");
+
+        if (loc.getText() != null && !loc.getText().isEmpty()) {
+            ArrayNode arr = locNode.putArray("text");
+            for (TextLocator t : loc.getText()) {
+                ObjectNode o = arr.addObject();
+                o.put("start_offset", t.getStartOffset());
+                o.put("end_offset", t.getEndOffset());
+            }
+        }
+
+        if (loc.getPaginated() != null && !loc.getPaginated().isEmpty()) {
+            ArrayNode arr = locNode.putArray("paginated");
+            for (PaginatedLocator p : loc.getPaginated()) {
+                ObjectNode o = arr.addObject();
+                o.put("page", p.getPage());
+                if (p.getBbox() != null) {
+                    ArrayNode bboxArr = o.putArray("bbox");
+                    for (float v : p.getBbox()) {
+                        bboxArr.add(v);
+                    }
+                }
+            }
+        }
+
+        if (loc.getSpatial() != null && !loc.getSpatial().isEmpty()) {
+            ArrayNode arr = locNode.putArray("spatial");
+            for (SpatialLocator s : loc.getSpatial()) {
+                ObjectNode o = arr.addObject();
+                if (s.getBbox() != null) {
+                    ArrayNode bboxArr = o.putArray("bbox");
+                    for (float v : s.getBbox()) {
+                        bboxArr.add(v);
+                    }
+                }
+                if (s.getLabel() != null) {
+                    o.put("label", s.getLabel());
+                }
+            }
+        }
+
+        if (loc.getTemporal() != null && !loc.getTemporal().isEmpty()) {
+            ArrayNode arr = locNode.putArray("temporal");
+            for (TemporalLocator t : loc.getTemporal()) {
+                ObjectNode o = arr.addObject();
+                o.put("start_ms", t.getStartMs());
+                o.put("end_ms", t.getEndMs());
+            }
+        }
+
+        if (loc.getEmbedded() != null && !loc.getEmbedded().isEmpty()) {
+            ArrayNode arr = locNode.putArray("embedded");
+            for (EmbeddedLocator e : loc.getEmbedded()) {
+                ObjectNode o = arr.addObject();
+                o.put("id_path", e.getIdPath());
+                if (e.getName() != null) {
+                    o.put("name", e.getName());
+                }
+            }
+        }
+    }
+
+    private static Locators deserializeLocators(JsonNode locNode) {
+        Locators locators = new Locators();
+        if (locNode == null || locNode.isNull()) {
+            return locators;
+        }
+
+        JsonNode textArr = locNode.get("text");
+        if (textArr != null && textArr.isArray()) {
+            for (JsonNode n : textArr) {
+                locators.addText(new TextLocator(
+                        n.get("start_offset").asInt(),
+                        n.get("end_offset").asInt()));
+            }
+        }
+
+        JsonNode pagArr = locNode.get("paginated");
+        if (pagArr != null && pagArr.isArray()) {
+            for (JsonNode n : pagArr) {
+                float[] bbox = deserializeBbox(n.get("bbox"));
+                locators.addPaginated(
+                        new PaginatedLocator(n.get("page").asInt(), bbox));
+            }
+        }
+
+        JsonNode spatArr = locNode.get("spatial");
+        if (spatArr != null && spatArr.isArray()) {
+            for (JsonNode n : spatArr) {
+                float[] bbox = deserializeBbox(n.get("bbox"));
+                String label = n.has("label") ? n.get("label").asText() : null;
+                locators.addSpatial(new SpatialLocator(bbox, label));
+            }
+        }
+
+        JsonNode tempArr = locNode.get("temporal");
+        if (tempArr != null && tempArr.isArray()) {
+            for (JsonNode n : tempArr) {
+                locators.addTemporal(new TemporalLocator(
+                        n.get("start_ms").asLong(),
+                        n.get("end_ms").asLong()));
+            }
+        }
+
+        JsonNode embArr = locNode.get("embedded");
+        if (embArr != null && embArr.isArray()) {
+            for (JsonNode n : embArr) {
+                String name = n.has("name") ? n.get("name").asText() : null;
+                locators.addEmbedded(new EmbeddedLocator(n.get("id_path").asText(), name));
+            }
+        }
+
+        return locators;
+    }
+
+    private static float[] deserializeBbox(JsonNode bboxNode) {
+        if (bboxNode == null || !bboxNode.isArray()) {
+            return null;
+        }
+        float[] bbox = new float[bboxNode.size()];
+        for (int i = 0; i < bboxNode.size(); i++) {
+            bbox[i] = (float) bboxNode.get(i).asDouble();
+        }
+        return bbox;
+    }
+}

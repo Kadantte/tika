@@ -1,0 +1,26 @@
+{
+  "engines": {
+    "claude": {
+      "claude-vlm-parser": {
+        "baseUrl": "https://api.anthropic.com",
+        "model": "claude-sonnet-4-20250514",
+        "prompt": "Extract all visible text from this image. Return the text in markdown format, preserving the original structure (headings, lists, tables, paragraphs). Do not describe the image. Only return the extracted text.",
+        "maxTokens": 4096,
+        "timeoutMillis": 300000,
+        "apiKey": "YOUR_ANTHROPIC_API_KEY",
+        "inlineContent": true,
+        "skipOcr": false,
+        "textRecognizer": true,
+        "minFileSizeToOcr": 0,
+        "maxFileSizeToOcr": 52428800,
+        "maxImagePixels": 100000000,
+        "allowRuntimePrompt": false
+      }
+    }
+  },
+  "text-recognizers": [
+    {
+      "engine": "claude"
+    }
+  ]
+}

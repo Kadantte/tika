@@ -25,17 +25,24 @@ import org.apache.commons.io.input.TaggedInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
+import org.apache.tika.sax.XHTMLBalancingHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 /**
  * RTF parser
  */
+@TikaComponent
 public class RTFParser implements Parser {
 
     /**
@@ -51,26 +58,60 @@ public class RTFParser implements Parser {
     private static int EMB_OBJ_MAX_BYTES = 20 * 1024 * 1024; //20MB
     //get rid of this once we get rid of the other static maxbytes...
     private static volatile boolean USE_STATIC = false;
-    @Field
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public int memoryLimitInKb = EMB_OBJ_MAX_BYTES / 1024;
+        public boolean ignoreListMarkup = false;
+    }
+
     private int memoryLimitInKb = EMB_OBJ_MAX_BYTES / 1024;
-    @Field
     private boolean ignoreListMarkup = false;
+
+    public RTFParser() {
+    }
+
+    public RTFParser(Config config) {
+        this.memoryLimitInKb = config.memoryLimitInKb;
+        this.ignoreListMarkup = config.ignoreListMarkup;
+    }
+
+    public RTFParser(JsonConfig jsonConfig) throws TikaConfigException {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
 
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        metadata.set(Metadata.CONTENT_TYPE, "application/rtf");
-        TaggedInputStream tagged = new TaggedInputStream(stream);
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        metadata.set(HttpHeaders.CONTENT_TYPE, "application/rtf");
+        TaggedInputStream tagged = new TaggedInputStream(tis);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
+        // Wrap xhtml in a balancing handler so the finally's endDocument
+        // doesn't fire on an unbalanced stack if the RTF state machine
+        // emits inconsistent SAX events (e.g., </b> while <p> is topmost
+        // due to state-vs-stack drift on certain corpus files). Without
+        // this, StrictXHTMLValidator's </body> vs <p>/<b> at endDocument
+        // masks the real well-formedness error from inside extract().
+        XHTMLBalancingHandler balancer = new XHTMLBalancingHandler(xhtml);
         try {
-            parseInline(stream, xhtml, metadata, context);
+            parseInline(tis, balancer, metadata, context);
         } catch (IOException e) {
             tagged.throwIfCauseOf(e);
+            balancer.drainOpenElements();
             throw new TikaException("Error parsing an RTF document", e);
+        } catch (SAXException | TikaException e) {
+            // Drain on any exception escaping parseInline. parseInline can
+            // throw TikaException too (memory limits, embedded extraction,
+            // etc.); without the drain, the finally's xhtml.endDocument()
+            // throws on the unbalanced stack and masks the real error.
+            balancer.drainOpenElements();
+            throw e;
         } finally {
             xhtml.endDocument();
         }
@@ -91,12 +132,12 @@ public class RTFParser implements Parser {
             throws TikaException, IOException, SAXException {
         RTFEmbObjHandler embObjHandler =
                 new RTFEmbObjHandler(handler, metadata, context, getMemoryLimitInKb());
-        final TextExtractor ert = new TextExtractor(handler, metadata, embObjHandler);
+        final TextExtractor ert = new TextExtractor(handler, metadata, embObjHandler, context);
         ert.setIgnoreListMarkup(ignoreListMarkup);
         ert.extract(is);
     }
 
-    public int getMemoryLimitInKb() {
+    private int getMemoryLimitInKb() {
         //there's a race condition here, but it shouldn't matter.
         if (USE_STATIC) {
             if (EMB_OBJ_MAX_BYTES < 0) {
@@ -105,11 +146,5 @@ public class RTFParser implements Parser {
             return EMB_OBJ_MAX_BYTES / 1024;
         }
         return memoryLimitInKb;
-    }
-
-    @Field
-    public void setMemoryLimitInKb(int memoryLimitInKb) {
-        this.memoryLimitInKb = memoryLimitInKb;
-        USE_STATIC = false;
     }
 }

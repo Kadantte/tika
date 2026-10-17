@@ -17,24 +17,26 @@
 package org.apache.tika.parser;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.config.OutputLimits;
 import org.apache.tika.exception.CorruptedFileException;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.exception.ZeroByteFileException;
+import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.extractor.EmbeddedMetadataLookup;
 import org.apache.tika.extractor.ParentContentHandler;
+import org.apache.tika.extractor.ParentMetadata;
 import org.apache.tika.io.FilenameUtils;
-import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -128,7 +130,7 @@ public class RecursiveParserWrapper extends ParserDecorator {
      * @throws IllegalStateException if the handler is not a {@link RecursiveParserWrapperHandler}
      */
     @Override
-    public void parse(InputStream stream, ContentHandler recursiveParserWrapperHandler,
+    public void parse(TikaInputStream tis, ContentHandler recursiveParserWrapperHandler,
                       Metadata metadata, ParseContext context)
             throws IOException, SAXException, TikaException {
         //this tracks the state of the parent parser, per call to #parse
@@ -141,13 +143,15 @@ public class RecursiveParserWrapper extends ParserDecorator {
                     "ContentHandler must implement RecursiveParserWrapperHandler");
         }
         EmbeddedParserDecorator decorator =
-                new EmbeddedParserDecorator(getWrappedParser(), "/", "/", parserState);
+                new EmbeddedParserDecorator(getWrappedParser(), "/", "/", parserState, metadata);
         context.set(Parser.class, decorator);
+        EmbeddedMetadataLookup preParseLookup = context.get(EmbeddedMetadataLookup.class);
+        context.set(EmbeddedMetadataLookup.class,
+                new EmbeddedMetadataLookup(parserState.recursiveParserWrapperHandler));
         ContentHandler localHandler =
-                parserState.recursiveParserWrapperHandler.getNewContentHandler();
+                parserState.recursiveParserWrapperHandler.createHandler();
         long started = System.currentTimeMillis();
         parserState.recursiveParserWrapperHandler.startDocument();
-        TemporaryResources tmp = new TemporaryResources();
         int writeLimit = -1;
         boolean throwOnWriteLimitReached = true;
 
@@ -159,10 +163,10 @@ public class RecursiveParserWrapper extends ParserDecorator {
                 throwOnWriteLimitReached = ((WriteLimiter)factory).isThrowOnWriteLimitReached();
             }
         }
+        SecureHandlerCounter handlerCounter = new SecureHandlerCounter(writeLimit, tis);
         try {
-            TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
             RecursivelySecureContentHandler secureContentHandler =
-                    new RecursivelySecureContentHandler(localHandler, tis, new SecureHandlerCounter(writeLimit),
+                    new RecursivelySecureContentHandler(localHandler, tis, handlerCounter,
                             throwOnWriteLimitReached, context);
             context.set(RecursivelySecureContentHandler.class, secureContentHandler);
             getWrappedParser().parse(tis, secureContentHandler, metadata, context);
@@ -173,17 +177,20 @@ public class RecursiveParserWrapper extends ParserDecorator {
             if (WriteLimitReachedException.isWriteLimitReached(e)) {
                 metadata.set(TikaCoreProperties.WRITE_LIMIT_REACHED, "true");
             } else {
-                String stackTrace = ExceptionUtils.getFilteredStackTrace(e);
-                metadata.add(TikaCoreProperties.CONTAINER_EXCEPTION, stackTrace);
+                metadata.add(TikaCoreProperties.CONTAINER_EXCEPTION,
+                        ExceptionUtils.format(e, context));
+                if (handlerCounter.zipBombDetected) {
+                    throw new TikaException("Zip bomb detected!", e);
+                }
                 throw e;
             }
         } finally {
-            tmp.dispose();
             long elapsedMillis = System.currentTimeMillis() - started;
             metadata.set(TikaCoreProperties.PARSE_TIME_MILLIS, Long.toString(elapsedMillis));
             parserState.recursiveParserWrapperHandler.endDocument(localHandler, metadata);
             parserState.recursiveParserWrapperHandler.endDocument();
             context.set(RecursivelySecureContentHandler.class, null);
+            context.set(EmbeddedMetadataLookup.class, preParseLookup);
         }
     }
 
@@ -191,12 +198,18 @@ public class RecursiveParserWrapper extends ParserDecorator {
         String objectName = "";
         if (metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY) != null) {
             objectName = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
+        } else if (metadata.get(TikaCoreProperties.INTERNAL_PATH) != null) {
+            objectName = FilenameUtils.getName(metadata.get(TikaCoreProperties.INTERNAL_PATH));
         } else if (metadata.get(TikaCoreProperties.EMBEDDED_RELATIONSHIP_ID) != null) {
             objectName = metadata.get(TikaCoreProperties.EMBEDDED_RELATIONSHIP_ID);
         } else if (metadata.get(TikaCoreProperties.VERSION_NUMBER) != null) {
             objectName = "version-number-" + metadata.get(TikaCoreProperties.VERSION_NUMBER);
         } else {
-            objectName = "embedded-" + counter.incrementAndGet();
+            objectName = EmbeddedDocumentUtil.generateResourceName(
+                    EmbeddedDocumentUtil.EmbeddedResourcePrefix.EMBEDDED,
+                    counter.incrementAndGet(),
+                    metadata.get(HttpHeaders.CONTENT_TYPE));
+            metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
         }
         //make sure that there isn't any path info in the objectName
         //some parsers can return paths, not just file names
@@ -212,10 +225,12 @@ public class RecursiveParserWrapper extends ParserDecorator {
         private String location = null;
 
         private String embeddedIdPath = null;
-
+        // the document whose embedded documents this decorator parses
+        private final Metadata parentMetadata;
 
         private EmbeddedParserDecorator(Parser parser, String location,
-                                        String embeddedIdPath, ParserState parseState) {
+                                        String embeddedIdPath, ParserState parseState,
+                                        Metadata parentMetadata) {
             super(parser);
             this.location = location;
             if (!this.location.endsWith("/")) {
@@ -223,16 +238,13 @@ public class RecursiveParserWrapper extends ParserDecorator {
             }
             this.embeddedIdPath = embeddedIdPath;
             this.parserState = parseState;
+            this.parentMetadata = parentMetadata;
         }
 
         @Override
-        public void parse(InputStream stream, ContentHandler ignore, Metadata metadata,
+        public void parse(TikaInputStream tis, ContentHandler ignore, Metadata metadata,
                           ParseContext context) throws IOException, SAXException, TikaException {
 
-            //Test to see if we should avoid parsing
-            if (parserState.recursiveParserWrapperHandler.hasHitMaximumEmbeddedResources()) {
-                return;
-            }
             // Work out what this thing is
             String objectName = getResourceName(metadata, parserState.unknownCount);
             String objectLocation = this.location + objectName;
@@ -247,13 +259,13 @@ public class RecursiveParserWrapper extends ParserDecorator {
             metadata.set(TikaCoreProperties.EMBEDDED_ID, parserState.embeddedCount);
             //get a fresh handler
             ContentHandler localHandler =
-                    parserState.recursiveParserWrapperHandler.getNewContentHandler();
+                    parserState.recursiveParserWrapperHandler.createHandler();
             parserState.recursiveParserWrapperHandler.startEmbeddedDocument(localHandler, metadata);
 
             Parser preContextParser = context.get(Parser.class);
             context.set(Parser.class,
                     new EmbeddedParserDecorator(getWrappedParser(), objectLocation,
-                            idPath, parserState));
+                            idPath, parserState, metadata));
             long started = System.currentTimeMillis();
             //store the handler that was used before this parse
             //so that you can return it back to its state at the end of this parse
@@ -261,12 +273,8 @@ public class RecursiveParserWrapper extends ParserDecorator {
 
             ParentContentHandler preParseParentHandler = context.get(ParentContentHandler.class);
             context.set(ParentContentHandler.class, new ParentContentHandler(preParseHandler));
-            TemporaryResources tmp = null;
-            TikaInputStream tis = TikaInputStream.cast(stream);
-            if (tis == null) {
-                tmp = new TemporaryResources();
-                tis = TikaInputStream.get(CloseShieldInputStream.wrap(stream), tmp, metadata);
-            }
+            ParentMetadata preParseParentMetadata = context.get(ParentMetadata.class);
+            context.set(ParentMetadata.class, new ParentMetadata(parentMetadata));
             ContentHandler secureContentHandler =
                     new RecursivelySecureContentHandler(localHandler, tis, preParseHandler.handlerCounter,
                     preParseHandler.throwOnWriteLimitReached, context);
@@ -278,9 +286,11 @@ public class RecursiveParserWrapper extends ParserDecorator {
                 if (WriteLimitReachedException.isWriteLimitReached(e)) {
                     metadata.add(TikaCoreProperties.WRITE_LIMIT_REACHED, "true");
                     throw e;
+                } else if (preParseHandler.handlerCounter.zipBombDetected) {
+                    throw e;
                 } else {
                     if (catchEmbeddedExceptions) {
-                        ParserUtils.recordParserFailure(this, e, metadata);
+                        ParserUtils.recordParserFailure(this, e, metadata, context);
                     } else {
                         throw e;
                     }
@@ -295,7 +305,7 @@ public class RecursiveParserWrapper extends ParserDecorator {
                         e instanceof ZeroByteFileException) {
                     //do nothing
                 } else if (catchEmbeddedExceptions) {
-                    ParserUtils.recordParserFailure(this, e, metadata);
+                    ParserUtils.recordParserFailure(this, e, metadata, context);
                 } else {
                     throw e;
                 }
@@ -304,13 +314,11 @@ public class RecursiveParserWrapper extends ParserDecorator {
                 context.set(Parser.class, preContextParser);
                 context.set(RecursivelySecureContentHandler.class, preParseHandler);
                 context.set(ParentContentHandler.class, preParseParentHandler);
+                context.set(ParentMetadata.class, preParseParentMetadata);
                 long elapsedMillis = System.currentTimeMillis() - started;
                 metadata.set(TikaCoreProperties.PARSE_TIME_MILLIS, Long.toString(elapsedMillis));
                 parserState.recursiveParserWrapperHandler
                         .endEmbeddedDocument(localHandler, metadata);
-                if (tmp != null) {
-                    tis.close();
-                }
             }
         }
     }
@@ -333,9 +341,15 @@ public class RecursiveParserWrapper extends ParserDecorator {
         private boolean writeLimitReached = false;
         //total chars written to all handlers
         private int totalChars = 0;
+        //the container's stream: the denominator for the compression ratio across the tree
+        private final TikaInputStream rootStream;
+        //total chars produced by all handlers, whether or not written
+        private long ratioChars = 0;
+        private boolean zipBombDetected = false;
 
-        private SecureHandlerCounter(int totalWriteLimit) {
+        private SecureHandlerCounter(int totalWriteLimit, TikaInputStream rootStream) {
             this.totalWriteLimit = totalWriteLimit;
+            this.rootStream = rootStream;
         }
         /**
          * Given the requested length, how many characters are actually available
@@ -371,6 +385,26 @@ public class RecursiveParserWrapper extends ParserDecorator {
             this.handlerCounter = handlerCounter;
             this.throwOnWriteLimitReached = throwOnWriteLimitReached;
             this.parseContext = parseContext;
+            OutputLimits limits = OutputLimits.get(parseContext);
+            setOutputThreshold(limits.getZipBombThreshold());
+            setMaximumCompressionRatio(limits.getZipBombRatio());
+        }
+
+        /**
+         * Each embedded document's stream is decompressed, so the per-entry ratio
+         * can't see archive compression. Also check the whole tree's output
+         * against the container's bytes, as the concatenated path does.
+         */
+        @Override
+        protected void advance(int length) throws SAXException {
+            super.advance(length);
+            handlerCounter.ratioChars += length;
+            try {
+                checkCompressionRatio(handlerCounter.ratioChars, handlerCounter.rootStream);
+            } catch (SAXException e) {
+                handlerCounter.zipBombDetected = true;
+                throw e;
+            }
         }
 
         /**

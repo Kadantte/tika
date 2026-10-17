@@ -1,0 +1,290 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.core;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.PipesResult;
+import org.apache.tika.pipes.core.protocol.ForkBootstrap;
+import org.apache.tika.plugins.TikaPluginManager;
+
+public class PipesParser implements Closeable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PipesParser.class);
+
+    /**
+     * Loads a PipesParser from a configuration file path.
+     * <p>
+     * This method:
+     * <ol>
+     *   <li>Loads the JSON configuration</li>
+     *   <li>Pre-extracts plugins before spawning child processes</li>
+     *   <li>Creates the PipesParser with the loaded configuration</li>
+     * </ol>
+     *
+     * @param tikaConfigPath path to the tika-config.json file
+     * @return a new PipesParser instance
+     * @throws IOException if reading config or extraction fails
+     * @throws TikaConfigException if configuration is invalid
+     */
+    public static PipesParser load(Path tikaConfigPath) throws IOException, TikaConfigException {
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+        return load(tikaJsonConfig, pipesConfig);
+    }
+
+    /**
+     * Loads a PipesParser from pre-loaded configuration objects.
+     * <p>
+     * Use this method when you need to modify the PipesConfig before creating
+     * the parser (e.g., to override emit strategy).
+     *
+     * @param tikaJsonConfig the pre-loaded JSON configuration; forked servers receive this
+     *                       config, env references already resolved, over their stdin
+     * @param pipesConfig the pipes configuration (may be modified by caller)
+     * @return a new PipesParser instance
+     * @throws IOException if plugin extraction or config serialization fails
+     */
+    public static PipesParser load(TikaJsonConfig tikaJsonConfig, PipesConfig pipesConfig)
+            throws IOException {
+        TikaPluginManager.preExtractPlugins(tikaJsonConfig);
+        return new PipesParser(pipesConfig, ForkBootstrap.toBytes(tikaJsonConfig));
+    }
+
+    /**
+     * @deprecated forked servers no longer read the config file; use
+     * {@link #load(TikaJsonConfig, PipesConfig)}. {@code tikaConfigPath} is ignored.
+     */
+    @Deprecated
+    public static PipesParser load(TikaJsonConfig tikaJsonConfig, PipesConfig pipesConfig,
+            Path tikaConfigPath) throws IOException {
+        return load(tikaJsonConfig, pipesConfig);
+    }
+
+    private final PipesConfig pipesConfig;
+    private final List<PipesClient> clients = new ArrayList<>();
+    private final List<ServerManager> serverManagers = new ArrayList<>();
+    // LIFO: the most-recently-returned client is borrowed next, so light traffic
+    // concentrates on warm forks instead of round-robining every fork awake (and,
+    // at intervals over the idle shutdown, cold-starting on every request).
+    private final LinkedBlockingDeque<PipesClient> clientQueue;
+    private final boolean isSharedMode;
+
+    private PipesParser(PipesConfig pipesConfig, byte[] tikaConfigJson) {
+        this.pipesConfig = pipesConfig;
+        this.isSharedMode = pipesConfig.isUseSharedServer();
+        this.clientQueue = new LinkedBlockingDeque<>(pipesConfig.getNumClients());
+
+        if (isSharedMode) {
+            // Shared mode: one ServerManager for all clients
+            LOG.info("Using shared server mode with {} clients", pipesConfig.getNumClients());
+            SharedServerManager sharedManager = new SharedServerManager(
+                    pipesConfig, tikaConfigJson, pipesConfig.getNumClients());
+            serverManagers.add(sharedManager);
+
+            for (int i = 0; i < pipesConfig.getNumClients(); i++) {
+                PipesClient client = new PipesClient(pipesConfig, sharedManager);
+                clientQueue.offerLast(client);
+                clients.add(client);
+            }
+        } else {
+            // Per-client mode: each client has its own ServerManager
+            LOG.info("Using per-client server mode with {} clients", pipesConfig.getNumClients());
+            for (int i = 0; i < pipesConfig.getNumClients(); i++) {
+                PerClientServerManager serverManager = new PerClientServerManager(
+                        pipesConfig, tikaConfigJson, i);
+                serverManagers.add(serverManager);
+
+                PipesClient client = new PipesClient(pipesConfig, serverManager);
+                clientQueue.offerLast(client);
+                clients.add(client);
+            }
+        }
+    }
+
+    public PipesResult parse(FetchEmitTuple t) throws InterruptedException,
+            PipesException, IOException {
+        PipesClient client = null;
+        try {
+            client = clientQueue.pollFirst(pipesConfig.getMaxWaitForClientMillis(),
+                    TimeUnit.MILLISECONDS);
+            if (client == null) {
+                return PipesResults.CLIENT_UNAVAILABLE_WITHIN_MS;
+            }
+            return client.process(t);
+        } finally {
+            if (client != null) {
+                clientQueue.offerFirst(client);
+            }
+        }
+    }
+
+    /**
+     * Starts every idle client's server now and waits until each is ready, instead of on the
+     * first {@link #parse}. Optional: it surfaces a server that can't start (bad config, a
+     * missing plugin) before work is queued. Clients busy in a {@link #parse} are skipped;
+     * they are already up.
+     *
+     * @throws ServerInitializationException if a server fails to start
+     */
+    public void start() throws InterruptedException, ServerInitializationException {
+        List<PipesClient> idle = new ArrayList<>();
+        PipesClient client;
+        while ((client = clientQueue.pollFirst()) != null) {
+            idle.add(client);
+        }
+        if (idle.isEmpty()) {
+            return;
+        }
+        ExecutorService executor = Executors.newFixedThreadPool(idle.size());
+        try {
+            List<Future<Void>> futures = new ArrayList<>();
+            for (PipesClient c : idle) {
+                futures.add(executor.submit(() -> {
+                    c.start();
+                    return null;
+                }));
+            }
+            ServerInitializationException failure = null;
+            for (Future<Void> future : futures) {
+                try {
+                    future.get();
+                } catch (ExecutionException e) {
+                    if (failure == null) {
+                        failure = e.getCause() instanceof ServerInitializationException sie ? sie
+                                : new ServerInitializationException("server failed to start", e.getCause());
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        } finally {
+            // A client goes back in the queue only once nothing is using it; each start is
+            // bounded by the startup timeouts.
+            executor.shutdownNow();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    if (executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                        break;
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            idle.forEach(clientQueue::offerFirst);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        List<IOException> exceptions = new ArrayList<>();
+
+        // First close all clients (closes their connections)
+        for (PipesClient pipesClient : clients) {
+            try {
+                pipesClient.close();
+            } catch (IOException e) {
+                exceptions.add(e);
+            }
+        }
+
+        // Then close all server managers (shuts down server processes)
+        for (ServerManager serverManager : serverManagers) {
+            try {
+                serverManager.close();
+            } catch (IOException e) {
+                exceptions.add(e);
+            }
+        }
+
+        if (!exceptions.isEmpty()) {
+            throw exceptions.get(0);
+        }
+    }
+
+    // package-private for tests: how many forked servers are actually live
+    long startedServerCount() {
+        return serverManagers.stream().filter(ServerManager::isRunning).count();
+    }
+
+    public int getNumClients() {
+        return pipesConfig.getNumClients();
+    }
+
+    /** Clients not currently borrowed by a {@link #parse} call. */
+    public int getIdleClientCount() {
+        return clientQueue.size();
+    }
+
+    /** Forked-server restarts performed so far for {@code reason}, summed over all servers. */
+    public long getRestartCount(RestartReason reason) {
+        return serverManagers.stream().mapToLong(m -> m.getRestartCount(reason)).sum();
+    }
+
+    /**
+     * Returns whether this parser is using shared server mode.
+     *
+     * @return true if using shared server mode
+     */
+    /**
+     * Total forks performed across this parser's server managers. One more than the number of
+     * restarts, since the first start of each manager is not a restart. Exposed for tests: it is
+     * the only observable that distinguishes a justified restart from a spurious one.
+     */
+    public long getGeneration() {
+        return serverManagers.stream().mapToLong(ServerManager::getGeneration).sum();
+    }
+
+    public boolean isSharedMode() {
+        return isSharedMode;
+    }
+
+    /**
+     * Returns the current server port. For testing purposes only.
+     * In shared mode, returns the port of the shared server.
+     * In per-client mode, returns the port of the first client's server.
+     *
+     * @return the current server port, or -1 if no server is running
+     */
+    public int getCurrentServerPort() {
+        if (serverManagers.isEmpty()) {
+            return -1;
+        }
+        return serverManagers.get(0).getPort();
+    }
+}

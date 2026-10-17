@@ -1,0 +1,391 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Building the Junk Detector
+
+The training pipeline, model format, and known limitations of the bundled
+junk-detector model.  For usage, see
+xref:advanced/junk-detection.adoc[Text Quality Scoring (Junk Detection)].
+
+Corpus paths below are written as `<corpus>` and `<workdir>`; substitute your own.
+
+== Model shape
+
+The model scores text with nine features and one global linear combiner:
+
+[cols="1,4"]
+|===
+| Feature | What it measures
+
+| z1
+| Codepoint-bigram log-probability.  Every bigram is bucketed to its Unicode
+  script and scored against that script's own table; unseen pairs fall back to a
+  unigram independence score.  *The only per-script feature*, and the only one
+  with per-script mu/sigma calibration.
+
+| z2
+| Unicode block-transition log-probability.  One global table.
+
+| z3
+| Control-byte fraction over [0x01–0x08, 0x0B, 0x0C, 0x0E–0x1F, 0x7F].
+
+| z4
+| Script-transition log-probability.  One global table over raw
+  `Character.UnicodeScript` values.
+
+| z5–z9
+| Document-level quality: letter-adjacent-to-mark ratio, replacement-character
+  ratio, script density, script coherence, script alternation.
+|===
+
+`logit = w1*z1 + … + w9*z9 + bias`, fit on clean versus corrupted windows.
+Positive means clean; the natural threshold is 0.  The bundled model covers 72
+scripts (including COMMON, which is treated as a script in its own right so that
+digits and punctuation do not pollute the neighbouring script's evidence).
+
+== Pipeline
+
+[source]
+----
+1. BuildJunkTrainingData      — collect and split corpus per script group
+2. BuildJunkAugmentationData  — optional: fold in real-document text
+3. TrainJunkModel             — train tables, calibrate, write the model
+----
+
+Tools live in `tika-ml/tika-ml-junkdetect-tools` and are packaged as a
+self-contained jar by the `train` profile:
+
+[source,bash]
+----
+./mvnw clean package -pl tika-ml/tika-ml-junkdetect-tools -am -Ptrain -DskipTests
+----
+
+The result is `tika-ml-junkdetect-tools-*-tools.jar`.
+
+[IMPORTANT]
+====
+Durable training parameters are *not* CLI flags.  They are `public static final`
+constants in `JunkDetectorTrainingConfig`, and both tools **refuse to start** if a
+CLI argument tries to override one.  A model file's identity therefore always
+matches a committed config: to change a parameter, edit that file and commit the
+change together with the retrained model.
+====
+
+== Stage 1: corpus collection (`BuildJunkTrainingData`)
+
+Collects clean UTF-8 sentences from language-specific source files, groups them by
+Unicode script, allocates a byte budget per script, and writes 80/10/10
+train/dev/test splits.
+
+=== Data format
+
+One directory per language (ISO 639 code), each containing up to two files:
+
+`sentences_wikipedia.txt`::
+  Line-numbered Wikipedia sentences: `\{lineNum}\{TAB}\{text}`, one per line.
+
+`sentences_madlad.txt`::
+  Line-numbered MADLAD-400 documents, same shape.  Documents use literal
+  two-character `\n` escape sequences as sub-sentence separators; the tool splits
+  on those first.
+
+=== Script group detection
+
+Each language directory's dominant script is found by sampling up to 2,000 lines
+and histogramming `Character.UnicodeScript`, excluding the `COMMON`, `INHERITED`,
+and `UNKNOWN` pseudo-scripts.  The plurality script wins, subject to a 1% floor
+that suppresses spurious wins on mixed-script text.  Languages sharing a dominant
+script are pooled into one training group.  No groups are hardcoded — the set is
+derived from the data.
+
+=== Entropy-proportional byte budget
+
+Scripts are not comparable by sentence count: CJK text has thousands of distinct
+3-byte UTF-8 codepoints and high byte-bigram entropy (~10.4 bits), while Arabic
+clusters in a narrow 0xD8–0xDB high-byte range (~7.2 bits).  A sentence-count
+budget would badly over-represent low-entropy scripts.
+
+The tool instead splits the total byte budget in proportion to each group's
+empirical byte-bigram Shannon entropy, estimated from a 200 KB sample per group:
+
+[source]
+----
+H(script) = -Σ p(a,b) · log₂ p(a,b)   over all observed bigrams (a,b)
+
+budget(script) = totalBudget × H(script) / Σ H(all scripts)
+----
+
+Within a group the budget is spread evenly across member languages, and a
+per-language cap keeps one large source (`zho` has 8 GB of MADLAD) from dominating
+a multi-language bucket.
+
+=== Train/dev/test split
+
+[cols="1,1,3"]
+|===
+| File | Split | Purpose
+
+| `\{script}.train.gz`
+| 80%
+| Bigram count accumulation in `TrainJunkModel`.
+
+| `\{script}.dev.gz`
+| 10%
+| Calibration (mu/sigma).  Also the split to use for iterative evaluation.
+
+| `\{script}.test.gz`
+| 10%
+| **Held out completely.**  Final reported numbers only — never a model or
+  threshold decision.
+|===
+
+`manifest.tsv` records per-script entropy, budget, bytes written, sentence count,
+and contributing languages.
+
+=== Running it
+
+[source,bash]
+----
+java -cp tika-ml-junkdetect-tools-*-tools.jar \
+  org.apache.tika.ml.junkdetect.tools.BuildJunkTrainingData \
+  --data-dir   <corpus>/madlad/data \
+  --output-dir <workdir>/junkdetect
+----
+
+`--data-dir`, `--output-dir`, and `--dry-run` (detect scripts and show the budget
+without writing) are the only accepted arguments.
+
+=== Config constants
+
+`JunkDetectorTrainingConfig` holds everything else:
+
+[cols="3,1,4"]
+|===
+| Constant | Value | Effect
+
+| `TOTAL_BUDGET_BYTES`
+| 500,000,000
+| Total UTF-8 byte budget across all script groups.
+
+| `PER_LANGUAGE_CAP_BYTES`
+| 5,000,000
+| Cap on one language's contribution to a multi-language bucket.  Single-language
+  buckets ignore it.
+
+| `MIN_TARGET_SCRIPT_FRAC`
+| 0.05
+| Minimum fraction of non-COMMON codepoints that must be in the bucket's target
+  script.  Low enough to keep legitimate mixed-script content (kanji + kana,
+  Korean with hanja), high enough to reject off-target lines.
+
+| `MIN_BYTES_PER_SENTENCE`
+| 50
+| Minimum UTF-8 length for a sentence to pass the quality filter.
+
+| `MAX_PUNC_FRAC`
+| 0.30
+| Maximum fraction of ASCII punctuation and digits.  Filters bullet lists and
+  code snippets.
+
+| `MIN_DEV_SENTENCES`
+| 500
+| A script below this in the dev split is excluded — too little data for reliable
+  calibration, which inflates FPR.  At `DEV_FRAC = 0.10` that is ~5,000 sentences
+  total.
+
+| `SCRIPT_SAMPLE_LINES`
+| 2,000
+| Lines sampled per language for dominant-script detection.
+
+| `ENTROPY_SAMPLE_BYTES`
+| 200,000
+| Bytes sampled per group for the entropy estimate.
+
+| `SEED`
+| 42
+| Shuffle seed.
+
+| `DROP_SCRIPTS`
+| GOTHIC, THAANA
+| Script buckets to exclude from the next build: THAANA has 216 native train
+  sentences, and 40% of the Wikipedia "gothic" directory is English text *about*
+  Gothic.  The javadoc also expects `MIN_TARGET_SCRIPT_FRAC` to remove
+  CANADIAN_ABORIGINAL, CHEROKEE, and TIFINAGH.  None of that has been applied yet:
+  the bundled `junkdetect.bin` predates these settings and still carries tables for
+  all five, so `knownScripts()` returns them today.
+
+| `MIN_BIGRAM_COUNT`
+| 3
+| Drop z1 bigrams occurring fewer than 3 times in a script.  Singletons and
+  doubletons are overwhelmingly OCR artifacts and proper-noun noise that inflate
+  the clean-side tail without adding signal.  Set to 1 to disable.
+
+| `OA_LOAD_FACTOR`
+| 0.5
+| Target load factor for the per-script open-addressed table: ~2 probes per
+  lookup.
+
+| `KEY_INDEX_BITS`
+| 16
+| Bits per codepoint index in a packed bigram key.  Supports 65,535 codepoints per
+  script; HAN is the worst case at ~15 K.
+|===
+
+== Stage 2: augmentation (`BuildJunkAugmentationData`, optional)
+
+The Wikipedia/MADLAD corpus is clean linguistic text and carries almost no HTML
+symbols (©, ®, ™, €, £).  On real web pages those bytes then look anomalously
+surprising, which tips charset arbitration toward whichever encoding happens to
+put a frequent training letter at the same byte position.
+
+`BuildJunkAugmentationData` folds quality-filtered text from tika-app RMETA JSON
+output into the `.train.gz` files to close that gap.  It is strictly additive: the
+baseline directory is never modified, `.dev.gz` / `.test.gz` are copied verbatim
+so evaluation stays honest, and the tool refuses to run if the output directory
+resolves to the baseline.  Per-script gates require a minimum document count and
+cap appended lines as a fraction of the baseline, so augmentation cannot skew the
+distribution toward data-rich scripts.
+
+== Stage 3: training (`TrainJunkModel`)
+
+Reads each script's `.train.gz`, accumulates codepoint-bigram counts, builds the
+quantized per-script tables, then calibrates z1's mu and sigma from `.dev.gz`.
+The global tables (z2, z4) and the global calibrations (z3, z5–z9) and combiner
+weights are fit in the same run.
+
+[source,bash]
+----
+java -cp tika-ml-junkdetect-tools-*-tools.jar \
+  org.apache.tika.ml.junkdetect.tools.TrainJunkModel
+----
+
+The tool takes **no arguments**.  Its input directory and its output path — the
+classpath resource
+`tika-ml/tika-ml-junkdetect/src/main/resources/org/apache/tika/ml/junkdetect/junkdetect.bin`
+— are baked into `main`, deliberately: one bundled model in git, never a training
+run to a scratch directory, never parallel A/B variants.  Editing either means
+editing and committing the source.
+
+=== Calibration
+
+For each dev sentence, `meanLogProb = Σ table[bigram] / (bigrams - 1)`; mu and
+sigma are its mean and standard deviation across the split.  At inference
+`z = (meanLogProb - mu) / sigma`, so 0 means "exactly as likely as average clean
+text for this script" and negative means less likely than clean.
+
+== Model binary format (JUNKDET1)
+
+Gzipped; the loader detects the wrapper from the first two bytes (`0x1f 0x8b`).
+The version byte is a hard gate — older files are rejected rather than read
+through a compatibility path, because parallel scoring paths are a known source of
+silent miscalibration.
+
+[source]
+----
+[8 bytes]  magic "JUNKDET1" (ASCII)
+[1 byte]   version (15)
+[4 bytes]  num_scripts (int32 BE)
+[1 byte]   block_scheme_version
+
+// z4 — global script-transition section
+[1 byte]   num_script_buckets
+  per bucket: [2 bytes] name length, [N bytes] name (UTF-8)
+[4 bytes]  scriptTrans quant min (float32 BE)
+[4 bytes]  scriptTrans quant max
+[num_script_buckets² × 2 bytes]  transition table (int16 quantized)
+[8 bytes]  z4 calibration {mu, sigma}
+
+// z2 — global block-transition section
+[4 bytes]  block quant min
+[4 bytes]  block quant max
+[block_N² × 2 bytes]  transition table (int16 quantized)
+[8 bytes]  z2 calibration {mu, sigma}
+
+// remaining global calibrations, {mu, sigma} float32 pairs
+[8 bytes]  z3 (control-byte ratio)
+[8 bytes]  z5 (letter-adjacent-to-mark)
+[8 bytes]  z6 (replacement-char ratio)
+[8 bytes]  z9 (script-alternation)
+
+// global combiner
+[1 byte]   num_features
+[(num_features + 1) × 4 bytes]  weights w1..wN then bias
+
+// per-script section, sorted by script name
+  [2 bytes]  name length, [N bytes] name (UTF-8)
+  [8 bytes]  z1 calibration {mu, sigma}
+  [variable] bigram + unigram tables: codepoint index, then sorted-occupied
+             bigram keys (first as int32 BE, rest as LEB128 varint deltas) with
+             8-bit quantized bigram and unigram log-prob values
+----
+
+Default classpath resource: `org/apache/tika/ml/junkdetect/junkdetect.bin`.
+
+== Known limitations
+
+=== Baltic and closely related Latin languages
+
+The LATIN bucket pools hundreds of languages.  Baltic languages (Lithuanian,
+Latvian) use distinctive diacritics encoded differently in cp1257 and cp1252, but
+those bigrams are diluted by the shared Latin vocabulary.  The model picks the
+right winner with a delta below the production confidence threshold of 1.0.
+
+Candidate improvements: weight Baltic languages more heavily within the LATIN
+bucket, or split LATIN into a dedicated LATIN-EAST bucket trained primarily on
+Baltic, Slavic-Latin (Polish, Czech, Slovak), and Romanian.
+
+=== RTL script reversal on short text
+
+For Arabic and Hebrew, codepoint reversal is a realistic failure mode (text stored
+in the wrong visual order).  Separation is good at 50+ characters and weak at
+15–30, where there are too few bigrams to be stable.  A short-text RTL specialist
+using finer-grained features (trigrams, or unigram frequency distributions) is the
+obvious next step.
+
+== Smoke tests
+
+`JunkDetectorSmokeTest` verifies the bundled model through the `TextQualityDetector`
+interface, using `TextQualityScore` and `TextQualityComparison` from `tika-core`.
+
+[cols="1,3"]
+|===
+| Test | What it checks
+
+| `cleanVsGarbage`
+| Clean English scores above random high-byte garbage (decoded from ISO-8859-1 so
+  it is scoreable at all).
+
+| `forwardVsReversedArabic`
+| Forward Arabic scores above codepoint-reversed Arabic.  Reversal is at codepoint
+  granularity, so the text stays valid Unicode.
+
+| `cp1252VsCp1257OnBalticText`
+| `compare()` picks cp1257 for Lithuanian text.  The asserted floor is only
+  delta > 0.05 — weak, per the Baltic limitation above.
+
+| `cp1252VsCp1251OnRussianText`
+| `compare()` picks cp1251 for Russian text.  Delta > 1.0; Cyrillic bigrams are
+  highly distinctive.
+
+| `cleanVsShuffledCjk`
+| Clean Japanese scores above byte-shuffled Japanese.
+|===
+
+NOTE: Codepoint reversal is *not* a useful test for LTR scripts.  Their byte-bigram
+distributions are nearly symmetric, so forward and reversed are barely
+distinguishable.  The Russian test therefore uses codec comparison
+(cp1251 vs cp1252), which is the real-world failure mode for Cyrillic.

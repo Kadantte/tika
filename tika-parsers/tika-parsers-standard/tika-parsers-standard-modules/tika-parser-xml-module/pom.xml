@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-parsers-standard-modules</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
   <modelVersion>4.0.0</modelVersion>
@@ -35,8 +35,23 @@
       <artifactId>commons-codec</artifactId>
     </dependency>
   </dependencies>
+  <properties>
+    <!-- TIKA-4816 metadata string-key ban, main sources; see tika-parent -->
+    <forbiddenapis.module.signaturesFile>${metadata.forbiddenapis.signaturesFile}</forbiddenapis.module.signaturesFile>
+  </properties>
+
   <build>
     <plugins>
+      <!-- needs an entry or it will fail?! -->
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>src/test/resources/test-documents/*</inputExclude>
+          </inputExcludes>
+        </configuration>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
@@ -59,6 +74,6 @@
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

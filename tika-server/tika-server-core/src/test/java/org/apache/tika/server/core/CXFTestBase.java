@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -29,18 +28,24 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.compress.archivers.ArchiveEntry;
 import org.apache.commons.compress.archivers.ArchiveInputStream;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.compress.archivers.zip.ZipFile;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.cxf.binding.BindingFactoryManager;
 import org.apache.cxf.endpoint.Server;
@@ -48,19 +53,152 @@ import org.apache.cxf.jaxrs.JAXRSBindingFactory;
 import org.apache.cxf.jaxrs.JAXRSServerFactoryBean;
 import org.apache.cxf.transport.common.gzip.GZIPInInterceptor;
 import org.apache.cxf.transport.common.gzip.GZIPOutInterceptor;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.TestInstance;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.TikaConfig;
-import org.apache.tika.parser.digestutils.CommonsDigester;
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.config.loader.TikaLoader;
+import org.apache.tika.pipes.core.EmitStrategy;
+import org.apache.tika.pipes.core.EmitStrategyConfig;
+import org.apache.tika.pipes.core.PipesConfig;
+import org.apache.tika.pipes.core.PipesParser;
+import org.apache.tika.serialization.config.JsonConfigHelper;
+import org.apache.tika.server.core.resource.PipesParsingHelper;
 import org.apache.tika.server.core.resource.TikaResource;
-import org.apache.tika.server.core.resource.UnpackerResource;
 
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public abstract class CXFTestBase {
-    protected static final String endPoint = "http://localhost:" + TikaServerConfig.DEFAULT_PORT;
+
+    private static final Logger LOG = LoggerFactory.getLogger(CXFTestBase.class);
+
+    public final static String FETCHER_ID = "fsf";
+    public final static String EMITTER_JSON_ID = "fse-json";
+    public final static String EMITTER_BYTES_ID = "fse-bytes";
+
+    public final static String BASIC_CONFIG = """
+            {
+              "auto-detect-parser": {
+                "throwOnZeroBytes": false
+              },
+              "parse-context": {
+                "commons-digester-factory": {
+                  "digests": [
+                    { "algorithm": "MD5" }
+                  ]
+                }
+              }
+            }
+            """;
+
+    private static final String TEMPLATE_RESOURCE = "/configs/cxf-test-base-template.json";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    protected final int testPort = TestPortAllocator.findFreePort();
+    protected final String endPoint = "http://localhost:" + testPort;
     protected final static int DIGESTER_READ_LIMIT = 20 * 1024 * 1024;
     protected Server server;
-    protected TikaConfig tika;
+    protected TikaLoader tika;
+    protected TikaResource tikaResource;
+    private PipesParser pipesParser;
+    private Path pipesConfigPath;
+    private Path inputTempDirectory = null;
+
+    // Keyed on the worker config's bytes; later classes with the same config reuse warm forks.
+    // Forks start lazily and idle-exit, so the bound only caps parser objects; it must exceed
+    // the distinct configs in a module (server-standard has ~12) or warm forks get evicted and
+    // re-forked. Classes run sequentially (junit-platform.properties), so an evicted parser is
+    // never in use.
+    private static final int MAX_SHARED_WORKERS = 32;
+    private static final Map<String, SharedWorker> SHARED_WORKERS =
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, SharedWorker> eldest) {
+                    if (size() <= MAX_SHARED_WORKERS) {
+                        return false;
+                    }
+                    LOG.info("shared pipes worker: evicted");
+                    eldest.getValue().close();
+                    return true;
+                }
+            };
+    private static Path sharedInputDir;
+    private static Path sharedUnpackDir;
+
+    private record SharedWorker(PipesParser parser, Path configPath) {
+        void close() {
+            try {
+                parser.close();
+                Files.deleteIfExists(configPath);
+            } catch (Exception e) {
+                LOG.warn("Error closing shared PipesParser", e);
+            }
+        }
+    }
+
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(CXFTestBase::closeSharedWorkers));
+    }
+
+    private static synchronized void closeSharedWorkers() {
+        SHARED_WORKERS.values().forEach(SharedWorker::close);
+        SHARED_WORKERS.clear();
+        for (Path dir : new Path[]{sharedInputDir, sharedUnpackDir}) {
+            if (dir != null) {
+                FileUtils.deleteQuietly(dir.toFile());
+            }
+        }
+    }
+
+    private static synchronized Path sharedInputDir() throws IOException {
+        if (sharedInputDir == null) {
+            sharedInputDir = Files.createTempDirectory("tika-server-test-input-");
+        }
+        return sharedInputDir;
+    }
+
+    /**
+     * Unpack-emitter basePath for classes that share a worker; per-class dirs would make
+     * every config unique.
+     */
+    protected static synchronized Path sharedUnpackDir() throws IOException {
+        if (sharedUnpackDir == null) {
+            sharedUnpackDir = Files.createTempDirectory("tika-server-test-unpack-");
+        }
+        return sharedUnpackDir;
+    }
+
+    /**
+     * Return false if the class kills, times out or restarts a worker, or counts restarts.
+     * Today none does: restart counting lives in {@code TikaServerMetricsIntegrationTest},
+     * which runs a forked server, not this base.
+     */
+    protected boolean sharesWorker() {
+        return true;
+    }
+
+    public static void createPluginsConfig(Path configPath, Path inputDir, Path jsonOutputDir, Path bytesOutputDir, Long timeoutMillis) throws IOException {
+
+        Path pluginsDir = Paths.get("target/plugins");
+        if (!Files.isDirectory(pluginsDir)) {
+            LOG.warn("CAN'T FIND PLUGINS DIR. pwd={}", Paths.get("").toAbsolutePath().toString());
+        }
+
+        Map<String, Object> replacements = new HashMap<>();
+        replacements.put("FETCHER_BASE_PATH", inputDir);
+        replacements.put("JSON_EMITTER_BASE_PATH", jsonOutputDir);
+        replacements.put("PLUGINS_PATHS", pluginsDir);
+        if (bytesOutputDir != null) {
+            replacements.put("BYTES_EMITTER_BASE_PATH", bytesOutputDir);
+        }
+        replacements.put("TIMEOUT_MILLIS", timeoutMillis != null ? timeoutMillis : 10000L);
+
+        JsonConfigHelper.writeConfigFromResource(TEMPLATE_RESOURCE,
+                CXFTestBase.class, replacements, configPath);
+    }
+
 
     public static void assertContains(String needle, String haystack) {
         assertTrue(haystack.contains(needle), needle + " not found in:\n" + haystack);
@@ -90,10 +228,10 @@ public abstract class CXFTestBase {
 
     public static InputStream gzip(InputStream is) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        OutputStream gz = new GzipCompressorOutputStream(bos);
-        IOUtils.copy(is, gz);
-        gz.flush();
-        gz.close();
+        try (OutputStream gz = new GzipCompressorOutputStream(bos)) {
+            is.transferTo(gz);
+            gz.flush();
+        }
         return new ByteArrayInputStream(bos.toByteArray());
     }
 
@@ -117,13 +255,52 @@ public abstract class CXFTestBase {
         return new AverageColor((double) totalRed / (double) pixels, (double) totalGreen / (double) pixels, (double) totalBlue / (double) pixels);
     }
 
-    @BeforeEach
+    @BeforeAll
     public void setUp() throws Exception {
+        Path tmp = Files.createTempFile("tika-server-test-", ".json");
+        try {
+            // Copy tika config to temp file first
+            Files.copy(getTikaConfigInputStream(), tmp, StandardCopyOption.REPLACE_EXISTING);
 
-        this.tika = new TikaConfig(getTikaConfigInputStream());
-        TikaServerConfig tikaServerConfig = getTikaServerConfig();
-        TikaResource.init(tika, tikaServerConfig, new CommonsDigester(DIGESTER_READ_LIMIT, "md5," + "sha1:32"), getInputStreamFactory(getTikaConfigInputStream()),
-                new ServerStatus("", 0, true));
+            Path tmpPipesConfigPath;
+            try (InputStream pipesConfigInputStream = getPipesConfigInputStream()) {
+                if (pipesConfigInputStream != null) {
+                    // Test provided its own pipes config - merge in PASSBACK_ALL emit strategy
+                    tmpPipesConfigPath = mergePassbackAllStrategy(pipesConfigInputStream);
+                } else {
+                    // Create a default pipes config, merging metadata-filters from tika config
+                    tmpPipesConfigPath = createDefaultTestConfig(tmp);
+                }
+            }
+
+            this.tika = TikaLoader.load(tmp);
+
+            // Create input temp directory for pipes-based parsing
+            inputTempDirectory = sharesWorker() ? sharedInputDir()
+                    : Files.createTempDirectory("tika-server-test-input-");
+
+            // Initialize PipesParsingHelper for pipes-based parsing
+            // Merge the fetcher config with basePath pointing to the temp directory
+            this.pipesConfigPath = mergeFetcherConfig(tmpPipesConfigPath, inputTempDirectory);
+            Files.delete(tmpPipesConfigPath);
+            TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(this.pipesConfigPath);
+            PipesConfig pipesConfig = tikaJsonConfig.deserialize("pipes", PipesConfig.class);
+            if (pipesConfig == null) {
+                pipesConfig = new PipesConfig();
+            }
+            pipesConfig.setEmitStrategy(new EmitStrategyConfig(EmitStrategy.PASSBACK_ALL));
+            this.pipesParser = sharesWorker() ? sharedPipesParser(tikaJsonConfig, pipesConfig)
+                    : PipesParser.load(tikaJsonConfig, pipesConfig);
+            PipesParsingHelper pipesParsingHelper = new PipesParsingHelper(this.pipesParser, pipesConfig,
+                    inputTempDirectory, getUnpackEmitterBasePath());
+
+            tikaResource = new TikaResource(tika, new ServerStatus(), pipesParsingHelper, isAllowPerRequestConfig());
+        } finally {
+            // Only delete tika config, keep pipes config for child processes
+            Files.deleteIfExists(tmp);
+        }
+        tika.loadAutoDetectParser();
+        tika.loadMetadataFilters();
         JAXRSServerFactoryBean sf = new JAXRSServerFactoryBean();
         //set compression interceptors
         sf.setOutInterceptors(Collections.singletonList(new GZIPOutInterceptor()));
@@ -145,20 +322,218 @@ public abstract class CXFTestBase {
         server = sf.create();
     }
 
-    protected TikaServerConfig getTikaServerConfig() {
-        TikaServerConfig tikaServerConfig = new TikaServerConfig();
-        tikaServerConfig.setReturnStackTrace(true);
-        return tikaServerConfig;
+    private PipesParser sharedPipesParser(TikaJsonConfig tikaJsonConfig, PipesConfig pipesConfig)
+            throws Exception {
+        String key = Files.readString(pipesConfigPath, UTF_8);
+        synchronized (CXFTestBase.class) {
+            SharedWorker w = SHARED_WORKERS.get(key);
+            if (w == null) {
+                PipesParser parser;
+                try {
+                    parser = PipesParser.load(tikaJsonConfig, pipesConfig);
+                } catch (Exception e) {
+                    Files.deleteIfExists(pipesConfigPath);
+                    throw e;
+                }
+                w = new SharedWorker(parser, pipesConfigPath);
+                SHARED_WORKERS.put(key, w);
+                LOG.info("shared pipes worker: new for {}", getClass().getSimpleName());
+            } else {
+                Files.delete(pipesConfigPath);
+                LOG.info("shared pipes worker: reused by {}", getClass().getSimpleName());
+            }
+            pipesConfigPath = w.configPath();
+            return w.parser();
+        }
     }
 
-    protected InputStreamFactory getInputStreamFactory(InputStream tikaConfig) {
-        return new DefaultInputStreamFactory();
+    /**
+     * Merges PASSBACK_ALL emit strategy into a pipes config.
+     * This ensures the child process uses PASSBACK_ALL regardless of what's in the config file.
+     * 
+     * @return JSON config file in the temp directory.
+     */
+    private Path mergePassbackAllStrategy(InputStream pipesConfigInputStream) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        com.fasterxml.jackson.databind.node.ObjectNode root = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(pipesConfigInputStream);
+
+        // Get or create pipes section
+        com.fasterxml.jackson.databind.node.ObjectNode pipes = (com.fasterxml.jackson.databind.node.ObjectNode) root.get("pipes");
+        if (pipes == null) {
+            pipes = mapper.createObjectNode();
+            root.set("pipes", pipes);
+        }
+
+        // Set emit strategy to PASSBACK_ALL
+        com.fasterxml.jackson.databind.node.ObjectNode emitStrategy = mapper.createObjectNode();
+        emitStrategy.put("type", "PASSBACK_ALL");
+        pipes.set("emitStrategy", emitStrategy);
+
+        Path tempConfig = Files.createTempFile("tika-server-pipes-", ".json");
+        mapper.writerWithDefaultPrettyPrinter().writeValue(tempConfig.toFile(), root);
+        return tempConfig;
+    }
+
+    /**
+     * Merges the tika-server-fetcher configuration into the pipes config.
+     * The fetcher is configured with basePath pointing to the input temp directory.
+     * 
+     * @return new (different) JSON configPath in the temp directory.
+     */
+    private Path mergeFetcherConfig(Path configPath, Path inputTempDirectory) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        com.fasterxml.jackson.databind.node.ObjectNode root =
+                (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(configPath.toFile());
+
+        // Get or create fetchers section
+        com.fasterxml.jackson.databind.node.ObjectNode fetchers =
+                (com.fasterxml.jackson.databind.node.ObjectNode) root.get("fetchers");
+        if (fetchers == null) {
+            fetchers = mapper.createObjectNode();
+            root.set("fetchers", fetchers);
+        }
+
+        // Create the tika-server-fetcher with basePath
+        com.fasterxml.jackson.databind.node.ObjectNode fetcherTypeConfig = mapper.createObjectNode();
+        fetcherTypeConfig.put("basePath", inputTempDirectory.toAbsolutePath().toString());
+
+        com.fasterxml.jackson.databind.node.ObjectNode fetcherNode = mapper.createObjectNode();
+        fetcherNode.set("file-system-fetcher", fetcherTypeConfig);
+
+        fetchers.set(PipesParsingHelper.DEFAULT_FETCHER_ID, fetcherNode);
+
+        Path tempConfig = Files.createTempFile("tika-server-pipes-fetcher-", ".json");
+        mapper.writerWithDefaultPrettyPrinter().writeValue(tempConfig.toFile(), root);
+        return tempConfig;
+    }
+
+    /**
+     * Creates a default test config with pipes configuration, carrying parse-context,
+     * metadata-filters, presets and text-recognizers over from the tika config.
+     *
+     * @param tikaConfigPath path to the tika config (may contain metadata-filters)
+     * 
+     * @return JSON config file in the temp directory.
+     */
+    private Path createDefaultTestConfig(Path tikaConfigPath) throws IOException {
+        Path pluginsDir = Paths.get("target/plugins").toAbsolutePath();
+        ObjectMapper mapper = new ObjectMapper();
+
+        String configJson = String.format(Locale.ROOT, """
+            {
+              "fetchers": {
+                "file-system-fetcher": {
+                  "file-system-fetcher": {
+                    "allowAbsolutePaths": true
+                  }
+                }
+              },
+              "pipes": {
+                "numClients": 2
+              },
+              "parse-context": {
+                "timeout-limits": {
+                  "progressTimeoutMillis": 60000
+                }
+              },
+              "plugin-roots": "%s"
+            }
+            """, pluginsDir.toString().replace("\\", "/"));
+
+        com.fasterxml.jackson.databind.node.ObjectNode root =
+                (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(configJson);
+
+        // Production hands the forked worker a ConfigMerger'd copy of the server's own config,
+        // so the worker resolves the same parse-context and metadata-filters. Carry them across
+        // here too: requests ship only their own entries, so anything the harness leaves out of
+        // the worker's config is simply absent rather than arriving over the wire.
+        try {
+            JsonNode tikaConfig = mapper.readTree(tikaConfigPath.toFile());
+            JsonNode parseContext = tikaConfig.get("parse-context");
+            if (parseContext != null && parseContext.isObject()) {
+                com.fasterxml.jackson.databind.node.ObjectNode target =
+                        (com.fasterxml.jackson.databind.node.ObjectNode) root.get("parse-context");
+                parseContext.properties().forEach(e -> target.set(e.getKey(), e.getValue()));
+            }
+            JsonNode metadataFilters = tikaConfig.get("metadata-filters");
+            if (metadataFilters != null && !metadataFilters.isEmpty()) {
+                root.set("metadata-filters", metadataFilters);
+            }
+            // the worker loads enrichers from its own config; [] is meaningful
+            JsonNode contentEnrichers = tikaConfig.get("text-recognizers");
+            if (contentEnrichers != null) {
+                root.set("text-recognizers", contentEnrichers);
+            }
+            // the worker builds its own engines and bindings from its own config
+            for (String section : new String[]{"engines", "inference"}) {
+                JsonNode node = tikaConfig.get(section);
+                if (node != null) {
+                    root.set(section, node);
+                }
+            }
+            // The worker resolves preset names from its own config, so presets must be
+            // visible there just like the parse-context defaults above.
+            JsonNode presets = tikaConfig.get("presets");
+            if (presets != null && !presets.isEmpty()) {
+                root.set("presets", presets);
+            }
+        } catch (Exception e) {
+            LOG.debug("Could not carry config into the worker config: {}", e.getMessage());
+        }
+
+        Path tempConfig = Files.createTempFile("tika-test-default-config-", ".json");
+        Files.writeString(tempConfig, mapper.writeValueAsString(root));
+        return tempConfig;
     }
 
     protected InputStream getTikaConfigInputStream() throws IOException {
-        return new ByteArrayInputStream(new String(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + "<properties>\n" + "    <parsers>\n" + "        <parser class=\"org.apache.tika.parser.DefaultParser\"/>\n" +
-                        "    </parsers>\n" + "</properties>").getBytes(UTF_8));
+        return new ByteArrayInputStream(BASIC_CONFIG.getBytes(UTF_8));
+    }
+
+    /**
+     * Returns the basePath for the unpack-emitter, or null if UNPACK mode is not needed.
+     * Tests that use UNPACK mode should override this to return the temp directory
+     * where the emitter writes zip files.
+     */
+    protected Path getUnpackEmitterBasePath() throws IOException {
+        return null;
+    }
+
+    /**
+     * Whether per-request config injection is permitted. Defaults to false, matching
+     * the production default. Tests that POST a multipart "config" part must override
+     * this to return true, otherwise the config part is rejected with 403.
+     */
+    protected boolean isAllowPerRequestConfig() {
+        return false;
+    }
+
+    protected InputStream getPipesConfigInputStream() throws IOException {
+        if (getPipesInputPath() == null) {
+            return null;
+        }
+
+        Path pluginsDir = Paths.get("target/plugins");
+        if (!Files.isDirectory(pluginsDir)) {
+            LOG.warn("CAN'T FIND PLUGINS DIR. pwd={}", Paths
+                    .get("")
+                    .toAbsolutePath()
+                    .toString());
+        }
+
+        Map<String, Object> replacements = new HashMap<>();
+        replacements.put("FETCHER_BASE_PATH", getPipesInputPath());
+        replacements.put("PLUGINS_PATHS", pluginsDir);
+        replacements.put("TIMEOUT_MILLIS", 10000L);
+
+        JsonNode config = JsonConfigHelper.loadFromResource(TEMPLATE_RESOURCE,
+                CXFTestBase.class, replacements);
+        String json = MAPPER.writeValueAsString(config);
+        return new ByteArrayInputStream(json.getBytes(UTF_8));
+    }
+
+    protected String getPipesInputPath() {
+        return null;
     }
 
     /**
@@ -173,10 +548,32 @@ public abstract class CXFTestBase {
      */
     protected abstract void setUpProviders(JAXRSServerFactoryBean sf);
 
-    @AfterEach
+    @AfterAll
     public void tearDown() throws Exception {
         server.stop();
         server.destroy();
+
+        if (sharesWorker()) {
+            return;
+        }
+        // Close PipesParser and clean up config file
+        if (pipesParser != null) {
+            try {
+                pipesParser.close();
+            } catch (Exception e) {
+                LOG.warn("Error closing PipesParser", e);
+            }
+        }
+        if (pipesConfigPath != null) {
+            try {
+                Files.deleteIfExists(pipesConfigPath);
+            } catch (Exception e) {
+                LOG.warn("Error deleting config file", e);
+            }
+        }
+        if (inputTempDirectory != null) {
+            Files.deleteIfExists(inputTempDirectory);
+        }
     }
 
     protected Map<String, String> readZipArchive(InputStream inputStream) throws IOException {
@@ -184,14 +581,15 @@ public abstract class CXFTestBase {
         Path tempFile = null;
         try {
             tempFile = writeTemporaryArchiveFile(inputStream, "zip");
-            try (ZipFile zip = ZipFile.builder().setPath(tempFile).get())
-            {
+            try (ZipFile zip = ZipFile.builder().setPath(tempFile).get()) {
                 Enumeration<ZipArchiveEntry> entries = zip.getEntries();
                 while (entries.hasMoreElements()) {
                     ZipArchiveEntry entry = entries.nextElement();
-                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                    IOUtils.copy(zip.getInputStream(entry), bos);
-                    data.put(entry.getName(), DigestUtils.md5Hex(bos.toByteArray()));
+                    try (InputStream zis = zip.getInputStream(entry)) {
+                        byte[] bytes = zis.readAllBytes();
+                        data.put(entry.getName(), DigestUtils.md5Hex(bytes));
+                    }
+                    
                 }
             }
         } finally {
@@ -207,14 +605,14 @@ public abstract class CXFTestBase {
         Path tempFile = null;
         try {
             tempFile = writeTemporaryArchiveFile(inputStream, "zip");
-            try (ZipFile zip = ZipFile.builder().setPath(tempFile).get())
-            {
+            try (ZipFile zip = ZipFile.builder().setPath(tempFile).get())  {
                 Enumeration<ZipArchiveEntry> entries = zip.getEntries();
                 while (entries.hasMoreElements()) {
                     ZipArchiveEntry entry = entries.nextElement();
-                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                    IOUtils.copy(zip.getInputStream(entry), bos);
-                    data.put(entry.getName(), bos.toByteArray());
+                    try (InputStream zis = zip.getInputStream(entry)) {
+                        byte[] bytes = zis.readAllBytes();
+                        data.put(entry.getName(), bytes);
+                    }
                 }
             }
         } finally {
@@ -225,38 +623,6 @@ public abstract class CXFTestBase {
         return data;
     }
 
-    protected String readArchiveText(InputStream inputStream) throws IOException {
-        Path tempFile = writeTemporaryArchiveFile(inputStream, "zip");
-        ByteArrayOutputStream bos;
-        try (ZipFile zip = ZipFile.builder().setPath(tempFile).get())
-        {
-            zip.getEntry(UnpackerResource.TEXT_FILENAME);
-            bos = new ByteArrayOutputStream();
-            IOUtils.copy(zip.getInputStream(zip.getEntry(UnpackerResource.TEXT_FILENAME)), bos);
-        }
-        Files.delete(tempFile);
-        return bos.toString(UTF_8.name());
-    }
-
-    protected String readArchiveMetadataAndText(InputStream inputStream) throws IOException {
-        Path tempFile = writeTemporaryArchiveFile(inputStream, "zip");
-        String metadata;
-        String txt;
-        try (ZipFile zip = ZipFile.builder().setPath(tempFile).get())
-        {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            zip.getEntry(UnpackerResource.META_FILENAME);
-            IOUtils.copy(zip.getInputStream(zip.getEntry(UnpackerResource.META_FILENAME)), bos);
-            metadata = new String(bos.toByteArray(), UTF_8);
-            bos = new ByteArrayOutputStream();
-            zip.getEntry(UnpackerResource.TEXT_FILENAME);
-            IOUtils.copy(zip.getInputStream(zip.getEntry(UnpackerResource.TEXT_FILENAME)), bos);
-            txt = new String(bos.toByteArray(), UTF_8);
-        }
-        Files.delete(tempFile);
-        return metadata + "\n\n" + txt;
-    }
-
     protected Map<String, String> readArchiveFromStream(ArchiveInputStream zip) throws IOException {
         Map<String, String> data = new HashMap<>();
         while (true) {
@@ -264,10 +630,7 @@ public abstract class CXFTestBase {
             if (entry == null) {
                 break;
             }
-
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            IOUtils.copy(zip, bos);
-            data.put(entry.getName(), DigestUtils.md5Hex(bos.toByteArray()));
+            data.put(entry.getName(), DigestUtils.md5Hex(zip.readAllBytes()));
         }
 
         return data;

@@ -1,0 +1,64 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Getting Started with Apache Tika
+
+Four ways to use Tika. Pick by how you need to call it.
+
+[cols="1,2,2"]
+|===
+|Integration |What it is |Best for
+
+|xref:using-tika/java-api/index.adoc[Java API]
+|Tika embedded in your Java application
+|Tight integration and full control over parsing behavior
+
+|xref:using-tika/cli/index.adoc[Command line (`tika-app`)]
+|A standalone jar you run per file or per directory
+|Quick extraction, shell scripts, one-off tasks
+
+|xref:using-tika/server/index.adoc[Server (REST)]
+|A standalone service with an HTTP API
+|Language-agnostic integration and microservice architectures
+
+|xref:using-tika/grpc/index.adoc[gRPC]
+|A standalone service speaking gRPC
+|High-performance, cross-language communication
+|===
+
+NOTE: tika-grpc is more exposed by default than tika-server: no transport security, no per-caller
+authorization, and its core fetch-and-parse surface is always on. (Its most dangerous
+capabilities — runtime fetcher/iterator changes and per-request parse configuration — are off by
+default.) Run it only on a trusted, access-controlled network. See
+xref:using-tika/grpc/index.adoc#_security[Security].
+
+For large volumes of documents, xref:pipes/index.adoc[Tika Pipes] adds fault-tolerant, scalable
+processing and works with all four.
+
+To run the server or gRPC service from a published image rather than a distribution zip, see
+xref:using-tika/docker.adoc[Running Tika in Docker].
+
+To run Tika inside an OSGi container such as Apache Felix or Eclipse Equinox, see
+xref:using-tika/osgi.adoc[Using Tika in OSGi].
+
+== Resources
+
+* https://tika.apache.org/download.html[Downloads] — jars, the `tika-app` and `tika-server` zips
+* https://hub.docker.com/r/apache/tika[Docker images] — `apache/tika` on Docker Hub
+* https://tika.apache.org/[Apache Tika website]
+* xref:formats.adoc[Supported formats] — what Tika can parse
+* {tika-javadoc-url}/[Javadoc]

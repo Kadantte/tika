@@ -17,7 +17,6 @@
 package org.apache.tika.parser.font;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -28,7 +27,10 @@ import org.apache.fontbox.afm.FontMetrics;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -40,6 +42,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
 /**
  * Parser for AFM Font Files
  */
+@TikaComponent
 public class AdobeFontMetricParser implements Parser {
     // TIKA-1325 Replace these with properties, from a well known standard
     static final String MET_AVG_CHAR_WIDTH = "AvgCharacterWidth";
@@ -64,10 +67,10 @@ public class AdobeFontMetricParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         FontMetrics fontMetrics;
-        AFMParser parser = new AFMParser(stream);
+        AFMParser parser = new AFMParser(tis);
 
         // Have FontBox process the file
         fontMetrics = parser.parse();
@@ -79,7 +82,7 @@ public class AdobeFontMetricParser implements Parser {
         // Get the creation date
         extractCreationDate(metadata, comments);
 
-        metadata.set(Metadata.CONTENT_TYPE, AFM_TYPE.toString());
+        metadata.set(HttpHeaders.CONTENT_TYPE, AFM_TYPE.toString());
         metadata.set(TikaCoreProperties.TITLE, fontMetrics.getFullName());
 
         // Add metadata associated with the font type
@@ -96,7 +99,7 @@ public class AdobeFontMetricParser implements Parser {
                 Float.toString(fontMetrics.getUnderlineThickness()));
 
         // Output the remaining comments as text
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         // Display the comments
@@ -112,10 +115,11 @@ public class AdobeFontMetricParser implements Parser {
         xhtml.endDocument();
     }
 
+    //name is always one of the fixed MET_* constants above, never document-derived
     private void addMetadataByString(Metadata metadata, String name, String value) {
         // Add metadata if an appropriate value is passed
         if (value != null) {
-            metadata.add(name, value);
+            metadata.add(Property.externalText(name), value);
         }
     }
 

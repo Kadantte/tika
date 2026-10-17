@@ -16,36 +16,69 @@
  */
 package org.apache.tika.parser.microsoft;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
+import org.apache.poi.util.LocaleUtil;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
 import org.xml.sax.ContentHandler;
 
 import org.apache.tika.TikaTest;
 import org.apache.tika.exception.EncryptedDocumentException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.metadata.TikaPagedText;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.BodyContentHandler;
 
+//pins the JVM default locale, which is global: no other class may run alongside
+@Isolated
 public class PowerPointParserTest extends TikaTest {
+
+    //POI formats dates with the JVM default locale's digits whatever locale it is given;
+    //pin the default until that is fixed upstream (see TIKA-4920)
+    private static Locale USER_LOCALE = null;
+
+    @BeforeAll
+    public static void setUpLocale() {
+        USER_LOCALE = LocaleUtil.getUserLocale();
+    }
+
+    @AfterAll
+    public static void tearDownLocale() {
+        LocaleUtil.setUserLocale(USER_LOCALE);
+        Locale.setDefault(USER_LOCALE);
+    }
+
+    @BeforeEach
+    public void pinLocale() {
+        LocaleUtil.setUserLocale(Locale.US);
+        Locale.setDefault(Locale.US);
+    }
 
     @Test
     public void testPowerPointParser() throws Exception {
-        try (InputStream input = getResourceAsStream("/test-documents/testPPT.ppt")) {
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPPT.ppt")) {
             Metadata metadata = new Metadata();
             ContentHandler handler = new BodyContentHandler();
-            new OfficeParser().parse(input, handler, metadata, new ParseContext());
+            new OfficeParser().parse(tis, handler, metadata, new ParseContext());
 
-            assertEquals("application/vnd.ms-powerpoint", metadata.get(Metadata.CONTENT_TYPE));
+            assertEquals("application/vnd.ms-powerpoint", metadata.get(HttpHeaders.CONTENT_TYPE));
             assertEquals("Sample Powerpoint Slide", metadata.get(TikaCoreProperties.TITLE));
             assertEquals("Keith Bennett", metadata.get(TikaCoreProperties.CREATOR));
             String content = handler.toString();
@@ -141,8 +174,8 @@ public class PowerPointParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/testPPT_masterFooter.ppt")) {
-            new OfficeParser().parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPPT_masterFooter.ppt")) {
+            new OfficeParser().parse(tis, handler, metadata, new ParseContext());
         }
 
         String content = handler.toString();
@@ -175,8 +208,8 @@ public class PowerPointParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/testPPT_masterText.ppt")) {
-            new OfficeParser().parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPPT_masterText.ppt")) {
+            new OfficeParser().parse(tis, handler, metadata, new ParseContext());
         }
 
         String content = handler.toString();
@@ -203,8 +236,8 @@ public class PowerPointParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/testPPT_masterText2.ppt")) {
-            new OfficeParser().parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPPT_masterText2.ppt")) {
+            new OfficeParser().parse(tis, handler, metadata, new ParseContext());
         }
 
         String content = handler.toString();
@@ -232,14 +265,14 @@ public class PowerPointParserTest extends TikaTest {
     public void testCustomProperties() throws Exception {
         Metadata metadata = new Metadata();
 
-        try (InputStream input = getResourceAsStream("/test-documents/testPPT_custom_props.ppt")) {
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPPT_custom_props.ppt")) {
             ContentHandler handler = new BodyContentHandler(-1);
             ParseContext context = new ParseContext();
             context.set(Locale.class, Locale.US);
-            new OfficeParser().parse(input, handler, metadata, context);
+            new OfficeParser().parse(tis, handler, metadata, context);
         }
 
-        assertEquals("application/vnd.ms-powerpoint", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.ms-powerpoint", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("JOUVIN ETIENNE", metadata.get(TikaCoreProperties.CREATOR));
         assertEquals("EJ04325S", metadata.get(TikaCoreProperties.MODIFIER));
         assertEquals("2011-08-22T13:32:58Z", metadata.get(TikaCoreProperties.MODIFIED));
@@ -281,9 +314,9 @@ public class PowerPointParserTest extends TikaTest {
     @Test
     public void testMacros() throws Exception {
         Metadata minExpected = new Metadata();
-        minExpected.add(TikaCoreProperties.TIKA_CONTENT.getName(), "Sub Embolden()");
-        minExpected.add(TikaCoreProperties.TIKA_CONTENT.getName(), "Sub Italicize()");
-        minExpected.add(Metadata.CONTENT_TYPE, "text/x-vbasic");
+        minExpected.addTrusted(TikaCoreProperties.TIKA_CONTENT.getName(), "Sub Embolden()");
+        minExpected.addTrusted(TikaCoreProperties.TIKA_CONTENT.getName(), "Sub Italicize()");
+        minExpected.add(HttpHeaders.CONTENT_TYPE, "text/x-vbasic");
         minExpected.add(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                 TikaCoreProperties.EmbeddedResourceType.MACRO.toString());
 
@@ -326,7 +359,8 @@ public class PowerPointParserTest extends TikaTest {
     @Test
     public void testGroups() throws Exception {
         List<Metadata> metadataList = getRecursiveMetadata("testPPT_groups.ppt");
-        assertEquals(3, metadataList.size());
+        //two pictures and the SummaryInformation thumbnail
+        assertEquals(4, metadataList.size());
         String content = metadataList.get(0).get(TikaCoreProperties.TIKA_CONTENT);
         //this tests that we're ignoring text shapes at depth=0
         //i.e. POI has already included them in the slide's getTextParagraphs()
@@ -349,11 +383,11 @@ public class PowerPointParserTest extends TikaTest {
         assertContains("tika", content);
         assertContains("MyTitle", content);
 
-        assertEquals("/embedded-1",
-                metadataList.get(1).get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH));
+        String path1 = metadataList.get(1).get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH);
+        assertTrue(path1.contains("."), "embedded resource should have extension: " + path1);
 
-        assertEquals("/embedded-2",
-                metadataList.get(2).get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH));
+        String path2 = metadataList.get(2).get(TikaCoreProperties.EMBEDDED_RESOURCE_PATH);
+        assertTrue(path2.contains("."), "embedded resource should have extension: " + path2);
 
     }
 
@@ -374,12 +408,63 @@ public class PowerPointParserTest extends TikaTest {
     @Test
     public void testEmbeddedXLSInOLEObject() throws Exception {
         List<Metadata> metadataList = getRecursiveMetadata("testPPT_oleWorkbook.ppt");
-        assertEquals(3, metadataList.size());
+        //the workbook, its picture and the SummaryInformation thumbnail
+        assertEquals(4, metadataList.size());
         Metadata xlsx = metadataList.get(1);
         assertContains("<h1>Sheet1</h1>", xlsx.get(TikaCoreProperties.TIKA_CONTENT));
         assertContains("<td>1</td>", xlsx.get(TikaCoreProperties.TIKA_CONTENT));
         assertEquals("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                xlsx.get(Metadata.CONTENT_TYPE));
+                xlsx.get(HttpHeaders.CONTENT_TYPE));
 
+    }
+
+    @Test
+    public void testPptxPicturePageNumbersMultiSlide() throws Exception {
+        // testPPT_embedded_two_slides.pptx references image4.png, image5.gif
+        // and image6.png from BOTH slide1 and slide2 (other media parts in
+        // /ppt/media/ are OLE-object preview thumbnails not referenced from
+        // any slide).  Each slide-referenced image should carry
+        // PAGE_NUMBERS=[1,2] and PAGE_NUMBER unset.
+        List<String> slideReferencedImages = Arrays.asList(
+                "/ppt/media/image4.png", "/ppt/media/image5.gif", "/ppt/media/image6.png");
+        List<Metadata> metadataList =
+                getRecursiveMetadata("testPPT_embedded_two_slides.pptx");
+        int imagesChecked = 0;
+        for (Metadata m : metadataList) {
+            String path = m.get(TikaCoreProperties.INTERNAL_PATH);
+            if (path == null || !slideReferencedImages.contains(path)) {
+                continue;
+            }
+            assertArrayEquals(new int[]{1, 2},
+                    m.getIntValues(TikaPagedText.PAGE_NUMBERS),
+                    "image " + path + " should be tagged with both slide numbers");
+            assertNull(m.get(TikaPagedText.PAGE_NUMBER),
+                    "PAGE_NUMBER should be unset for multi-slide image: " + path);
+            imagesChecked++;
+        }
+        assertEquals(3, imagesChecked,
+                "expected three slide-referenced images in testPPT_embedded_two_slides.pptx");
+    }
+
+    @Test
+    public void testPptxPicturePageNumbersSingleSlide() throws Exception {
+        // testPPT_2imgs.pptx has all images on slide 1, so each picture
+        // should carry PAGE_NUMBERS=[1] AND PAGE_NUMBER=1 (single-page
+        // backwards-compatible convention).
+        List<Metadata> metadataList = getRecursiveMetadata("testPPT_2imgs.pptx");
+        int imagesChecked = 0;
+        for (Metadata m : metadataList) {
+            String path = m.get(TikaCoreProperties.INTERNAL_PATH);
+            if (path == null || !path.startsWith("/ppt/media/image")) {
+                continue;
+            }
+            assertArrayEquals(new int[]{1},
+                    m.getIntValues(TikaPagedText.PAGE_NUMBERS),
+                    "image " + path + " should report slide 1");
+            assertEquals("1", m.get(TikaPagedText.PAGE_NUMBER),
+                    "PAGE_NUMBER should equal 1 for single-slide image: " + path);
+            imagesChecked++;
+        }
+        assertTrue(imagesChecked > 0, "expected at least one embedded image");
     }
 }

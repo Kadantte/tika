@@ -37,13 +37,18 @@ import org.w3c.dom.Node;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
+import org.apache.tika.metadata.TIFF;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 
+@TikaComponent
 public class ImageParser extends AbstractImageParser {
     /**
      * Serial version UID
@@ -61,10 +66,11 @@ public class ImageParser extends AbstractImageParser {
         TMP_SUPPORTED = new HashSet<>(
                 Arrays.asList(MAIN_BMP_TYPE, OLD_BMP_TYPE, MediaType.image("gif"),
                         MediaType.image("png"), MediaType.image("vnd.wap.wbmp"),
-                        MediaType.image("x-icon"), MediaType.image("x-xcf"),
-                        MediaType.image("x-jbig2")));
-        //add try/catch class.forName() for image types relying on
-        //provided dependencies
+                        MediaType.image("x-xcf"),
+                        MediaType.image("x-jbig2"),
+                        // no JPEG 2000 reader (license): owned so OCR still reaches them
+                        MediaType.image("jp2"), MediaType.image("jpx"),
+                        MediaType.image("x-portable-pixmap")));
     }
 
     private static final Set<MediaType> SUPPORTED_TYPES =
@@ -102,11 +108,14 @@ public class ImageParser extends AbstractImageParser {
             parents += node.getNodeName();
         }
         NamedNodeMap map = node.getAttributes();
-        if (map != null) {
+        //a bare root node (parents=="") carries no meaningful field name; skip it
+        //rather than let the prefix route WARN on a blank name
+        if (map != null && !parents.isEmpty()) {
 
             int length = map.getLength();
             if (length == 1) {
-                metadata.add(ImageMetadataExtractor.UNKNOWN_IMG_NS + parents, normalize(map.item(0).getNodeValue()));
+                metadata.add(ImageMetadataExtractor.UNKNOWN_IMG, parents,
+                        normalize(map.item(0).getNodeValue()));
             } else if (length > 1) {
                 StringBuilder value = new StringBuilder();
                 for (int i = 0; i < length; i++) {
@@ -118,7 +127,7 @@ public class ImageParser extends AbstractImageParser {
                     value.append("=");
                     value.append(normalize(attr.getNodeValue()));
                 }
-                metadata.add(ImageMetadataExtractor.UNKNOWN_IMG_NS + parents, value.toString());
+                metadata.add(ImageMetadataExtractor.UNKNOWN_IMG, parents, value.toString());
             }
         }
 
@@ -153,7 +162,7 @@ public class ImageParser extends AbstractImageParser {
     void extractMetadata(InputStream stream, ContentHandler contentHandler, Metadata metadata,
                          ParseContext parseContext)
             throws IOException, SAXException, TikaException {
-        String type = metadata.get(Metadata.CONTENT_TYPE);
+        String type = metadata.get(HttpHeaders.CONTENT_TYPE);
         if (type == null) {
             return;
         }
@@ -162,8 +171,8 @@ public class ImageParser extends AbstractImageParser {
             if (iterator.hasNext()) {
                 ImageReader reader = iterator.next();
                 try {
-                    try (ImageInputStream imageStream = ImageIO
-                            .createImageInputStream(CloseShieldInputStream.wrap(stream))) {
+                    // a file we already have beats ImageIO copying the stream to its own cache file
+                    try (ImageInputStream imageStream = imageInput(stream)) {
                         reader.setInput(imageStream);
                         try {
                             int numImages = reader.getNumImages(true);
@@ -173,10 +182,10 @@ public class ImageParser extends AbstractImageParser {
                         } catch (IllegalStateException e) {
                             //ignore
                         }
-                        metadata.set(Metadata.IMAGE_WIDTH, Integer.toString(reader.getWidth(0)));
-                        metadata.set(Metadata.IMAGE_LENGTH, Integer.toString(reader.getHeight(0)));
-                        metadata.set(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height", Integer.toString(reader.getHeight(0)));
-                        metadata.set(ImageMetadataExtractor.UNKNOWN_IMG_NS + "width", Integer.toString(reader.getWidth(0)));
+                        metadata.set(TIFF.IMAGE_WIDTH, Integer.toString(reader.getWidth(0)));
+                        metadata.set(TIFF.IMAGE_LENGTH, Integer.toString(reader.getHeight(0)));
+                        metadata.add(ImageMetadataExtractor.UNKNOWN_IMG, "height", Integer.toString(reader.getHeight(0)));
+                        metadata.add(ImageMetadataExtractor.UNKNOWN_IMG, "width", Integer.toString(reader.getWidth(0)));
 
                         loadMetadata(reader.getImageMetadata(0), metadata);
                     }
@@ -190,7 +199,7 @@ public class ImageParser extends AbstractImageParser {
             setIfPresent(metadata, ImageMetadataExtractor.UNKNOWN_IMG_NS + "CommentExtensions CommentExtension",
                     TikaCoreProperties.COMMENTS);
             setIfPresent(metadata, ImageMetadataExtractor.UNKNOWN_IMG_NS + "markerSequence com", TikaCoreProperties.COMMENTS);
-            setIfPresent(metadata, ImageMetadataExtractor.UNKNOWN_IMG_NS + "Data BitsPerSample", Metadata.BITS_PER_SAMPLE);
+            setIfPresent(metadata, ImageMetadataExtractor.UNKNOWN_IMG_NS + "Data BitsPerSample", TIFF.BITS_PER_SAMPLE);
         } catch (IIOException e) {
             // TIKA-619: There is a known bug in the Sun API when dealing with GIF images
             //  which Tika will just ignore.
@@ -199,6 +208,13 @@ public class ImageParser extends AbstractImageParser {
                 throw new TikaException(type + " parse error", e);
             }
         }
+    }
+
+    private static ImageInputStream imageInput(InputStream stream) throws IOException {
+        if (stream instanceof TikaInputStream tis && tis.hasFile()) {
+            return ImageIO.createImageInputStream(tis.getPath().toFile());
+        }
+        return ImageIO.createImageInputStream(CloseShieldInputStream.wrap(stream));
     }
 
     @Override

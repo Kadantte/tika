@@ -32,31 +32,33 @@ import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
 import java.io.Writer;
 import java.lang.reflect.Field;
-import java.net.URI;
 import java.net.URL;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.UUID;
 import javax.xml.transform.OutputKeys;
 import javax.xml.transform.TransformerConfigurationException;
 import javax.xml.transform.sax.SAXTransformerFactory;
 import javax.xml.transform.sax.TransformerHandler;
 import javax.xml.transform.stream.StreamResult;
 
-import org.apache.commons.io.FilenameUtils;
-import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.input.CloseShieldInputStream;
+import org.apache.commons.io.output.CloseShieldOutputStream;
 import org.apache.logging.log4j.Level;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,15 +68,16 @@ import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.Tika;
 import org.apache.tika.async.cli.TikaAsyncCLI;
-import org.apache.tika.config.TikaConfig;
-import org.apache.tika.config.TikaConfigSerializer;
+import org.apache.tika.config.EmbeddedLimits;
+import org.apache.tika.config.TikaExtras;
+import org.apache.tika.config.TimeoutLimits;
+import org.apache.tika.config.loader.ComponentRegistry;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.detect.CompositeDetector;
 import org.apache.tika.detect.Detector;
+import org.apache.tika.digest.DigestDef;
+import org.apache.tika.digest.DigesterFactory;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.extractor.DefaultEmbeddedStreamTranslator;
-import org.apache.tika.extractor.EmbeddedDocumentExtractor;
-import org.apache.tika.extractor.EmbeddedStreamTranslator;
-import org.apache.tika.fork.ForkParser;
 import org.apache.tika.gui.TikaGUI;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.language.detect.LanguageHandler;
@@ -87,23 +90,28 @@ import org.apache.tika.mime.MimeTypeException;
 import org.apache.tika.mime.MimeTypes;
 import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.CompositeParser;
-import org.apache.tika.parser.DigestingParser;
-import org.apache.tika.parser.NetworkParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.ParserDecorator;
 import org.apache.tika.parser.PasswordProvider;
 import org.apache.tika.parser.RecursiveParserWrapper;
-import org.apache.tika.parser.digestutils.CommonsDigester;
+import org.apache.tika.parser.digestutils.CommonsDigesterFactory;
+import org.apache.tika.parser.inference.InferenceDispatcher;
+import org.apache.tika.pipes.api.ParseMode;
+import org.apache.tika.pipes.fork.PipesForkParser;
+import org.apache.tika.pipes.fork.PipesForkParserConfig;
+import org.apache.tika.pipes.fork.PipesForkResult;
 import org.apache.tika.sax.BasicContentHandlerFactory;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.ContentHandlerFactory;
 import org.apache.tika.sax.ExpandedTitleContentHandler;
 import org.apache.tika.sax.RecursiveParserWrapperHandler;
+import org.apache.tika.sax.ToMarkdownContentHandler;
 import org.apache.tika.sax.WriteOutContentHandler;
 import org.apache.tika.sax.boilerpipe.BoilerpipeContentHandler;
 import org.apache.tika.serialization.JsonMetadata;
 import org.apache.tika.serialization.JsonMetadataList;
+import org.apache.tika.utils.StringUtils;
 import org.apache.tika.utils.XMLReaderUtils;
 import org.apache.tika.xmp.XMPMetadata;
 
@@ -121,14 +129,12 @@ public class TikaCLI {
             return new DefaultHandler();
         }
     };
-    private Path extractDir = Paths.get(".");
     private ParseContext context;
     private Detector detector;
     private Parser parser;
-    private TikaConfig config;
+    private TikaLoader tikaLoader;
     private String configFilePath;
     private boolean recursiveJSON = false;
-    private URI networkURI = null;
     /**
      * Output character encoding, or <code>null</code> for platform default
      */
@@ -186,10 +192,10 @@ public class TikaCLI {
     };
     private final OutputType DETECT = new OutputType() {
         @Override
-        public void process(InputStream stream, OutputStream output, Metadata metadata) throws Exception {
+        public void process(TikaInputStream tis, OutputStream output, Metadata metadata) throws Exception {
             PrintWriter writer = new PrintWriter(getOutputWriter(output, encoding));
             writer.println(detector
-                    .detect(stream, metadata)
+                    .detect(tis, metadata, context)
                     .toString());
             writer.flush();
         }
@@ -198,17 +204,78 @@ public class TikaCLI {
      * Password for opening encrypted documents, or <code>null</code>.
      */
     private String password = System.getenv("TIKA_PASSWORD");
-    private DigestingParser.Digester digester = null;
+    private DigesterFactory digesterFactory = null;
+    /**
+     * Maximum depth for embedded document extraction, or -1 for unlimited.
+     */
+    private int maxEmbeddedDepth = EmbeddedLimits.UNLIMITED;
+    /**
+     * Maximum count of embedded documents to extract, or -1 for unlimited.
+     */
+    private int maxEmbeddedCount = EmbeddedLimits.UNLIMITED;
     private boolean pipeMode = true;
-    private boolean fork = false;
     private boolean prettyPrint;
+    /**
+     * Fork mode: run parsing in a forked JVM process for isolation.
+     */
+    private boolean forkMode = false;
+    /**
+     * Fork mode total task timeout in milliseconds. Null means unset -- falls back to
+     * {@link TimeoutLimits#DEFAULT_TOTAL_TASK_TIMEOUT_MILLIS}, the same default used
+     * everywhere else in Tika (pipes, library usage), so a CLI user moving to pipes for
+     * production doesn't see different truncation behavior on the same file.
+     */
+    private Long taskTimeoutMillis = null;
+    /**
+     * Fork mode progress (stall-detector) timeout in milliseconds. Null means unset --
+     * falls back to {@link TimeoutLimits#DEFAULT_PROGRESS_TIMEOUT_MILLIS}.
+     */
+    private Long progressTimeoutMillis = null;
+    /**
+     * Fork mode JVM arguments.
+     */
+    private List<String> forkJvmArgs = null;
+    /**
+     * Fork mode plugins directory.
+     */
+    private String forkPluginsDir = null;
+    private final OutputType MARKDOWN = new OutputType() {
+        @Override
+        public void process(TikaInputStream tis, OutputStream output, Metadata metadata) throws Exception {
+            // The markdown handler buffers the whole document and only writes on endDocument.
+            // Drive the parse here so we can flush partial content if it aborts mid-document,
+            // matching the streaming text/HTML/XML handlers (otherwise -o leaves an empty file).
+            ToMarkdownContentHandler markdown =
+                    new ToMarkdownContentHandler(getOutputWriter(output, encoding));
+            try {
+                parser.parse(tis, new BodyContentHandler(markdown), metadata, context);
+            } catch (Throwable t) {
+                // Best-effort: flush whatever was parsed before the abort, but never let a
+                // secondary flush failure mask the real parse error.
+                try {
+                    markdown.writePartialContentIfUnfinished();
+                } catch (IOException suppressed) {
+                    t.addSuppressed(suppressed);
+                }
+                throw t;
+            }
+            // Success: endDocument normally wrote the content; this is a no-op unless the
+            // parser produced no document at all (then it emits the empty/partial result).
+            markdown.writePartialContentIfUnfinished();
+        }
+
+        @Override
+        protected ContentHandler getContentHandler(OutputStream output, Metadata metadata) throws Exception {
+            return new BodyContentHandler(new ToMarkdownContentHandler(getOutputWriter(output, encoding)));
+        }
+    };
     private final OutputType XML = new OutputType() {
         @Override
         protected ContentHandler getContentHandler(OutputStream output, Metadata metadata) throws Exception {
             return getTransformerHandler(output, "xml", encoding, prettyPrint);
         }
     };
-    private OutputType type = XML;
+    private OutputType type = MARKDOWN;
     private final OutputType HTML = new OutputType() {
         @Override
         protected ContentHandler getContentHandler(OutputStream output, Metadata metadata) throws Exception {
@@ -221,6 +288,7 @@ public class TikaCLI {
     }
 
     public static void main(String[] args) throws Exception {
+        TikaExtras.install();
         TikaCLI cli = new TikaCLI();
 
         if (cli.testForHelp(args)) {
@@ -254,16 +322,58 @@ public class TikaCLI {
     }
 
     private static void async(String[] args) throws Exception {
+        System.err.println("tika-app: running in Tika Pipes mode "
+                + "(async dispatch via -a/--async); use --help for options.");
+        args = AsyncHelper.translateArgs(args);
         String tikaConfigPath = "";
-        String config = "--config=";
-        for (String arg : args) {
-            if (arg.startsWith(config)) {
-                tikaConfigPath = arg.substring(config.length());
-                TikaAsyncCLI.main(new String[]{tikaConfigPath});
-                return;
+        //TODO - runpack is a smelly. fix this.
+        boolean runpack = false;
+        for (int i = 0; i < args.length - 1; i++) {
+            if (args[i].equals("-c")) {
+                tikaConfigPath = args[i + 1];
+            } else if ("-Z".equals(args[i]) || "-z".equals(args[i]) || "--extract".equals(args[i])) {
+                runpack = true;
             }
         }
-        TikaAsyncCLI.main(args);
+
+        if (runpack || ! StringUtils.isBlank(tikaConfigPath)) {
+            invokeAsyncCLI(args);
+            return;
+        }
+        if (args.length == 1 &&  args[0].endsWith(".json")) {
+            invokeAsyncCLI(args);
+            return;
+        }
+        // For Pipes mode (two directories), pass directly to TikaAsyncCLI.
+        // It will create its own config with PluginsWriter that includes
+        // plugin-roots, fetcher, emitter, and pipes-iterator configuration.
+        invokeAsyncCLI(args);
+    }
+
+    /**
+     * Invokes the Tika Pipes async processor ({@code tika-async-cli}). The async
+     * processor and the parsers it forks live in the {@code lib/} directory of
+     * the tika-app distribution rather than inside the bare {@code tika-app.jar}.
+     * If tika-app is run as a standalone jar (without the surrounding unzipped
+     * distribution), the supporting classes are missing from the classpath and
+     * the JVM throws {@link NoClassDefFoundError}. Translate that into an
+     * actionable message rather than letting the raw error escape.
+     *
+     * @see <a href="https://issues.apache.org/jira/browse/TIKA-4733">TIKA-4733</a>
+     */
+    private static void invokeAsyncCLI(String[] args) throws Exception {
+        try {
+            TikaAsyncCLI.main(args);
+        } catch (NoClassDefFoundError e) {
+            System.err.println("Error: could not load the Tika Pipes processor (" +
+                    e.getMessage() + ").");
+            System.err.println("Tika Pipes mode requires the full tika-app distribution, not the "
+                    + "standalone jar.");
+            System.err.println("Download tika-app-<version>.zip, unzip it, and run "
+                    + "tika-app-<version>.jar from inside the unzipped directory so that the "
+                    + "adjacent 'lib/' and 'plugins/' directories are present alongside the jar.");
+            System.exit(1);
+        }
     }
 
     /**
@@ -318,11 +428,50 @@ public class TikaCLI {
     }
 
     private boolean testForAsync(String[] args) {
-        if (args.length == 2) {
-            if (Files.isDirectory(Paths.get(args[0]))) {
-                return true;
+
+        // Standalone utility flags are handled directly by process(), never via async mode.
+        // (Without this guard, --convert-config-xml-to-json=in.xml would be misread as a
+        // ".json"/batch arg and routed to async, failing with a TikaConfigException - TIKA-4734.)
+        for (String arg : args) {
+            if (arg.startsWith("--convert-config-xml-to-json=")) {
+                return false;
             }
         }
+
+        // Single .json file is a config file for async mode.
+        // Reject option-style args like `--config=foo.json` so they fall through to process().
+        if (args.length == 1 && !args[0].startsWith("-") && args[0].endsWith(".json")) {
+            return true;
+        }
+
+        if (args.length == 2) {
+            try {
+                if (Files.isDirectory(Paths.get(args[0]))) {
+                    return true;
+                }
+            } catch (InvalidPathException e) {
+                // Not a valid path (e.g. a URL passed as a raw single-dash
+                // arg on Windows) -- fall through to the other checks.
+            }
+        }
+
+        // Check if last two args are directories (Pipes mode with options)
+        if (args.length >= 2) {
+            String lastArg = args[args.length - 1];
+            String secondLastArg = args[args.length - 2];
+            // Make sure neither looks like an option value
+            if (!lastArg.startsWith("-") && !secondLastArg.startsWith("-")) {
+                try {
+                    if (Files.isDirectory(Paths.get(secondLastArg)) &&
+                        (Files.isDirectory(Paths.get(lastArg)) || !Files.exists(Paths.get(lastArg)))) {
+                        return true;
+                    }
+                } catch (Exception e) {
+                    // Invalid path, not Pipes mode
+                }
+            }
+        }
+
         for (String arg : args) {
             if (arg.equals("-a") || arg.equals("--async")) {
                 return true;
@@ -333,7 +482,12 @@ public class TikaCLI {
             if (arg.equals("-o") || arg.startsWith("--output")) {
                 return true;
             }
-
+            if (arg.equals("-Z") || arg.equals("-z") || arg.equals("--extract") || arg.startsWith("--extract-dir")) {
+                return true;
+            }
+            if (arg.equals("--fileList")) {
+                return true;
+            }
         }
         return false;
     }
@@ -357,15 +511,25 @@ public class TikaCLI {
         } else if (arg.equals("--list-parser") || arg.equals("--list-parsers")) {
             pipeMode = false;
             displayParsers(false, false);
+        } else if (arg.equals("--list-parser-names")) {
+            pipeMode = false;
+            displayParserNames();
         } else if (arg.equals("--list-detector") || arg.equals("--list-detectors")) {
             pipeMode = false;
             displayDetectors();
+        } else if (arg.equals("--list-detector-names")) {
+            pipeMode = false;
+            displayDetectorNames();
         } else if (arg.equals("--list-parser-detail") || arg.equals("--list-parser-details")) {
             pipeMode = false;
             displayParsers(true, false);
         } else if (arg.equals("--list-parser-detail-apt") || arg.equals("--list-parser-details-apt")) {
             pipeMode = false;
             displayParsers(true, true);
+        } else if (arg.equals("--list-parser-detail-adoc") || arg.equals("--list-parser-details-adoc")) {
+            pipeMode = false;
+            configure();
+            System.out.print(SupportedFormatsAdoc.render(parser));
         } else if (arg.equals("--list-met-models")) {
             pipeMode = false;
             displayMetModels();
@@ -375,7 +539,8 @@ public class TikaCLI {
         } else if (arg.startsWith("--compare-file-magic=")) {
             pipeMode = false;
             compareFileMagic(arg.substring("--compare-file-magic=".length()));
-        } else if (arg.equals("--dump-minimal-config")) {
+        //TODO -- rework with json serialization
+        /*} else if (arg.equals("--dump-minimal-config")) {
             pipeMode = false;
             dumpConfig(TikaConfigSerializer.Mode.MINIMAL);
         } else if (arg.equals("--dump-current-config")) {
@@ -386,21 +551,22 @@ public class TikaCLI {
             dumpConfig(TikaConfigSerializer.Mode.STATIC);
         } else if (arg.equals("--dump-static-full-config")) {
             pipeMode = false;
-            dumpConfig(TikaConfigSerializer.Mode.STATIC_FULL);
+            dumpConfig(TikaConfigSerializer.Mode.STATIC_FULL);*/
+        } else if (arg.startsWith("--convert-config-xml-to-json=")) {
+            pipeMode = false;
+            convertConfigXmlToJson(arg.substring("--convert-config-xml-to-json=".length()));
         } else if (arg.equals("--container-aware") || arg.equals("--container-aware-detector")) {
             // ignore, as container-aware detectors are now always used
-        } else if (arg.equals("-f") || arg.equals("--fork")) {
-            fork = true;
         } else if (arg.startsWith("--config=")) {
             configFilePath = arg.substring("--config=".length());
         } else if (arg.startsWith("--digest=")) {
-            digester = new CommonsDigester(MAX_MARK, arg.substring("--digest=".length()));
-        } else if (arg.startsWith("-e")) {
-            encoding = arg.substring("-e".length());
+            String algorithmName = arg.substring("--digest=".length()).toUpperCase(Locale.ROOT);
+            DigestDef.Algorithm algorithm = DigestDef.Algorithm.valueOf(algorithmName);
+            CommonsDigesterFactory factory = new CommonsDigesterFactory();
+            factory.setDigests(Collections.singletonList(new DigestDef(algorithm)));
+            digesterFactory = factory;
         } else if (arg.startsWith("--encoding=")) {
             encoding = arg.substring("--encoding=".length());
-        } else if (arg.startsWith("-p") && !arg.equals("-p")) {
-            password = arg.substring("-p".length());
         } else if (arg.startsWith("--password=")) {
             password = arg.substring("--password=".length());
         } else if (arg.equals("-j") || arg.equals("--json")) {
@@ -413,6 +579,8 @@ public class TikaCLI {
             type = XML;
         } else if (arg.equals("-h") || arg.equals("--html")) {
             type = HTML;
+        } else if (arg.equals("--md")) {
+            type = MARKDOWN;
         } else if (arg.equals("-t") || arg.equals("--text")) {
             type = TEXT;
         } else if (arg.equals("-T") || arg.equals("--text-main")) {
@@ -425,49 +593,76 @@ public class TikaCLI {
             type = LANGUAGE;
         } else if (arg.equals("-d") || arg.equals("--detect")) {
             type = DETECT;
-        } else if (arg.startsWith("--extract-dir=")) {
-            String dirPath = arg.substring("--extract-dir=".length());
-            //if the user accidentally doesn't include
-            //a directory, set the directory to the cwd
-            if (dirPath.isEmpty()) {
-                dirPath = ".";
-            }
-            extractDir = Paths.get(dirPath);
-        } else if (arg.equals("-z") || arg.equals("--extract")) {
-            type = NO_OUTPUT;
-            context.set(EmbeddedDocumentExtractor.class, new FileEmbeddedDocumentExtractor());
+        } else if (arg.equals("-f") || arg.equals("--fork")) {
+            forkMode = true;
+        } else if (arg.startsWith("--fork-timeout=")) {
+            throw new IllegalArgumentException("--fork-timeout was removed in 4.0 because its "
+                    + "meaning was ambiguous (total budget vs. stall detector). Use "
+                    + "--task-timeout=<ms> for the total per-file budget and/or "
+                    + "--progress-timeout=<ms> for the stall detector instead.");
+        } else if (arg.startsWith("--task-timeout=")) {
+            taskTimeoutMillis = Long.parseLong(arg.substring("--task-timeout=".length()));
+        } else if (arg.startsWith("--progress-timeout=")) {
+            progressTimeoutMillis = Long.parseLong(arg.substring("--progress-timeout=".length()));
+        } else if (arg.startsWith("--fork-jvm-args=")) {
+            forkJvmArgs = Arrays.asList(arg.substring("--fork-jvm-args=".length()).split(","));
+        } else if (arg.startsWith("--fork-plugins-dir=")) {
+            forkPluginsDir = arg.substring("--fork-plugins-dir=".length());
+        } else if (arg.startsWith("--maxEmbeddedDepth=")) {
+            maxEmbeddedDepth = Integer.parseInt(arg.substring("--maxEmbeddedDepth=".length()));
+        } else if (arg.startsWith("--maxEmbeddedCount=")) {
+            maxEmbeddedCount = Integer.parseInt(arg.substring("--maxEmbeddedCount=".length()));
         } else if (arg.equals("-r") || arg.equals("--pretty-print")) {
             prettyPrint = true;
-        } else if (arg.equals("-p") || arg.equals("--port") || arg.equals("-s") || arg.equals("--server")) {
-            throw new IllegalArgumentException("As of Tika 2.0, the server option is no longer supported in tika-app.\n" + "See https://wiki.apache.org/tika/TikaJAXRS for usage.");
-        } else if (arg.startsWith("-c")) {
-            networkURI = new URI(arg.substring("-c".length()));
-        } else if (arg.startsWith("--client=")) {
-            networkURI = new URI(arg.substring("--client=".length()));
         } else {
+            // Any arg that reaches here is either "-" (stdin), an existing
+            // file, a URL, or an unknown/typo'd flag. The default fallthrough
+            // lets typos like "-input /path" hit new URL("-input") and
+            // surface as a confusing MalformedURLException. Catch dash-prefixed
+            // args that aren't the stdin marker or an existing file and emit
+            // an actionable error before that happens.
+            if (arg.startsWith("-") && !arg.equals("-") && !fileExists(arg)) {
+                String hint = " Run with --help for the full option list.";
+                // Heuristic: single-dash + multi-letter (e.g. "-input") is
+                // usually a long-form-with-one-dash typo. Single-dash + one
+                // letter (e.g. "-s") or "--<unknown>" is just an unknown flag.
+                if (arg.length() > 2 && !arg.startsWith("--")) {
+                    hint = " Long-form flags require two dashes (try '-"
+                            + arg + "' instead of '" + arg + "')." + hint;
+                }
+                throw new IllegalArgumentException("Unknown option '" + arg + "'." + hint);
+            }
             pipeMode = false;
             configure();
 
             if (arg.equals("-")) {
-                try (InputStream stream = TikaInputStream.get(CloseShieldInputStream.wrap(System.in))) {
-                    type.process(stream, System.out, new Metadata());
+                try (TikaInputStream tis = TikaInputStream.get(CloseShieldInputStream.wrap(System.in))) {
+                    if (forkMode) {
+                        processWithFork(tis, Metadata.newInstance(context), System.out);
+                    } else {
+                        type.process(tis, System.out, Metadata.newInstance(context));
+                    }
                 }
             } else {
                 URL url;
-                File file = new File(arg);
-                if (file.isFile()) {
-                    url = file
+                if (isRegularFile(arg)) {
+                    url = new File(arg)
                             .toURI()
                             .toURL();
                 } else {
                     url = new URL(arg);
                 }
-                if (recursiveJSON) {
+                if (forkMode) {
+                    Metadata metadata = Metadata.newInstance(context);
+                    try (TikaInputStream tis = TikaInputStream.get(url, metadata)) {
+                        processWithFork(tis, metadata, System.out);
+                    }
+                } else if (recursiveJSON) {
                     handleRecursiveJson(url, System.out);
                 } else {
-                    Metadata metadata = new Metadata();
-                    try (InputStream input = TikaInputStream.get(url, metadata)) {
-                        type.process(input, System.out, metadata);
+                    Metadata metadata = Metadata.newInstance(context);
+                    try (TikaInputStream tis = TikaInputStream.get(url, metadata)) {
+                        type.process(tis, System.out, metadata);
                     } finally {
                         System.out.flush();
                     }
@@ -476,25 +671,185 @@ public class TikaCLI {
         }
     }
 
-    private void dumpConfig(TikaConfigSerializer.Mode mode) throws Exception {
-        configure();
-        TikaConfig localConfig = (config == null) ? TikaConfig.getDefaultConfig() : config;
+    /**
+     * Windows rejects a colon outside the drive-letter slot (e.g. a URL passed
+     * as a raw CLI arg) by throwing InvalidPathException from File I/O instead
+     * of just reporting "not found"; normalize that to "doesn't exist".
+     */
+    private static boolean fileExists(String arg) {
+        try {
+            return new File(arg).exists();
+        } catch (InvalidPathException e) {
+            return false;
+        }
+    }
 
-        TikaConfigSerializer.serialize(localConfig, mode, new OutputStreamWriter(System.out, UTF_8), UTF_8);
+    private static boolean isRegularFile(String arg) {
+        try {
+            return new File(arg).isFile();
+        } catch (InvalidPathException e) {
+            return false;
+        }
+    }
+
+    //TODO -- rework with json serialization
+    /*private void dumpConfig(TikaConfigSerializer.Mode mode) throws Exception {
+        configure();
+        TikaLoader localConfig = (tikaLoader == null) ? TikaLoader.loadDefault() : tikaLoader;
+        //TODO -- implement mode
+        System.out.println(localConfig.getConfig().toString());
+    }*/
+
+    private void convertConfigXmlToJson(String inputPath) throws Exception {
+        if (inputPath == null || inputPath.trim().isEmpty()) {
+            System.err.println("Error: --convert-config-xml-to-json requires an input XML path");
+            System.err.println("Usage: --convert-config-xml-to-json=<input.xml> > <output.json>");
+            return;
+        }
+
+        Path xmlPath = Paths.get(inputPath.trim());
+
+        if (!Files.isRegularFile(xmlPath)) {
+            System.err.println("Error: Input XML path is not a regular file: " + xmlPath);
+            return;
+        }
+        if (!Files.isReadable(xmlPath)) {
+            System.err.println("Error: Input XML file is not readable: " + xmlPath);
+            return;
+        }
+
+        // Write JSON to stdout so the user can redirect it (e.g. > tika-config.json).
+        // Informational/diagnostic output from the converter goes to the logger (stderr),
+        // keeping stdout clean for the JSON payload. The converter closes the stream it
+        // is handed, so shield System.out from being closed out from under us.
+        try (InputStream in = Files.newInputStream(xmlPath)) {
+            XmlToJsonConfigConverter.convert(in, CloseShieldOutputStream.wrap(System.out));
+            System.out.flush();
+        } catch (Exception e) {
+            System.err.println("Error converting config: " + e.getMessage());
+            throw e;
+        }
     }
 
     private void handleRecursiveJson(URL url, OutputStream output) throws IOException, SAXException, TikaException {
-        Metadata metadata = new Metadata();
+        Metadata metadata = Metadata.newInstance(context);
         RecursiveParserWrapper wrapper = new RecursiveParserWrapper(parser);
-        RecursiveParserWrapperHandler handler = new RecursiveParserWrapperHandler(getContentHandlerFactory(type), -1, config.getMetadataFilter());
-        try (InputStream input = TikaInputStream.get(url, metadata)) {
-            wrapper.parse(input, handler, metadata, context);
+        RecursiveParserWrapperHandler handler = new RecursiveParserWrapperHandler(getContentHandlerFactory(type));
+        try (TikaInputStream tis = TikaInputStream.get(url, metadata)) {
+            wrapper.parse(tis, handler, metadata, context);
         }
         JsonMetadataList.setPrettyPrinting(prettyPrint);
         try (Writer writer = getOutputWriter(output, encoding)) {
             List<Metadata> metadataList = handler.getMetadataList();
-            metadataList = config.getMetadataListFilter().filter(metadataList);
+            InferenceDispatcher inference = tikaLoader.get(InferenceDispatcher.class);
+            if (inference != null) {
+                inference.text(metadataList, context);
+            }
+            tikaLoader.loadMetadataFilters().filter(metadataList);
             JsonMetadataList.toJson(metadataList, writer);
+        }
+    }
+
+    /**
+     * Process a file using forked JVM process for isolation.
+     * This provides protection against parser crashes, OOM, and other issues.
+     */
+    private void processWithFork(TikaInputStream tis, Metadata metadata, OutputStream output) throws Exception {
+        PipesForkParserConfig config = new PipesForkParserConfig();
+
+        // Set handler type based on output type
+        config.setContentHandlerFactory(getContentHandlerFactory(type));
+
+        // Set parse mode based on recursiveJSON flag
+        if (recursiveJSON) {
+            config.setParseMode(ParseMode.RMETA);
+        } else {
+            config.setParseMode(ParseMode.CONCATENATE);
+        }
+
+        // Unset flags fall back to the same TimeoutLimits defaults used everywhere else
+        // in Tika (pipes, library usage) rather than CLI-specific numbers.
+        long effectiveTaskTimeoutMillis = taskTimeoutMillis != null
+                ? taskTimeoutMillis : TimeoutLimits.DEFAULT_TOTAL_TASK_TIMEOUT_MILLIS;
+        long effectiveProgressTimeoutMillis = progressTimeoutMillis != null
+                ? progressTimeoutMillis : TimeoutLimits.DEFAULT_PROGRESS_TIMEOUT_MILLIS;
+        config.setTimeoutLimits(new TimeoutLimits(
+                effectiveTaskTimeoutMillis, effectiveProgressTimeoutMillis));
+
+        // Set JVM args if provided
+        if (forkJvmArgs != null && !forkJvmArgs.isEmpty()) {
+            config.setJvmArgs(forkJvmArgs);
+        }
+
+        // Set plugins directory if provided
+        if (forkPluginsDir != null) {
+            config.setPluginsDir(Paths.get(forkPluginsDir));
+        }
+
+        // Set embedded limits if configured
+        if (maxEmbeddedDepth != EmbeddedLimits.UNLIMITED || maxEmbeddedCount != EmbeddedLimits.UNLIMITED) {
+            EmbeddedLimits limits = new EmbeddedLimits();
+            if (maxEmbeddedDepth != EmbeddedLimits.UNLIMITED) {
+                limits.setMaxDepth(maxEmbeddedDepth);
+            }
+            if (maxEmbeddedCount != EmbeddedLimits.UNLIMITED) {
+                limits.setMaxCount(maxEmbeddedCount);
+            }
+            config.setEmbeddedLimits(limits);
+        }
+
+        try (PipesForkParser parser = new PipesForkParser(config)) {
+            PipesForkResult result = parser.parse(tis, metadata);
+
+            if (result.isProcessCrash()) {
+                LOG.error("Fork process crashed: {}", result.getStatus());
+                System.err.println("Fork process crashed: " + result.getStatus());
+                return;
+            }
+
+            List<Metadata> metadataList = result.getMetadataList();
+
+            // Output based on type
+            if (recursiveJSON) {
+                // Output as JSON metadata list
+                JsonMetadataList.setPrettyPrinting(prettyPrint);
+                try (Writer writer = getOutputWriter(output, encoding)) {
+                    JsonMetadataList.toJson(metadataList, writer);
+                }
+            } else if (type == JSON || type == METADATA) {
+                // Output metadata (first item only for single-file mode)
+                if (!metadataList.isEmpty()) {
+                    Metadata m = metadataList.get(0);
+                    if (type == JSON) {
+                        JsonMetadata.setPrettyPrinting(prettyPrint);
+                        try (Writer writer = getOutputWriter(output, encoding)) {
+                            JsonMetadata.toJson(m, writer);
+                        }
+                    } else {
+                        try (PrintWriter writer = new PrintWriter(getOutputWriter(output, encoding))) {
+                            String[] names = m.names();
+                            Arrays.sort(names);
+                            for (String name : names) {
+                                for (String value : m.getValues(name)) {
+                                    writer.println(name + ": " + value);
+                                }
+                            }
+                            writer.flush();
+                        }
+                    }
+                }
+            } else {
+                // Output content (text, xml, html)
+                if (!metadataList.isEmpty()) {
+                    String content = metadataList.get(0).get(TikaCoreProperties.TIKA_CONTENT);
+                    if (content != null) {
+                        try (Writer writer = getOutputWriter(output, encoding)) {
+                            writer.write(content);
+                            writer.flush();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -508,6 +863,8 @@ public class TikaCLI {
             handlerType = BasicContentHandlerFactory.HANDLER_TYPE.TEXT;
         } else if (type.equals(TEXT_MAIN)) {
             handlerType = BasicContentHandlerFactory.HANDLER_TYPE.BODY;
+        } else if (type.equals(MARKDOWN)) {
+            handlerType = BasicContentHandlerFactory.HANDLER_TYPE.MARKDOWN;
         } else if (type.equals(METADATA)) {
             handlerType = BasicContentHandlerFactory.HANDLER_TYPE.IGNORE;
         }
@@ -524,18 +881,24 @@ public class TikaCLI {
         out.println("    -V  or --version       Print the Apache Tika version number");
         out.println();
         out.println("    -g  or --gui           Start the Apache Tika GUI");
-        out.println("    -f  or --fork          Use Fork Mode for out-of-process extraction");
         out.println();
-        out.println("    --config=<tika-config.xml>");
-        out.println("        TikaConfig file. Must be specified before -g, -s, -f or the dump-x-config !");
-        out.println("    --dump-minimal-config  Print minimal TikaConfig");
-        out.println("    --dump-current-config  Print current TikaConfig");
-        out.println("    --dump-static-config   Print static config");
-        out.println("    --dump-static-full-config  Print static explicit config");
+        out.println("    --config=<tika-config.json>");
+        out.println("        TikaConfig file (JSON as of Tika 4.x). Must be specified before -g or -f !");
+        // TODO: TIKA-XXXX - Re-enable config dump options once JSON serialization is complete
+        // These options are not yet implemented in 4.x due to the migration from XML to JSON config
+        // out.println("    --dump-minimal-config  Print minimal TikaConfig");
+        // out.println("    --dump-current-config  Print current TikaConfig");
+        // out.println("    --dump-static-config   Print static config");
+        // out.println("    --dump-static-full-config  Print static explicit config");
+        out.println("    --convert-config-xml-to-json=<input.xml>");
+        out.println("        Convert a legacy 3.x XML config to 4.x JSON format (parsers section only),");
+        out.println("        writing the JSON to stdout. Redirect to save, e.g.:");
+        out.println("        --convert-config-xml-to-json=tika-config.xml > tika-config.json");
         out.println("");
-        out.println("    -x  or --xml           Output XHTML content (default)");
+        out.println("    -x  or --xml           Output XHTML content");
         out.println("    -h  or --html          Output HTML content");
         out.println("    -t  or --text          Output plain text content (body)");
+        out.println("    --md                   Output Markdown content (body) (default)");
         out.println("    -T  or --text-main     Output plain text content (main content only via boilerpipe handler)");
         out.println("    -A  or --text-all      Output all text content");
         out.println("    -m  or --metadata      Output only metadata");
@@ -543,27 +906,47 @@ public class TikaCLI {
         out.println("    -y  or --xmp           Output metadata in XMP");
         out.println("    -J  or --jsonRecursive Output metadata and content from all");
         out.println("                           embedded files (choose content type");
-        out.println("                           with -x, -h, -t or -m; default is -x)");
-        out.println("    -a  or --async         Run Tika in async mode; must specify details in a" + " tikaConfig file");
+        out.println("                           with -x, -h, -t or -m; default is --md)");
+        out.println("    -a  or --async         Run Tika in async mode: -a -c <tika-config.json> [-p <pluginsDir>]");
         out.println("    -l  or --language      Output only language");
         out.println("    -d  or --detect        Detect document type");
         out.println("           --digest=X      Include digest X (md2, md5, sha1,");
-        out.println("                               sha256, sha384, sha512");
-        out.println("    -eX or --encoding=X    Use output encoding X");
-        out.println("    -pX or --password=X    Use document password X");
+        out.println("                               sha256, sha384, sha512)");
+        out.println("    --encoding=X           Use output encoding X");
+        out.println("    --password=X           Use document password X");
         out.println("    -z  or --extract       Extract all attachements into current directory");
         out.println("    --extract-dir=<dir>    Specify target directory for -z");
+        out.println("    --maxEmbeddedDepth=X   Maximum depth for embedded document extraction");
+        out.println("    --maxEmbeddedCount=X   Maximum number of embedded documents to extract");
         out.println("    -r  or --pretty-print  For JSON, XML and XHTML outputs, adds newlines and");
         out.println("                           whitespace, for better readability");
         out.println();
+        out.println("Fork Mode (process isolation):");
+        out.println("    -f  or --fork          Run parsing in a forked JVM process for isolation");
+        out.println("                           Protects against parser crashes, OOM, and timeouts");
+        out.println("    --task-timeout=<ms>    Total per-file budget in milliseconds");
+        out.println("                           (default: " + TimeoutLimits.DEFAULT_TOTAL_TASK_TIMEOUT_MILLIS + ")");
+        out.println("    --progress-timeout=<ms> Stall detector: max time with no progress");
+        out.println("                           (default: " + TimeoutLimits.DEFAULT_PROGRESS_TIMEOUT_MILLIS + ")");
+        out.println("    --fork-jvm-args=<args> JVM args for forked process (comma-separated)");
+        out.println("                           e.g., --fork-jvm-args=-Xmx512m,-Dsome.prop=value");
+        out.println("    --fork-plugins-dir=<dir> Directory containing plugin zips");
+        out.println();
         out.println("    --list-parsers");
         out.println("         List the available document parsers");
+        out.println("    --list-parser-names");
+        out.println("         List parsers as tab-separated class-name<TAB>friendly-name");
+        out.println("         (friendly names are the kebab-case keys used in JSON config)");
         out.println("    --list-parser-details");
         out.println("         List the available document parsers and their supported mime types");
         out.println("    --list-parser-details-apt");
         out.println("         List the available document parsers and their supported mime types in apt format.");
+        out.println("    --list-parser-details-adoc");
+        out.println("         Same, in AsciiDoc; regenerates docs/modules/ROOT/partials/supported-formats.adoc");
         out.println("    --list-detectors");
         out.println("         List the available document detectors");
+        out.println("    --list-detector-names");
+        out.println("         List detectors as tab-separated class-name<TAB>friendly-name");
         out.println("    --list-met-models");
         out.println("         List the available metadata models, and their supported keys");
         out.println("    --list-supported-types");
@@ -592,33 +975,33 @@ public class TikaCLI {
         out.println("    a normal file explorer to the GUI window to extract");
         out.println("    text content and metadata from the files.");
         out.println();
-        out.println("- Batch mode");
+        out.println("- Tika Pipes mode");
         out.println();
-        out.println("    Simplest method.");
-        out.println("    Specify two directories as args with no other args:");
+        out.println("    For processing many documents from a directory, S3, GCS, Azure, JDBC, etc.");
+        out.println("    Simplest invocation is two directories as args with no other args:");
         out.println("         java -jar tika-app.jar <inputDirectory> <outputDirectory>");
         out.println();
-        out.println("Batch Options:");
-        out.println("    -i  or --inputDir          Input directory");
-        out.println("    -o  or --outputDir         Output directory");
-        out.println("    -numConsumers              Number of processing threads");
-        out.println("    -bc                        Batch config file");
-        out.println("    -maxRestarts               Maximum number of times the ");
-        out.println("                               watchdog process will restart the forked process.");
-        out.println("    -timeoutThresholdMillis    Number of milliseconds allowed to a parse");
-        out.println("                               before the process is terminated and restarted");
-        out.println("    -fileList                  List of files to process, with");
-        out.println("                               paths relative to the input directory");
-        out.println("    -includeFilePat            Regular expression to determine which");
-        out.println("                               files to process, e.g. \"(?i)\\.pdf\"");
-        out.println("    -excludeFilePat            Regular expression to determine which");
-        out.println("                               files to avoid processing, e.g. \"(?i)\\.pdf\"");
-        out.println("    -maxFileSizeBytes          Skip files longer than this value");
+        out.println("Tika Pipes Options:");
+        out.println("    -i, --inputDir=<dir>       Input directory");
+        out.println("    -o, --outputDir=<dir>      Output directory");
+        out.println("    -n, --numClients           Number of forked processes");
+        out.println("    --Xmx=<size>               -Xmx for the forked processes, e.g. --Xmx=1g");
+        out.println("    -T, --timeoutMillis        Timeout for each parse in milliseconds");
+        out.println("    -c, --config=<file>        Tika config file (--config=<file> also accepted)");
+        out.println("    -p, --pluginsDir           Plugins directory");
+        out.println("    --fileList                 File list (one path per line, relative to --inputDir or absolute)");
+        out.println("    --handler                  Handler type: t=text, h=html, x=xml, m=markdown, b=body, i=ignore (default: m)");
+        out.println("    --concatenate              Concatenate content from all embedded documents");
+        out.println("    --content-only             Output only extracted content (no JSON wrapper); implies --concatenate");
+        out.println("    --on-exists                Behavior when an output file exists: exception (default), replace, skip");
+        out.println("    -Z                         Recursively unpack all the attachments, too");
+        out.println("    --unpack-format=<format>   Output format: FRICTIONLESS (default) or REGULAR");
+        out.println("    --unpack-mode=<mode>       Output mode: DIRECTORY (default: loose files) or ZIPPED");
+        out.println("    --unpack-include-metadata  Metadata for every extracted file. A Frictionless package");
+        out.println("                               carries metadata.json by default; this adds per-file");
+        out.println("                               sidecars to REGULAR zip output");
         out.println();
-        out.println("    Control the type of output with -x, -h, -t and/or -J.");
         out.println();
-        out.println("    To modify forked process jvm args, prepend \"J\" as in:");
-        out.println("    -JXmx4g or -JDlog4j.configuration=file:log4j.xml.");
     }
 
     private void version() {
@@ -634,45 +1017,48 @@ public class TikaCLI {
         return false;
     }
 
-    private boolean testForBatch(String[] args) {
-        if (args.length == 2 && !args[0].startsWith("-") && !args[1].startsWith("-")) {
-            Path inputCand = Paths.get(args[0]);
-            Path outputCand = Paths.get(args[1]);
-            if (Files.isDirectory(inputCand) && !Files.isRegularFile(outputCand)) {
-                return true;
-            }
-        }
-
-        for (String s : args) {
-            if (s.equals("-inputDir") || s.equals("--inputDir") || s.equals("-i")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private void configure() throws TikaException, IOException, SAXException {
         if (configFilePath != null) {
-            config = new TikaConfig(new File(configFilePath));
+            tikaLoader = TikaLoader.load(Paths.get(configFilePath));
         } else {
             String warn = "As a convenience, TikaCLI has turned on several non-default features\n" +
-                    "as specified in tika-app/src/main/resources/tika-config-default-single-file.xml.\n" +
+                    "as specified in tika-app/src/main/resources/tika-config-default-single-file.json.\n" +
                     "See: TIKA-2374, TIKA-4017, TIKA-4354 and TIKA-4472).\n" +
                     "This is not the default behavior in Tika generally or in tika-server.";
             LOG.info(warn);
-            try (InputStream is = getClass().getResourceAsStream("/tika-config-default-single-file.xml")) {
-                config = new TikaConfig(is);
+            Path tempConfig = Files.createTempFile("tika-config-", ".json");
+            try {
+                try (InputStream is = getClass().getResourceAsStream("/tika-config-default-single-file.json")) {
+                    Files.copy(is, tempConfig, StandardCopyOption.REPLACE_EXISTING);
+                }
+                tikaLoader = TikaLoader.load(tempConfig);
+            } finally {
+                Files.deleteIfExists(tempConfig);
             }
         }
-        if (networkURI != null) {
-            parser = new NetworkParser(networkURI);
-        } else {
-            parser = new AutoDetectParser(config);
-            if (digester != null) {
-                parser = new DigestingParser(parser, digester, false);
-            }
+        parser = tikaLoader.loadAutoDetectParser();
+
+        // Load configs from tika-config.json and merge into existing context
+        // (preserves EmbeddedDocumentExtractor and other items set before configure())
+        ParseContext loadedContext = tikaLoader.loadParseContext();
+        context.copyFrom(loadedContext);
+
+        // Override DigesterFactory in ParseContext if configured via --digest= command line
+        if (digesterFactory != null) {
+            context.set(DigesterFactory.class, digesterFactory);
         }
-        detector = config.getDetector();
+        // Set EmbeddedLimits if any limits were specified via command line
+        if (maxEmbeddedDepth != EmbeddedLimits.UNLIMITED || maxEmbeddedCount != EmbeddedLimits.UNLIMITED) {
+            EmbeddedLimits limits = new EmbeddedLimits();
+            if (maxEmbeddedDepth != EmbeddedLimits.UNLIMITED) {
+                limits.setMaxDepth(maxEmbeddedDepth);
+            }
+            if (maxEmbeddedCount != EmbeddedLimits.UNLIMITED) {
+                limits.setMaxCount(maxEmbeddedCount);
+            }
+            context.set(EmbeddedLimits.class, limits);
+        }
+        detector = tikaLoader.loadDetectors();
         context.set(Parser.class, parser);
         context.set(PasswordProvider.class, new SimplePasswordProvider(password));
     }
@@ -769,6 +1155,60 @@ public class TikaCLI {
             for (Detector sd : subDetectors) {
                 displayDetector(sd, i + 2);
             }
+        }
+    }
+
+    private void displayParserNames() throws TikaException, IOException, SAXException {
+        configure();
+        Set<Class<?>> seen = new LinkedHashSet<>();
+        collectParserClasses(parser, seen);
+        printNames(seen, "parsers");
+    }
+
+    private void displayDetectorNames() throws TikaException, IOException, SAXException {
+        configure();
+        Set<Class<?>> seen = new LinkedHashSet<>();
+        collectDetectorClasses(detector, seen);
+        printNames(seen, "detectors");
+    }
+
+    private void collectParserClasses(Parser p, Set<Class<?>> out) {
+        if (p instanceof ParserDecorator) {
+            p = ((ParserDecorator) p).getWrappedParser();
+        }
+        if (p instanceof CompositeParser) {
+            for (Parser sub : ((CompositeParser) p).getParsers().values()) {
+                collectParserClasses(sub, out);
+            }
+        } else {
+            out.add(p.getClass());
+        }
+    }
+
+    private void collectDetectorClasses(Detector d, Set<Class<?>> out) {
+        if (d instanceof CompositeDetector) {
+            for (Detector sub : ((CompositeDetector) d).getDetectors()) {
+                collectDetectorClasses(sub, out);
+            }
+        } else {
+            out.add(d.getClass());
+        }
+    }
+
+    private void printNames(Set<Class<?>> classes, String indexFileName) throws TikaException {
+        // Look up friendly names via ComponentRegistry, which reads them from
+        // the META-INF/tika/<indexFileName>.idx files generated at compile
+        // time by the @TikaComponent annotation processor. (The annotation
+        // itself has CLASS retention, so reflection on the class can't see it
+        // at runtime — the .idx file is the authoritative source.)
+        ComponentRegistry registry = new ComponentRegistry(indexFileName, Thread.currentThread().getContextClassLoader());
+        // Sort by class name for stable output; tab-separated so downstream
+        // scripts can `cut -f2` to get the JSON-config names.
+        List<Class<?>> sorted = new ArrayList<>(classes);
+        sorted.sort(Comparator.comparing(Class::getName));
+        for (Class<?> cls : sorted) {
+            String fname = registry.getFriendlyName(cls);
+            System.out.println(cls.getName() + "\t" + (fname != null ? fname : "(not registered)"));
         }
     }
 
@@ -875,9 +1315,9 @@ public class TikaCLI {
         }
 
         // See how those compare to the Tika ones
-        TikaConfig config = TikaConfig.getDefaultConfig();
-        MimeTypes mimeTypes = config.getMimeRepository();
-        MediaTypeRegistry registry = config.getMediaTypeRegistry();
+        TikaLoader loader = TikaLoader.loadDefault();
+        MimeTypes mimeTypes = TikaLoader.getMimeTypes();
+        MediaTypeRegistry registry = loader.getMediaTypeRegistry();
         for (String mime : fileMimes) {
             try {
                 final MimeType type = mimeTypes.getRegisteredMimeType(mime);
@@ -957,41 +1397,28 @@ public class TikaCLI {
         }
     }
 
+    /** Swallows the document; {@link #output()} writes the metadata after the parse. */
     private static class NoDocumentMetHandler extends DefaultHandler {
 
         protected final Metadata metadata;
 
         protected PrintWriter writer;
 
-        private boolean metOutput;
-
         public NoDocumentMetHandler(Metadata metadata, PrintWriter writer) {
             this.metadata = metadata;
             this.writer = writer;
-            this.metOutput = false;
         }
 
-        @Override
-        public void endDocument() {
+        public void output() throws IOException {
             String[] names = metadata.names();
             Arrays.sort(names);
-            outputMetadata(names);
-            writer.flush();
-            this.metOutput = true;
-        }
-
-        public void outputMetadata(String[] names) {
             for (String name : names) {
                 for (String value : metadata.getValues(name)) {
                     writer.println(name + ": " + value);
                 }
             }
+            writer.flush();
         }
-
-        public boolean metOutput() {
-            return this.metOutput;
-        }
-
     }
 
     /**
@@ -1035,26 +1462,17 @@ public class TikaCLI {
     }
 
     private class OutputType {
-        public void process(InputStream input, OutputStream output, Metadata metadata) throws Exception {
-            Parser p = parser;
-            if (fork) {
-                p = new ForkParser(TikaCLI.class.getClassLoader(), p);
-            }
+        public void process(TikaInputStream tis, OutputStream output, Metadata metadata) throws Exception {
             ContentHandler handler = getContentHandler(output, metadata);
             try {
-                p.parse(input, handler, metadata, context);
-                // fix for TIKA-596: if a parser doesn't generate
-                // XHTML output, the lack of an output document prevents
-                // metadata from being output: this fixes that
-                if (handler instanceof NoDocumentMetHandler) {
-                    NoDocumentMetHandler metHandler = (NoDocumentMetHandler) handler;
-                    if (!metHandler.metOutput()) {
-                        metHandler.endDocument();
-                    }
-                }
+                parser.parse(tis, handler, metadata, context);
             } finally {
-                if (fork) {
-                    ((ForkParser) p).close();
+                // Metadata is written once parse() returns, never at endDocument: parsers
+                // set keys after their SAX document ends (the PDF totals in a finally block,
+                // tk:parsed-by-full-set), some never start a document (TIKA-596), and a
+                // failed parse still has metadata worth showing before the error.
+                if (handler instanceof NoDocumentMetHandler metHandler) {
+                    metHandler.output();
                 }
             }
         }
@@ -1065,129 +1483,18 @@ public class TikaCLI {
 
     }
 
-    private class FileEmbeddedDocumentExtractor implements EmbeddedDocumentExtractor {
 
-        private final EmbeddedStreamTranslator embeddedStreamTranslator = new DefaultEmbeddedStreamTranslator();
-        private int count = 0;
-
-        public boolean shouldParseEmbedded(Metadata metadata) {
-            return true;
-        }
-
-        @Override
-        public void parseEmbedded(TikaInputStream tis, ContentHandler contentHandler, Metadata metadata, boolean outputHtml) throws SAXException, IOException {
-
-            MediaType contentType = detector.detect(tis, metadata);
-
-            String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
-            Path outputFile = null;
-            if (name == null) {
-                name = "file_" + count++;
-            }
-            outputFile = getOutputFile(name, metadata, contentType);
-
-
-            Path parent = outputFile.getParent();
-            if (parent != null && ! Files.isDirectory(parent)) {
-                Files.createDirectories(parent);
-            }
-            System.out.println("Extracting '" + name + "' (" + contentType + ") to " + outputFile);
-
-            try (OutputStream os = Files.newOutputStream(outputFile)) {
-                if (embeddedStreamTranslator.shouldTranslate(tis, metadata)) {
-                    try (InputStream translated = embeddedStreamTranslator.translate(tis, metadata)) {
-                        IOUtils.copy(translated, os);
-                    }
-                } else {
-                    IOUtils.copy(tis, os);
-                }
-            } catch (Exception e) {
-                //
-                // being a CLI program messages should go to the stderr too
-                //
-                String msg = String.format(Locale.ROOT, "Ignoring unexpected exception trying to save embedded file %s (%s)", name, e.getMessage());
-                LOG.warn(msg, e);
-            }
-        }
-
-        private Path getOutputFile(String name, Metadata metadata, MediaType contentType) throws IOException {
-            String ext = getExtension(contentType);
-            if (name.indexOf('.') == -1 && contentType != null) {
-                name += ext;
-            }
-
-            String relID = metadata.get(TikaCoreProperties.EMBEDDED_RELATIONSHIP_ID);
-            if (relID != null && !name.startsWith(relID)) {
-                name = relID + "_" + name;
-            }
-            //defensively do this so that we don't get an exception
-            //from FilenameUtils.normalize
-            name = name.replaceAll("\u0000", " ");
-            String normalizedName = FilenameUtils.normalize(name);
-
-            if (normalizedName == null) {
-                normalizedName = FilenameUtils.getName(name);
-            }
-
-            if (normalizedName == null) {
-                normalizedName = "file" + count++ + ext;
-            }
-            //strip off initial C:/ or ~/ or /
-            int prefixLength = FilenameUtils.getPrefixLength(normalizedName);
-            if (prefixLength > -1) {
-                normalizedName = normalizedName.substring(prefixLength);
-            }
-            Path outputFile = extractDir.resolve(normalizedName);
-            //if file already exists, prepend uuid
-            if (Files.exists(outputFile)) {
-                String fileName = FilenameUtils.getName(normalizedName);
-                outputFile = extractDir.resolve( UUID.randomUUID() + "-" + fileName);
-            }
-            if (! outputFile.toAbsolutePath().normalize().startsWith(extractDir.toAbsolutePath().normalize())) {
-                throw new IOException("Path traversal?!: " + outputFile.toAbsolutePath());
-            }
-            return outputFile;
-        }
-
-        private String getExtension(MediaType contentType) {
-            try {
-                String ext = config
-                        .getMimeRepository()
-                        .forName(contentType.toString())
-                        .getExtension();
-                if (ext == null) {
-                    return ".bin";
-                } else {
-                    return ext;
-                }
-            } catch (MimeTypeException e) {
-                LOG.info("bad mime type?", e);
-            }
-            return ".bin";
-
-        }
-    }
-
-    private class NoDocumentJSONMetHandler extends DefaultHandler {
-
-        protected final Metadata metadata;
-
-        protected PrintWriter writer;
+    private class NoDocumentJSONMetHandler extends NoDocumentMetHandler {
 
         public NoDocumentJSONMetHandler(Metadata metadata, PrintWriter writer) {
-            this.metadata = metadata;
-            this.writer = writer;
+            super(metadata, writer);
         }
 
         @Override
-        public void endDocument() throws SAXException {
-            try {
-                JsonMetadata.setPrettyPrinting(prettyPrint);
-                JsonMetadata.toJson(metadata, writer);
-                writer.flush();
-            } catch (IOException e) {
-                throw new SAXException(e);
-            }
+        public void output() throws IOException {
+            JsonMetadata.setPrettyPrinting(prettyPrint);
+            JsonMetadata.toJson(metadata, writer);
+            writer.flush();
         }
     }
 }

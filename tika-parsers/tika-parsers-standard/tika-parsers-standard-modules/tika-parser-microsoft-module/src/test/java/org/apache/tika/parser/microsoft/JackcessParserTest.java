@@ -14,21 +14,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.InputStream;
 import java.util.List;
 
-import org.apache.commons.io.IOUtils;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledIfSystemProperty;
 
 import org.apache.tika.TikaTest;
 import org.apache.tika.exception.EncryptedDocumentException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.OfficeOpenXMLExtended;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -47,18 +46,13 @@ public class JackcessParserTest extends TikaTest {
 
         for (String fName : new String[]{"testAccess2.accdb", "testAccess2_2000.mdb",
                 "testAccess2_2002-2003.mdb"}) {
-            InputStream is = null;
             RecursiveParserWrapperHandler handler = new RecursiveParserWrapperHandler(
                     new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.XML,
                             -1));
-            try {
-                is = this.getResourceAsStream("/test-documents/" + fName);
-
+            try (TikaInputStream tis = this.getResourceAsStream("/test-documents/" + fName)) {
                 Metadata meta = new Metadata();
                 ParseContext c = new ParseContext();
-                w.parse(is, handler, meta, c);
-            } finally {
-                IOUtils.closeQuietly(is);
+                w.parse(tis, handler, meta, c);
             }
             List<Metadata> list = handler.getMetadataList();
             assertEquals(4, list.size());
@@ -86,14 +80,16 @@ public class JackcessParserTest extends TikaTest {
         }
     }
 
+    // TODO TIKA-4924: jackcess-encrypt uppercases cipher params in the default locale (tr/az dotless i)
+    @DisabledIfSystemProperty(named = "tika.test.locale", matches = "(tr|az)(-.*)?")
     @Test
     public void testPassword() throws Exception {
         ParseContext c = new ParseContext();
         c.set(PasswordProvider.class, metadata -> "tika");
         String content;
-        try (InputStream is = this
+        try (TikaInputStream tis = this
                 .getResourceAsStream("/test-documents/testAccess2_encrypted.accdb")) {
-            content = getText(is, AUTO_DETECT_PARSER, c);
+            content = getText(tis, AUTO_DETECT_PARSER, c);
         }
         assertContains("red and brown", content);
 
@@ -101,9 +97,9 @@ public class JackcessParserTest extends TikaTest {
         c.set(PasswordProvider.class, metadata -> "WRONG");
 
         boolean ex = false;
-        try (InputStream is = this
+        try (TikaInputStream tis = this
                 .getResourceAsStream("/test-documents/testAccess2_encrypted.accdb")) {
-            getText(is, AUTO_DETECT_PARSER, c);
+            getText(tis, AUTO_DETECT_PARSER, c);
         } catch (EncryptedDocumentException e) {
             ex = true;
         }
@@ -113,9 +109,9 @@ public class JackcessParserTest extends TikaTest {
         c.set(PasswordProvider.class, metadata -> null);
 
         ex = false;
-        try (InputStream is = this
+        try (TikaInputStream tis = this
                 .getResourceAsStream("/test-documents/testAccess2_encrypted.accdb")) {
-            getText(is, AUTO_DETECT_PARSER, c);
+            getText(tis, AUTO_DETECT_PARSER, c);
         } catch (EncryptedDocumentException e) {
             ex = true;
         }
@@ -125,9 +121,9 @@ public class JackcessParserTest extends TikaTest {
         //now try missing password provider
         c = new ParseContext();
         ex = false;
-        try (InputStream is = this
+        try (TikaInputStream tis = this
                 .getResourceAsStream("/test-documents/testAccess2_encrypted.accdb")) {
-            getText(is, AUTO_DETECT_PARSER, c);
+            getText(tis, AUTO_DETECT_PARSER, c);
         } catch (EncryptedDocumentException e) {
             ex = true;
         }
@@ -138,8 +134,8 @@ public class JackcessParserTest extends TikaTest {
         c = new ParseContext();
         c.set(PasswordProvider.class, metadata -> "tika");
         ex = false;
-        try (InputStream is = this.getResourceAsStream("/test-documents/testAccess2.accdb")) {
-            content = getText(is, AUTO_DETECT_PARSER, c);
+        try (TikaInputStream tis = this.getResourceAsStream("/test-documents/testAccess2.accdb")) {
+            content = getText(tis, AUTO_DETECT_PARSER, c);
         } catch (EncryptedDocumentException e) {
             ex = true;
         }

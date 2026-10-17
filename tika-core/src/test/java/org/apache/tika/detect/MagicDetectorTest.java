@@ -20,30 +20,39 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_16BE;
 import static java.nio.charset.StandardCharsets.UTF_16LE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.io.IOUtils;
 import org.junit.jupiter.api.Test;
 
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
+import org.apache.tika.parser.ParseContext;
 
 /**
  * Test cases for the {@link MagicDetector} class.
  */
-public class MagicDetectorTest {
+public class MagicDetectorTest extends TikaTest {
 
     @Test
     public void testDetectNull() throws Exception {
         MediaType html = new MediaType("text", "html");
         Detector detector = new MagicDetector(html, "<html".getBytes(US_ASCII));
-        assertEquals(MediaType.OCTET_STREAM, detector.detect(null, new Metadata()));
+        assertEquals(MediaType.OCTET_STREAM, detector.detect(null, new Metadata(), new ParseContext()));
     }
 
     @Test
@@ -165,21 +174,22 @@ public class MagicDetectorTest {
         Detector detector = new MagicDetector(testMT, data, null, false, 0, 0);
         // Deliberately prevent InputStream.read(...) from reading the entire
         // buffer in one go
-        InputStream stream = new RestrictiveInputStream(data);
-        assertEquals(testMT, detector.detect(stream, new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get(new RestrictiveInputStream(data))) {
+            assertEquals(testMT, detector.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     @Test
     public void testDetectApplicationEnviHdr() throws Exception {
-        InputStream iStream = MagicDetectorTest.class
-                .getResourceAsStream("/test-documents/ang20150420t182050_corr_v1e_img.hdr");
+        InputStream iStream = getResourceAsStream("/test-documents/ang20150420t182050_corr_v1e_img.hdr");
         byte[] data = IOUtils.toByteArray(iStream);
         MediaType testMT = new MediaType("application", "envi.hdr");
         Detector detector = new MagicDetector(testMT, data, null, false, 0, 0);
         // Deliberately prevent InputStream.read(...) from reading the entire
         // buffer in one go
-        InputStream stream = new RestrictiveInputStream(data);
-        assertEquals(testMT, detector.detect(stream, new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get(new RestrictiveInputStream(data))) {
+            assertEquals(testMT, detector.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     @Test
@@ -205,6 +215,100 @@ public class MagicDetectorTest {
         assertDetect(detector, testMT, data.getBytes(US_ASCII));
     }
 
+    /**
+     * The byte[] path is what MagicMatch.eval uses for every magic in
+     * tika-mimetypes.xml, but it was only ever exercised indirectly. Cover the
+     * regex branch of it directly.
+     */
+    @Test
+    public void testMatchesByteArrayRegEx() {
+        MediaType pdf = new MediaType("application", "pdf");
+        MagicDetector detector =
+                new MagicDetector(pdf, "(?s)\\A.{0,144}%PDF-".getBytes(US_ASCII), null, true, 0, 0);
+
+        assertTrue(detector.matches("%PDF-1.0".getBytes(US_ASCII)));
+        assertTrue(detector.matches(("0        10        20        30        40        50        6" +
+                "0        70        80        90        100       110       1" +
+                "20       130       140" + "34%PDF-1.0").getBytes(US_ASCII)));
+        assertFalse(detector.matches(("0        10        20        30        40        50        6" +
+                "0        70        80        90        100       110       1" +
+                "20       130       140" + "345%PDF-1.0").getBytes(US_ASCII)));
+        assertFalse(detector.matches("".getBytes(US_ASCII)));
+        assertFalse(detector.matches(null));
+
+        // an offset range, mirroring the wider windows used in tika-mimetypes.xml
+        MediaType xhtml = new MediaType("application", "xhtml+xml");
+        String pattern = "(?s)\\x3chtml xmlns=\"http://www\\.w3\\.org/1999/xhtml" +
+                "\".*\\x3ctitle\\x3e.*\\x3c/title\\x3e";
+        MagicDetector ranged =
+                new MagicDetector(xhtml, pattern.getBytes(US_ASCII), null, true, 0, 8192);
+        assertTrue(ranged.matches(("<html xmlns=\"http://www.w3.org/1999/xhtml\">" +
+                "<head><title>XHTML test document</title></head>").getBytes(US_ASCII)));
+        assertFalse(ranged.matches("<html><head><title>no namespace</title></head>"
+                .getBytes(US_ASCII)));
+    }
+
+    /**
+     * A MagicDetector is built once and reused for the life of the process, so
+     * repeated calls must be independent of each other. Guards the compiled
+     * Pattern against per-call state leaking in.
+     */
+    @Test
+    public void testRegExDetectorRepeatedCallsStable() throws Exception {
+        MediaType html = new MediaType("text", "html");
+        String pattern = "(?s)\\A.{0,1024}\\x3c\\!(?:DOCTYPE|doctype) (?:HTML|html) ";
+        MagicDetector detector =
+                new MagicDetector(html, pattern.getBytes(US_ASCII), null, true, 0, 0);
+
+        byte[] match = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\">".getBytes(US_ASCII);
+        byte[] noMatch = "<html><head><title>plain</title></head>".getBytes(US_ASCII);
+
+        for (int i = 0; i < 100; i++) {
+            assertTrue(detector.matches(match), "matches() changed on iteration " + i);
+            assertFalse(detector.matches(noMatch), "matches() changed on iteration " + i);
+            assertDetect(detector, html, match);
+            assertDetect(detector, MediaType.OCTET_STREAM, noMatch);
+        }
+    }
+
+    /**
+     * MimeTypes shares one MagicDetector instance per magic clause across every
+     * caller, so the regex path has to be safe to use concurrently.
+     */
+    @Test
+    public void testRegExDetectorConcurrent() throws Exception {
+        MediaType pdf = new MediaType("application", "pdf");
+        MagicDetector detector =
+                new MagicDetector(pdf, "(?s)\\A.{0,144}%PDF-".getBytes(US_ASCII), null, true, 0, 0);
+
+        byte[] match = "%PDF-1.4\nsome trailing content".getBytes(US_ASCII);
+        byte[] noMatch = "not a pdf at all".getBytes(US_ASCII);
+
+        int threads = 8;
+        int iterations = 200;
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                futures.add(executor.submit(() -> {
+                    for (int i = 0; i < iterations; i++) {
+                        assertTrue(detector.matches(match));
+                        assertFalse(detector.matches(noMatch));
+                        assertEquals(pdf, detector.detect(TikaInputStream.get(match), new Metadata(),
+                                new ParseContext()));
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> future : futures) {
+                // an assertion failure on a worker surfaces here as an ExecutionException
+                future.get(60, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     private void assertDetect(Detector detector, MediaType type, String data) {
         byte[] bytes = data.getBytes(US_ASCII);
         assertDetect(detector, type, bytes);
@@ -212,14 +316,14 @@ public class MagicDetectorTest {
 
     private void assertDetect(Detector detector, MediaType type, byte[] bytes) {
         try {
-            InputStream stream = new ByteArrayInputStream(bytes);
-            assertEquals(type, detector.detect(stream, new Metadata()));
+            TikaInputStream tis = TikaInputStream.get(bytes);
+            assertEquals(type, detector.detect(tis, new Metadata(), new ParseContext()));
 
             // Test that the stream has been reset
             for (byte aByte : bytes) {
-                assertEquals(aByte, (byte) stream.read());
+                assertEquals(aByte, (byte) tis.read());
             }
-            assertEquals(-1, stream.read());
+            assertEquals(-1, tis.read());
         } catch (IOException e) {
             fail("Unexpected exception from MagicDetector");
         }
@@ -249,7 +353,7 @@ public class MagicDetectorTest {
 
     @Test
     public void testBZ2Detection() throws Exception {
-        Detector detector = new TikaConfig().getDetector();
+        Detector detector = new DefaultDetector();
         for (String bz2 : new String[]{"bzip2-8-file.txt.bz2",
                 "empty-file.txt.bz2", "lbzip2-8-file.txt.bz2",
                 "small-file.txt.bz2", "test-file-1.csv.bz2",
@@ -259,10 +363,8 @@ public class MagicDetectorTest {
     }
 
     private String detect(Detector detector, String bz2Name) throws IOException  {
-        try (InputStream is = new BufferedInputStream(
-                this.getClass().getResourceAsStream(
-                        "/test-documents/bz2/" + bz2Name))) {
-            return detector.detect(is, new Metadata()).toString();
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/bz2/" + bz2Name)) {
+            return detector.detect(tis, new Metadata(), new ParseContext()).toString();
         }
     }
 }

@@ -17,17 +17,18 @@
 package org.apache.tika.parser.xml;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -41,6 +42,7 @@ import org.apache.tika.utils.XMLReaderUtils;
 /**
  * XML parser.
  */
+@TikaComponent(spi = false)
 public class XMLParser implements Parser {
 
     /**
@@ -56,19 +58,20 @@ public class XMLParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        if (metadata.get(Metadata.CONTENT_TYPE) == null) {
-            metadata.set(Metadata.CONTENT_TYPE, "application/xml");
+        if (metadata.get(HttpHeaders.CONTENT_TYPE) == null) {
+            metadata.set(HttpHeaders.CONTENT_TYPE, "application/xml");
         }
 
-        final XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        final XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         xhtml.startElement("p");
 
         TaggedContentHandler tagged = new TaggedContentHandler(handler);
+        tis.setCloseShield();
         try {
-            XMLReaderUtils.parseSAX(CloseShieldInputStream.wrap(stream),
+            XMLReaderUtils.parseSAX(tis,
                             new EmbeddedContentHandler(
                                     getContentHandler(tagged, metadata, context)),
                     context);
@@ -76,6 +79,7 @@ public class XMLParser implements Parser {
             tagged.throwIfCauseOf(e);
             throw new TikaException("XML parse error", e);
         } finally {
+            tis.removeCloseShield();
             xhtml.endElement("p");
             xhtml.endDocument();
         }

@@ -1,0 +1,739 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Tika Server
+:toc:
+:toclevels: 3
+
+`tika-server` exposes Tika over HTTP, standalone or in a container.
+
+The parsing endpoints — `/tika`, `/rmeta`, `/unpack`, `/meta`, `/detect` — do their work in
+forked JVMs (*forks*) via Tika Pipes, so a parser crash or OOM cannot take down the
+request-handling process. That isolation is not optional: it is how these endpoints work, and
+it requires a Pipes configuration. Upgrading from 3.x? See
+xref:migration-to-4x/migrating-tika-server-4x.adoc[Migrating Tika Server to 4.x] for the full
+breaking-change list.
+
+[IMPORTANT]
+====
+Unlike `/pipes` and `/async`, which refuse to start without `allowPipes=true`, the parsing
+endpoints are *on by default*. PUT a document to `/tika` on a stock `tika-server` and a real
+forked JVM does the work.
+
+So `pipes.numClients` sizes two things at once: how many requests those endpoints serve
+concurrently, and how many forked JVMs run. Undersize it for your request volume and callers wait,
+then get `429`s. Oversize it for your host's core count and the forks starve each other of CPU.
+Neither shows up as an error — both show up as "the server got slower". Read
+<<_endpoints_and_forked_process_groups,Endpoints and Forked-Process Groups>> and
+xref:pipes/cpu-sizing.adoc[Forked-JVM CPU and Heap Sizing] before deploying; the `numClients` in
+example configs is not safe boilerplate.
+====
+
+== Backpressure: the server can tell you it is busy
+
+A saturated `tika-server` says so. When every fork in a pool is in use and none frees up within
+`pipes.maxWaitForClientMillis`, the request comes back as `429 Too Many Requests` with a
+`Retry-After` header and `status: CLIENT_UNAVAILABLE_WITHIN_MS` — deliberately distinct from the
+`503` you get when a fork actually crashed, OOM'd or timed out.
+
+That distinction is worth building on. A client can tell "the server is busy, come back in a
+moment" apart from "this document broke a fork" and act accordingly: back off and retry the
+`429`, quarantine or dead-letter the `503`. Load balancers can shed load, queue consumers can slow
+their fetch rate, and autoscalers have a signal to scale on — none of which is possible against a
+server that can only get slower or fail blind.
+
+The same signal is available as metrics -- busy workers, `429` rate, worker restarts by reason --
+when a metrics port is set; see xref:using-tika/server/monitoring.adoc[Monitoring with Prometheus].
+
+The cost is real and lands on you: backpressure only reports the capacity you configured.
+`numClients` is now an operational obligation, sized against both your request volume and your
+host's core count, as the note above says — undersized shows up as `429`s under load that should
+have been served, oversized quietly starves the forks of CPU instead. Size it deliberately with
+xref:pipes/cpu-sizing.adoc[Forked-JVM CPU and Heap Sizing], then treat a `429` rate as the capacity metric
+it is.
+
+[#_security]
+== Security
+
+IMPORTANT: The primary rule is *trusted callers only*. `tika-server` is not a security boundary:
+it performs no authentication or authorization, and parsing untrusted documents is inherently
+risky. Only expose it to trusted callers on a trusted network — never directly to untrusted users
+or the public internet — and put your own authentication, authorization, and network controls in
+front of it.
+
+`allowPipes` and `allowPerRequestConfig` (both off by default) are *defense in depth, not security
+boundaries*: they reduce what a caller can reach, but they do **not** make it safe to expose the
+server to untrusted callers. tika-grpc is even more exposed by default. See
+xref:security.adoc[Security] for the shared trust model and
+xref:using-tika/grpc/index.adoc[Tika gRPC] for the gRPC specifics.
+
+=== `allowPerRequestConfig` — the `/config` endpoints
+
+`/tika/config`, `/tika/config/{text,html,xml,md,json}`, `/rmeta/config`,
+`/rmeta/config/{handlerType}` and `/meta/config` accept
+a caller-supplied parser configuration as a multipart `config` part. They do not reveal the
+server's own config, but a caller-supplied one can enable dangerous operations such as pointing
+parsers at attacker-chosen resources (see
+https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2015-3271[CVE-2015-3271]). They are disabled by
+default; a request to one is rejected with `403`.
+
+There is no CLI flag — set `allowPerRequestConfig` in the `server` section:
+
+[source,json]
+----
+{
+  "server": {
+    "allowPerRequestConfig": true
+  }
+}
+----
+
+WARNING: Enable this only behind network controls (firewalls, private subnets), a reverse proxy,
+or xref:using-tika/server/tls.adoc[2-way TLS authentication]. Per-request configuration lets
+callers change how documents are parsed, widening what anyone who can reach the server can do.
+
+=== Presets — named configuration without `/config`
+
+A *preset* is a named, vetted parse-context fragment: parser and component configurations keyed
+by friendly name, defined once in the server config (or shipped with Tika) and selected whole by
+name. Callers apply one by inserting `preset/{name}` directly after the resource root:
+`/tika/preset/{name}[/text|/html|/xml|/md|/json[/{handlerType}]]`,
+`/rmeta/preset/{name}[/{handlerType}]`, `/unpack/preset/{name}[/all]`.
+
+[source,bash]
+----
+curl -T document.pdf http://localhost:9998/tika/preset/my-preset/text
+curl -T document.pdf http://localhost:9998/rmeta/preset/my-preset/text
+curl -T document.pdf http://localhost:9998/unpack/preset/my-preset
+----
+
+Nothing is active unless the top-level `presets` key names it. `true` activates a preset from
+the classpath *catalog* (definitions shipped with Tika, so their content tracks the Tika
+version); an object defines a preset in place, replacing any same-named catalog definition
+wholesale; `false`/`null` is an explicit no-op. Catalog jars can never activate themselves —
+every active preset is a visible line in the operator's config, and `true` naming nothing in
+the catalog fails startup:
+
+[source,json]
+----
+{
+  "presets": {
+    "some-catalog-preset": true,
+    "no-ocr": { "pages": { "text": "EXTRACT" } },
+    "no-enrichment": { "text-recognizers": { "enabled": false }, "inference": { "enabled": false } }
+  }
+}
+----
+
+Presets are deliberately narrow: a request selects exactly one, the preset routes take no
+`config` part, and a preset never combines with request-supplied configuration — a variant is
+another preset. Because preset content is operator- or Tika-vetted, the preset routes do *not*
+require `allowPerRequestConfig`, and the `preset/{name}` path segment gives network controls an
+addressable surface — a reverse proxy can allow `/rmeta/preset/` while blocking `/rmeta/config`
+entirely. An unknown preset name answers `404`. Names are letters, digits, `.`, `_`, `-`
+(max 100 chars) and may not start with `config` (that path fragment gates the `/config`
+endpoints).
+
+Only the preset's *name* travels with a request: the forked parse worker resolves the content
+from its own copy of the server config, with the same trust as the config's own
+`parse-context` block. A preset can therefore bind components per-request `/config` input may
+not (detectors, embedded-document extraction, exception reporting, ...) and raise timeout
+limits above the per-request clamp. Every active preset resolves at startup, so a bad preset
+fails the server, not its first request.
+
+WARNING: An active preset is a public route: anyone who can reach the server can call it, and
+it runs at config trust — it can bind components `/config` cannot and raise timeout limits
+above the per-request clamp. Vet a preset as you would `allowPerRequestConfig`, scoped to what
+the preset turns on. Tika's catalog presets are kept bounded (page and render caps, no OCR
+unless the preset is about OCR, no timeout raises); hold your own to the same bar. Startup
+logs one line per active preset naming the components it configures.
+
+==== The thumbnail catalog presets
+
+Tika ships two catalog presets in `tika-pipes-core`. They are not active out of the box: the
+operator names them in the server's `tika-config.json`, and a server without that line answers
+`404` on their routes.
+
+[source,json]
+----
+{ "presets": { "thumbnail": true, "render-thumbnail": true } }
+----
+
+Both render the same two things the same way — the first page of a top-level PDF and the EMF/WMF
+thumbnail of a top-level Office document (that metafile only, not the document's pictures), in
+colour, fitted into 256 x 256 pixels (one xref:configuration/pages.adoc[`pages`] block, `emit`
+with a box and `maxDepth`) — so an image found through one is the image the other returns,
+dimensions included. Attachments are not rendered: the selection rule below would refuse their
+renders, so the presets do not make them. Both name the standard parsers, so they need
+`tika-parsers-standard-package` on the classpath.
+
+`/unpack/preset/thumbnail` — "just give me the thumbnail". The zip holds at most one raster
+image per request and nothing else: the stored thumbnail (Office docProps, audio cover art,
+raw camera previews, epub, iWork), the rasterized EMF/WMF thumbnail, or the PDF page; `204`
+when the document has none. An image file is its own thumbnail: it has no embedded documents,
+so it answers `204` too. Text is read from the first PDF page only, no OCR or inference runs,
+and embedded documents are parsed two levels deep at most, so the parse is cheap.
+
+`/rmeta/preset/render-thumbnail` — "give me everything, thumbnail included". A full parse
+plus the two renders above, so an index gets the thumbnail's type and dimensions from the same
+request as the text. Nothing is selected for the client; it applies the rule below. The preset
+is a `pages` block plus the metafile parsers' overlays, and they merge field by field with what
+the config's `parsers` block sets for `pdf-parser`, `emf-parser` and `wmf-parser`; the `pages`
+entry in the config's `parse-context` block is replaced by the preset's, as with any parse-context
+layer, so keep server-wide page settings a preset must not lose under `parsers`.
+
+The selection rule, for a client that reads `/rmeta` and wants the answer `thumbnail` gives:
+take the first embedded document with an `image/*` `Content-Type` other than EMF, WMF or SVG
+that is a `tk:embedded-resource-type` of `THUMBNAIL` at `tk:embedded-depth` 1, a `THUMBNAIL` at
+depth 2 carrying `tk:rendering:rendered-by` (the rendering of a vector thumbnail), or a
+`RENDERING` at depth 1 (a PDF page). The thumbnail of a document inside an archive is that
+document's, not the archive's. Plain `/rmeta` lists stored thumbnails already; the PDF page and
+the EMF/WMF rendering exist only when a request turns rendering on, which is what
+`render-thumbnail` does.
+
+Output format on the preset routes: an explicit format segment (`/tika/preset/{name}/text`)
+always wins; without one, a `ContentHandlerFactory` the preset binds decides, then the
+config's, then the endpoint default (Markdown).
+
+Output format: name the handler once. A format segment sets it -- `/tika/config/xml`,
+`/rmeta/config/xml`, and `/unpack/all/{handlerType}` (or `/unpack/all/config/{handlerType}`
+with a config part), which selects how `tk:content` is rendered in the metadata `/all` adds
+(`/unpack/all/ignore` for none). Plain `/unpack` takes no segment: the `metadata.json` a
+Frictionless package carries there uses the config's handler, or the default. With no
+segment, a `content-handler-factory` in the
+`config` part does. Doing both is a `400`, whether or not the
+two agree -- on `/tika` the segment also fixes the route's `Content-Type`, so silently
+preferring one would let the response lie about its own body.
+
+On the batch surfaces, a `FetchEmitTuple` submitted to `/pipes` or `/async` may carry a
+top-level `"preset": "name"` field, resolved the same way beneath the tuple's own
+`parseContext`; an unknown name there answers the `PRESET_NOT_FOUND` status (HTTP `400`).
+
+=== `allowPipes` — the `/pipes` and `/async` endpoints
+
+`/pipes` and `/async` drive process-isolated batch parsing through your configured fetchers and
+emitters, so whoever can reach them gains the read access of your fetchers and the write access
+of your emitters (again
+https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2015-3271[CVE-2015-3271]). Listing them under
+`endpoints` is not enough — without `allowPipes` the server refuses to start, deliberately making
+this an explicit choice:
+
+[source,json]
+----
+{
+  "server": {
+    "allowPipes": true,
+    "endpoints": ["tika", "rmeta", "pipes", "async", "status"]
+  }
+}
+----
+
+NOTE: `/status` exposes only aggregate counters (active task count, files processed, time since
+last parse) and is gated by neither flag. Enable it by listing `status` under `endpoints`.
+
+==== Calling `/pipes` and `/async`
+
+`/pipes` takes a single `FetchEmitTuple` and answers when the parse finishes:
+
+[source,bash]
+----
+curl -X POST http://localhost:9998/pipes -H "Content-Type: application/json" -d '{
+  "id": "doc-1",
+  "fetcher": "my-fetcher",
+  "fetchKey": "reports/q3.pdf",
+  "emitter": "my-emitter",
+  "emitKey": "q3"
+}'
+----
+
+The body is `{"status":<RESULT_STATUS>,"message":...}` and the HTTP status carries the outcome,
+using the same mapping as `/tika` and `/rmeta`.
+
+`/async` takes a batch and answers as soon as it is queued:
+
+[source,bash]
+----
+curl -X POST http://localhost:9998/async -H "Content-Type: application/json" \
+  -d '{"tuples":[{"id":"1","fetcher":"my-fetcher","fetchKey":"a.pdf","emitter":"my-emitter","emitKey":"a"}]}'
+----
+
+----
+{"status":"ok","added":1}
+----
+
+A tuple's fields are `id`, `fetcher`, `fetchKey`, `emitter`, `emitKey`, and optionally
+`fetchRangeStart`, `fetchRangeEnd`, `metadata`, `parse-context` and `onParseException`. Any other
+field is a `400` — there is no silent tolerance for a typo. There is no field for content:
+`inlineBytes` draws a tailored `400`, because inline content is
+xref:pipes/fetchers.adoc#reserved-ids[how the server feeds its own workers], not something a
+tuple can carry. To parse content you already hold, PUT it to `/tika` or `/rmeta`, which inline
+it for you. The `{"tuples":[...]}` envelope is
+required on `/async`; a bare array is rejected.
+
+=== Best practices
+
+* Keep the `/config` endpoints disabled in production (the default).
+* Restrict access with firewall rules or a private subnet.
+* Consider TLS — see xref:using-tika/server/tls.adoc[TLS Configuration].
+* Run with minimal privileges; do not run as root.
+* Monitor logs for unusual access patterns.
+
+== Basic Usage
+
+Download `tika-server-standard-X.Y.Z.zip` from https://tika.apache.org/download.html[the Tika
+downloads page] and run from inside the unzipped directory. The bare
+jar published to Maven Central is a thin launcher whose manifest `Class-Path` points at `lib/`;
+running it on its own fails with `NoClassDefFoundError`. The zip has no top-level directory, so
+unzip it into one:
+
+[source,bash]
+----
+unzip -d tika-server-standard-X.Y.Z tika-server-standard-X.Y.Z.zip
+cd tika-server-standard-X.Y.Z
+java -jar tika-server-standard-X.Y.Z.jar
+----
+
+The server starts on `localhost:9998` by default.
+
+=== Command Line Options
+
+[cols="1,3"]
+|===
+|Option |Description
+
+|`-h <host>`, `--host <host>`
+|Hostname to bind to. Default `localhost`. Use `*` to bind to all interfaces.
+
+|`-p <port>`, `--port <port>`
+|Listen port. Default `9998`.
+
+|`-c <file>`, `--config <file>`
+|Path to `tika-config.json`. See <<_configuration,Configuration>>.
+
+|`-i <id>`, `--id <id>`
+|Server ID, written to the startup log. Defaults to a random UUID.
+
+|`--metricsPort <port>`
+|Enable Prometheus metrics on this port. See
+xref:using-tika/server/monitoring.adoc[Monitoring with Prometheus].
+
+|`-?`, `--help`
+|Print the usage message.
+|===
+
+NOTE: `-h`, `-p`, `-i` and `--metricsPort` override the JSON config. Everything else — `allowPipes`,
+`allowPerRequestConfig`, CORS, TLS, timeouts — is JSON-only.
+
+== Endpoints
+
+For the canonical endpoint inventory, including the PUT vs POST split and the multipart-config
+pattern, see
+xref:migration-to-4x/migrating-tika-server-4x.adoc#_new_tika_endpoint_structure[New `/tika` Endpoint Structure]
+in the migration guide. The most-used endpoints are summarized below.
+
+=== Content Extraction (`/tika`)
+
+Simple PUT — the entire request body is the document, no metadata:
+
+[source,bash]
+----
+curl -T document.pdf http://localhost:9998/tika       # default: raw Markdown
+curl -T document.pdf http://localhost:9998/tika/text
+curl -T document.docx http://localhost:9998/tika/html
+curl -T document.docx http://localhost:9998/tika/md
+curl -T document.pdf http://localhost:9998/tika/json
+----
+
+POST with multipart for custom per-request configuration:
+
+[source,bash]
+----
+curl -X POST http://localhost:9998/tika/config/json \
+  -F "file=@document.pdf" \
+  -F "config={\"pages\":{\"text\":\"EXTRACT\"}};type=application/json"
+----
+
+Valid handler paths under `/tika/`: `text`, `html`, `xml`, `md`, `json` (bare `/tika` returns
+Markdown). For the JSON variant, nest a handler — `/tika/json/text`, `/tika/json/html`, ... — to
+choose the content-field format inside the JSON envelope; that nested handler accepts the full
+set (`text`, `txt`, `html`, `xml`, `body`, `markdown`, `md`, `ignore`).
+
+=== Recursive Metadata (`/rmeta`)
+
+Returns metadata for the container document and all embedded documents as a JSON array of
+metadata objects. The handler controls the content field of each entry:
+
+[source,bash]
+----
+curl -T document.pdf http://localhost:9998/rmeta            # default: markdown
+curl -T document.pdf http://localhost:9998/rmeta/text
+curl -T document.pdf http://localhost:9998/rmeta/html
+curl -T document.pdf http://localhost:9998/rmeta/xml
+curl -T document.docx http://localhost:9998/rmeta/markdown  # or /md
+curl -T document.pdf http://localhost:9998/rmeta/ignore     # metadata only
+----
+
+POST with multipart for per-request configuration; the handler goes in the path, not the
+`config` part:
+
+[source,bash]
+----
+curl -X POST http://localhost:9998/rmeta/config/xml \
+  -F "file=@document.pdf" \
+  -F "config={\"pages\":{\"text\":\"EXTRACT\"}};type=application/json"
+----
+
+=== Metadata only (`/meta`)
+
+Returns container-document metadata only — no recursive embedded list, no content. With no
+`Accept` header it returns JSON; request `text/csv` or `application/rdf+xml` for the other
+representations.
+
+[source,bash]
+----
+curl -T document.pdf http://localhost:9998/meta                # default: JSON
+curl -T document.pdf -H 'Accept: text/csv' http://localhost:9998/meta
+curl -T document.pdf http://localhost:9998/meta/Content-Type   # single field
+----
+
+=== Type detection (`/detect`)
+
+PUT the bytes; the response is the media type as `text/plain`. A `Content-Disposition` filename
+is an optional hint — detection is driven by the bytes, so it works without one.
+
+[source,bash]
+----
+curl -T document.pdf http://localhost:9998/detect
+# application/pdf
+
+curl -X PUT --data-binary @blob -H 'Content-Disposition: attachment; filename=report.xlsx' \
+  http://localhost:9998/detect
+----
+
+NOTE: The 3.x path was `/detect/stream`. It is gone and returns `404` with an empty body — see
+xref:migration-to-4x/migrating-tika-server-4x.adoc#_detect_stream_is_now_detect[the migration guide].
+
+=== Other endpoints
+
+The `endpoints` config name is what you list under `server.endpoints`; leaving `endpoints` unset
+enables everything below except `status`, which is opt-in and must be listed explicitly.
+`pipes` and `async` are part of that default set too, but only when `allowPipes=true` — with
+`allowPipes` left at its `false` default they are not served at all.
+
+[cols="1,1,3"]
+|===
+|Path |Config name |Notes
+
+|`/unpack`
+|`unpack`
+|Returns embedded files as a zip. Forked.
+
+|`/detect`
+|`detect`
+|Type detection only, no parsing. Forked — detection opens containers (zip, OPC, POIFS) over
+caller-supplied bytes, so it gets the same isolation, timeouts and fork restart as parsing.
+Does not require `allowPipes`.
+
+|`/language`
+|`language`
+|Language detection. Runs *in the server's own JVM* — see the warning below.
+
+|`/parsers`, `/parsers/details`
+|`parsers`
+|Registered parsers, with supported media types under `/details`.
+
+|`/detectors`
+|`detectors`
+|Registered detectors.
+
+|`/mime-types`
+|`mime-types` (or `mime`)
+|Known media types.
+
+|`/version`
+|`version`
+|Server version.
+
+|`/status`
+|`status`
+|State, active task count, files processed. Opt-in: list it to enable it. Not gated by
+`allowPipes` or `allowPerRequestConfig`.
+
+|`/pipes`, `/async`
+|`pipes`, `async`
+|Pipes-based bulk processing. Require `allowPipes`; the server refuses to start if either is
+listed without it. See <<_security,Security>>.
+|===
+
+WARNING: `/language` does its work in the server's own JVM, not in a fork, so it sits
+outside the process isolation that protects the parsing endpoints — a crash or memory exhaustion
+takes the server with it rather than one fork. It caps detection at the first 100,000
+characters (accuracy saturates well before that) and reads no more than that from the body
+without materializing the rest, so the cap bounds both CPU and heap per request.
+`maxRequestSizeBytes` still bounds what a request may send at all. If you do not need
+`/language`, omit it from `endpoints`.
+
+[#_error_responses]
+== Error Responses
+
+Two different kinds of failure get different treatment: the fork itself dying, and the
+fork running fine but catching an exception while parsing one particular document.
+
+=== Process-level failures
+
+When the fork times out, runs out of memory, or crashes, the server returns an HTTP error
+whose JSON body carries the `PipesResult.RESULT_STATUS` enum name, plus a `message` field when one
+is available (often a server-side stack trace):
+
+[source,json]
+----
+{"status": "TIMEOUT", "message": "Task timed out after 60000ms"}
+----
+
+[cols="1,1,3"]
+|===
+|HTTP status |`status` values |Meaning
+
+|`503 Service Unavailable`
+|`TIMEOUT`, `OOM`, `UNSPECIFIED_CRASH`
+|The forked parse process actually failed. The server is still healthy; the response carries a
+`Retry-After` header and the client may retry.
+
+|`429 Too Many Requests`
+|`CLIENT_UNAVAILABLE_WITHIN_MS`
+|Nothing failed — no parse client became available within the configured wait time (deliberate
+backpressure; see <<_endpoints_and_forked_process_groups,Endpoints and Forked-Process Groups>>).
+Carries `Retry-After`. Distinct from `503` on purpose: a `429` spike means "raise `numClients` or
+add capacity", a `503` spike means "something is actually crashing".
+
+|`400 Bad Request`
+|`FETCHER_NOT_FOUND`, `EMITTER_NOT_FOUND`
+|The request named a fetcher or emitter that does not exist, or one reserved for the server's
+internal use. Permanently malformed — fix the fetcher/emitter id; retrying unchanged will not help.
+
+|`413 Payload Too Large`
+|`PAYLOAD_LIMIT_EXCEEDED`
+|The parse *result* was too large for the pipes IPC channel (`pipes.maxIpcPayloadBytes`). Distinct
+from a request *body* over `maxRequestSizeBytes`, which a request filter rejects with a plain-text
+`413` (declared `Content-Length` and chunked bodies alike) before any parsing starts.
+
+|`500 Internal Server Error`
+|`FAILED_TO_INITIALIZE`, `FETCH_EXCEPTION`, `EMIT_EXCEPTION`,
+`FETCHER_INITIALIZATION_EXCEPTION`, `EMITTER_INITIALIZATION_EXCEPTION`
+|Server misconfiguration or a task-level infrastructure error. Retrying the same document on the
+same server is unlikely to succeed without a configuration fix.
+|===
+
+=== Per-document parse exceptions
+
+Here the fork ran to completion and simply caught an exception on this one document (an
+encrypted file with no password, a malformed embedded object, an NPE in a specific parser). The
+fork is healthy, and whatever content it extracted is still available. The status depends on
+whether the response shape has room to embed the exception alongside content:
+
+[cols="1,1,3"]
+|===
+|Endpoints |Status |Behavior
+
+|`/rmeta`, `/tika/json`, `/meta`'s full-object endpoints
+|`200 OK`
+|The exception is embedded in `tk:exception:container-exception` (or
+`tk:exception:embedded-exception` on an individual embedded document within an `/rmeta` list),
+alongside whatever content and metadata were captured. Partial success is meaningful in a
+list response or a structured object with room for an extra field.
+
+|bare `/tika` and its raw endpoints (`text`, `html`, `xml`, `md`)
+|`422 Unprocessable Entity`
+|A raw byte-stream response has no field to embed the exception in, so the status itself signals
+it. The body carries the extracted content only; use `/rmeta` for the structured exception.
+
+|`/meta/\{field}`
+|`422 Unprocessable Entity`
+|A single scalar value has nowhere to embed the exception either, so it is thrown rather than
+silently returned as if the field were simply absent.
+
+|`/unpack`
+|`422 Unprocessable Entity`
+|Same reasoning as the raw endpoints, but content is *not* preserved — any files already unpacked
+before the exception are discarded. Known gap.
+|===
+
+[IMPORTANT]
+====
+By default exception detail is returned in full. Stack traces and their messages can contain the
+spooled file's path, the source filename, and fragments of the document. That detail appears in
+`tk:exception:*` metadata on **successful** parses as well as in error bodies — including inside
+the `metadata.json` of an `/unpack` zip.
+
+One config setting governs every one of those channels — the metadata values, every error body
+built from an exception (`422`, `500`; a `400` echoes the caller's own request problem, `415` and
+`404`/`405` carry no exception text, and the plain-text `413` from the request-size filter is
+fixed text), and the `message` of a `/pipes` or `/async` result. That includes the
+results the parent fabricates when the fork never reported one (`FAILED_TO_INITIALIZE`,
+`PAYLOAD_LIMIT_EXCEEDED`, a `TIMEOUT`/`OOM`/crash the fork died before reporting): those carry
+either no message at all or the trace of the parent's own infrastructure exception — never
+document content — formatted under the same policy:
+
+[source,json]
+----
+"parse-context": {
+  "exception-reporting": { "level": "MESSAGE_REDACTED", "maxLength": 10000 }
+}
+----
+
+`MESSAGE_REDACTED` keeps class names and frames but strips every message; `REDACTED` keeps class
+names only. A per-request config carrying it is refused with a `400` naming the reason, so callers
+cannot turn it back off. See
+xref:advanced/setting-limits.adoc#_exception_reporting[Exception reporting]. Set it whenever the
+server's callers are less trusted than its operator. Prefer it to a `MetadataFilter` that drops
+`tk:exception:*`: a filter supplied in a per-request config *replaces* the operator's rather than
+adding to it.
+====
+
+=== Truncated results (`PARTIAL_TIMEOUT`)
+
+A third case is neither of the above: the fork is healthy and no exception was caught, but the
+document's total task timeout (`totalTaskTimeoutMillis`) ran out partway through, so
+not-yet-started embedded documents were skipped rather than attempted. `PARTIAL_TIMEOUT` maps to
+`200 OK` on every endpoint — it is a success, just an incomplete one — alongside `PARSE_SUCCESS`,
+`PARSE_SUCCESS_WITH_EXCEPTION`, etc. The response carries
+`TikaCoreProperties.TASK_DEADLINE_REACHED = true` and whatever content was extracted before the
+deadline. See
+xref:pipes/timeouts.adoc#_how_timeouts_are_reported[How Timeouts Are Reported] for the full mental
+model, including the pipes-mode `throwOnDeadline` option that trades this graceful truncation for a
+hard failure.
+
+[#_configuration]
+== Configuration
+
+Server behavior beyond host/port comes from the `server` section of the JSON config passed via
+`-c`/`--config`. That section maps to fields on `TikaServerConfig`:
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`allowPipes`
+|`false`
+|Opt-in for `/pipes` and `/async`. The server refuses to start if either is selected without it.
+See <<_security,Security>>.
+
+|`allowPerRequestConfig`
+|`false`
+|Opt-in for the `/config` endpoints and the multipart `config` part. When off, such requests get
+`403`. See <<_security,Security>>.
+
+|`endpoints`
+|_all defaults_
+|Which endpoints to expose. Leave unset for the full default set. This also controls how many
+independent forked-process groups you run — see
+<<_endpoints_and_forked_process_groups,Endpoints and Forked-Process Groups>> before combining
+`/tika`/`/rmeta`/`/unpack`/`/meta`/`/detect`/`/pipes` with `/async`.
+
+|`cors`
+|`""` (off)
+|`*` to allow any origin, or an explicit origin string.
+
+|`maxRequestSizeBytes`
+|`1 GiB`
+|Maximum request body in bytes; larger requests are rejected with `413`. Enforced on bytes actually read, so a chunked upload with no `Content-Length` is bounded too. Bodies above xref:pipes/configuration.adoc#payload-limits[`maxInlineBytes`] are spooled to disk, so this also bounds how much one request can write. Raise it for larger documents, or set a negative value to disable the limit.
+
+|`maxQueuePauseMillis`
+|`60000`
+|How long a POST to `/async` blocks when the queue is full before it is rejected with `429`
+(`Retry-After`). A batch larger than the queue's total capacity is rejected immediately with
+`400` — retrying cannot help; split the batch.
+
+|`requestLogLevel`
+|_empty (off)_
+|`debug` or `info` to log each request URI at that level. Empty disables request logging and
+changes no other log level.
+
+|`id`
+|random UUID
+|Server ID, written to the startup log (same setting as the `-i` CLI flag).
+
+|`tlsConfig`
+|_TLS off_
+|Nested TLS/mTLS settings. See xref:using-tika/server/tls.adoc[TLS/SSL Configuration].
+
+|`metricsPort`
+|_metrics off_
+|Serve Prometheus metrics on this port (same setting as `--metricsPort`). See
+xref:using-tika/server/monitoring.adoc[Monitoring with Prometheus].
+|===
+
+NOTE: Digests are configured in `parse-context`, not in `server`. See
+xref:configuration/digesters.adoc[Digesters].
+
+For the `pipes`, `fetchers`, `emitters` and `parse-context` sections that tika-server requires,
+see
+xref:migration-to-4x/migrating-tika-server-4x.adoc#_configuration_changes[Configuration Changes].
+
+[#_endpoints_and_forked_process_groups]
+== Endpoints and Forked-Process Groups
+
+Two independent forked-process groups exist:
+
+* **`/tika` + `/rmeta` + `/unpack` + `/meta` + `/detect` + `/pipes`** share one group — all six go
+through the same `PipesParsingHelper`/`PipesParser`, sized by `pipes.numClients`. `/pipes` still
+requires `allowPipes` to start even though it shares its parser with the always-on endpoints; the
+others do not.
+* **`/async`** is a separate group (gated behind `allowPipes`). It shares no `PipesParser` with the
+group above; it manages its own fork pool for queued/background processing, with results
+delivered via a configured `PipesReporter` rather than in the HTTP response, sized by its own read
+of `pipes.numClients` from the same config.
+
+Within a group, `numClients` does two *separate* jobs.
+
+=== It bounds how many requests that group can serve at once
+
+Each group holds a fixed pool of `numClients` forks. A request that arrives when all are busy
+waits up to `pipes.maxWaitForClientMillis` (default 60s) for one to free up. This is deliberate
+backpressure: if a fork frees up in time the request is served normally; if the wait times out
+the server returns `429` with `status: CLIENT_UNAVAILABLE_WITHIN_MS` — an explicit "I'm at
+capacity, retry", not a crash (see <<_error_responses,Error Responses>>).
+
+`CLIENT_UNAVAILABLE_WITHIN_MS` under real load means this group is undersized for your request
+volume: raise `numClients` for more concurrent capacity, or tune `maxWaitForClientMillis` to fail
+faster (surface backpressure sooner) or more patiently (absorb bursts, at the cost of tying up
+request threads while waiting).
+
+=== It sizes each fork's view of available CPU
+
+Independently, each group auto-sizes its forked JVMs' `-XX:ActiveProcessorCount` from `numClients`
+and the host's core count — see xref:pipes/cpu-sizing.adoc[Forked-JVM CPU and Heap Sizing] for the
+mechanics.
+
+This part *can* go wrong across groups: one group's auto-sizer has no visibility into the other
+group in the same process. Enable `/async` alongside the shared group — by listing `async`
+together with any of `tika`/`rmeta`/`unpack`/`meta`/`detect`/`pipes`, or simply by leaving
+`endpoints` unset with `allowPipes=true` — and each group computes its slice as if it owned the
+whole host. Whether that oversubscribes depends on your `numClients` values relative to the core
+count; it is not automatic, but the auto-sizer will not warn you either, because from within
+either group the sizing looks fine. See
+xref:pipes/cpu-sizing.adoc#_known_limitation_multiple_pipes_groups_in_one_process[Known limitation: multiple Pipes groups in one process]
+for the mitigation (scope `endpoints` to what you use, or set `-XX:ActiveProcessorCount`
+explicitly with the combined total in mind).
+
+== Topics
+
+* xref:using-tika/server/tls.adoc[TLS/SSL Configuration] — TLS and mutual authentication
+* xref:using-tika/server/monitoring.adoc[Monitoring with Prometheus] — metrics for
+autoscaling and alerting
+* xref:migration-to-4x/migrating-tika-server-4x.adoc[Migrating Tika Server to 4.x] — breaking
+changes from 3.x

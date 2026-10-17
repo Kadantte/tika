@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.ooxml;
 
 
@@ -23,6 +22,15 @@ public class ParagraphProperties {
     private String styleId;
     private int ilvl = -1;
     private int numId = -1;
+
+    public ParagraphProperties() {
+    }
+
+    public ParagraphProperties(ParagraphProperties other) {
+        this.styleId = other.styleId;
+        this.ilvl = other.ilvl;
+        this.numId = other.numId;
+    }
 
     public String getStyleID() {
         return styleId;

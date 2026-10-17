@@ -1,0 +1,150 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Shared Server Mode (YOLO Mode)
+
+[WARNING]
+====
+Shared Server Mode is an **experimental, high-risk option** that trades reliability for reduced memory usage. It is **not the default** and should only be enabled when you fully understand the limitations.
+====
+
+== Overview
+
+By default, Tika Pipes runs each `PipesClient` with its own dedicated `PipesServer` JVM process. This provides isolation: if one document causes a crash, OOM, or timeout, only that single request is affected.
+
+Shared Server Mode changes this model: **all clients connect to a single shared server process**. This saves memory (N-1 JVMs worth) but means that **one failure affects all in-flight requests**.
+
+== Architecture Comparison
+
+[source]
+----
+Default Mode (Per-Client):              Shared Mode (YOLO):
+──────────────────────────              ────────────────────
+PipesClient-0 → Server-0 (JVM)          PipesClient-0 ─┐
+PipesClient-1 → Server-1 (JVM)          PipesClient-1 ─┼→ Shared Server (1 JVM)
+PipesClient-2 → Server-2 (JVM)          PipesClient-2 ─┤   with N connection handlers
+PipesClient-3 → Server-3 (JVM)          PipesClient-3 ─┘
+
+Memory: 4 JVMs                          Memory: 1 JVM
+Isolation: Per-request                  Isolation: None (shared fate)
+----
+
+== Performance
+
+Shared mode is not only a memory option. Because all requests are served by one
+warm JVM — a single JIT profile and a single garbage collector — it typically
+has *higher throughput* than per-client mode at the same concurrency, and can
+show lower tail latency (one large heap incurs fewer, shorter GC stalls than
+several small worker heaps). In one benchmark it came within roughly 5–15% of a
+single in-JVM parser's throughput on mixed and large documents, where per-client
+was ~20–35% slower. This throughput edge is the upside you weigh against the loss
+of per-request isolation described below. See
+xref:pipes/performance.adoc[Performance and Isolation Trade-offs] for the full
+comparison.
+
+== Limitations and Risks
+
+=== Shared fate
+
+Any crash, timeout, or `OutOfMemoryError` kills the one server process, so **all concurrent
+requests are lost**, not just the offending one. The server is then restarted and clients
+reconnect (see <<_recovery_behavior,Recovery Behavior>>).
+
+=== Emit status is lost with the process
+
+A crash also takes the *results* of the other in-flight requests with it, not just their
+work. When the server process does the emitting (`emitStrategy` `EMIT_ALL`, or `DYNAMIC` for
+extracts over the threshold), the client only learns a document was emitted when the server
+reports back. If worker A parses and emits its document and, before that report is sent,
+worker B's document OOMs the process, A's client sees only "crash" — it cannot tell whether
+its document reached the emitter. The document may well be safely emitted, but the
+application has no way to know, so it must either re-run the request (and tolerate a
+duplicate emit) or reconcile against the emit target. `PASSBACK_ALL` avoids this ambiguity —
+the parent emits, so a crash means "not emitted" — at the cost of carrying every extract back
+across IPC (see xref:pipes/configuration.adoc#_emit_strategy[Emit Strategy]). In per-client
+mode each JVM handles one request at a time, so a crash can only mean the request that
+crashed.
+
+=== Shared resources
+
+All concurrent parses share one heap, CPU allocation, and file-handle table. A memory-hungry
+document can starve the others or trigger the OOM that kills everything, and there is no
+per-document heap limit to contain it — you must size the heap for worst-case *concurrent*
+load rather than worst-case single document.
+
+=== Concurrency exposure
+
+In per-client mode each parse gets its own JVM and a single thread, so thread-safety bugs in
+parsers stay hidden. In shared mode parses run concurrently in one JVM, which can expose
+latent threading bugs in parsers or their dependencies. Strange behaviour that appears only
+in shared mode is most often this.
+
+== When to Use Shared Mode
+
+Consider shared mode only when all of these hold:
+
+* You have strict memory constraints and cannot run N separate JVMs
+* Your documents are well-behaved and unlikely to cause OOM or timeouts
+* You can tolerate occasional loss of multiple in-flight requests, including not
+  knowing whether a lost request's document was already emitted
+* You have tested thoroughly with your specific document corpus
+
+== Configuration
+
+Enable shared mode by setting `useSharedServer` to `true` in your pipes configuration:
+
+[source,json]
+----
+{
+  "pipes": {
+    "numClients": 4,
+    "useSharedServer": true,
+    "forkedJvmArgs": ["-Xmx4g"]
+  },
+  "parse-context": {
+    "timeout-limits": {
+      "progressTimeoutMillis": 60000
+    }
+  }
+}
+----
+
+See xref:pipes/timeouts.adoc[Timeouts] for details on configuring timeouts.
+
+== Sizing Guidance
+
+Size the single heap for `numClients` × worst-case per-document usage, plus GC headroom and
+JVM overhead: 4 clients at up to 500 MB each needs at least 2 GB. That is the same total a
+per-client deployment would use, but concentrated in one JVM where a single OOM takes down
+every in-flight request instead of one.
+
+For the per-fork `-Xmx` rule of thumb that informs both modes, see
+xref:pipes/cpu-sizing.adoc#heap-per-fork[Heap per fork].
+
+== Recovery Behavior
+
+On a fatal error (OOM, timeout, or crash) the affected client marks the server for restart
+and the process is terminated; other clients detect the pending restart, and once a new
+server process is up they reconnect and resume. **All in-flight requests from all clients
+are lost** in that window, so retry logic belongs at the application level.
+
+== Recommendation
+
+Use the default per-client mode for production workloads unless a memory constraint forces
+otherwise — the isolation is worth more than the saved JVMs. If you must use shared mode,
+test against your own corpus, monitor OOM and timeout events, retry lost requests at the
+application level, and size the heap generously.

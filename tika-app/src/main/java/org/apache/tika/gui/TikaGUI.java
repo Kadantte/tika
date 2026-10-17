@@ -36,6 +36,8 @@ import java.io.Writer;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -70,19 +72,20 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.DocumentSelector;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.AutoDetectParser;
-import org.apache.tika.parser.DigestingParser;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.RecursiveParserWrapper;
-import org.apache.tika.parser.digestutils.CommonsDigester;
+import org.apache.tika.parser.inference.InferenceDispatcher;
 import org.apache.tika.sax.BasicContentHandlerFactory;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.ContentHandlerDecorator;
@@ -154,9 +157,9 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
      * File chooser.
      */
     private final JFileChooser chooser = new JFileChooser();
-    private final TikaConfig tikaConfig;
+    private final TikaLoader tikaConfig;
 
-    public TikaGUI(Parser parser, TikaConfig tikaConfig) {
+    public TikaGUI(Parser parser, TikaLoader tikaConfig) {
         super("Apache Tika");
         this.tikaConfig = tikaConfig;
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -194,21 +197,32 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
      * @throws Exception if an error occurs
      */
     public static void main(String[] args) throws Exception {
-        TikaConfig config = null;
+        TikaLoader config = null;
         if (args.length > 0) {
             File configFile = new File(args[0]);
-            config = new TikaConfig(configFile);
+            config = TikaLoader.load(configFile.toPath());
         } else {
-            try (InputStream is = TikaGUI.class.getResourceAsStream("/tika-config-default-single-file.xml")) {
-                config = new TikaConfig(is);
+            Path tempConfig = Files.createTempFile("tika-config-", ".json");
+            try {
+                try (InputStream is = TikaGUI.class.getResourceAsStream("/tika-config-default-single-file.json")) {
+                    Files.copy(is, tempConfig, StandardCopyOption.REPLACE_EXISTING);
+                }
+                config = TikaLoader.load(tempConfig);
+            } finally {
+                Files.deleteIfExists(tempConfig);
             }
         }
         UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        final TikaConfig finalConfig = config;
-        SwingUtilities.invokeLater(() -> new TikaGUI(
-                new DigestingParser(new AutoDetectParser(finalConfig),
-                        new CommonsDigester(MAX_MARK, CommonsDigester.DigestAlgorithm.MD5, CommonsDigester.DigestAlgorithm.SHA256),
-                        false), finalConfig).setVisible(true));
+        final TikaLoader tikaLoader = config;
+        SwingUtilities.invokeLater(() -> {
+            try {
+                new TikaGUI(tikaLoader.loadAutoDetectParser(), tikaLoader).setVisible(true);
+            } catch (TikaConfigException e) {
+                throw new RuntimeException(e);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
     private void addMenuBar() {
@@ -292,9 +306,9 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
 
     public void openFile(File file) {
         try {
-            Metadata metadata = new Metadata();
-            try (TikaInputStream stream = TikaInputStream.get(file.toPath(), metadata)) {
-                handleStream(stream, metadata);
+            Metadata metadata = Metadata.newInstance(context);
+            try (TikaInputStream tis = TikaInputStream.get(file.toPath(), metadata)) {
+                handleStream(tis, metadata);
             }
         } catch (Throwable t) {
             handleError(file.getPath(), t);
@@ -303,16 +317,16 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
 
     public void openURL(URL url) {
         try {
-            Metadata metadata = new Metadata();
-            try (TikaInputStream stream = TikaInputStream.get(url, metadata)) {
-                handleStream(stream, metadata);
+            Metadata metadata = Metadata.newInstance(context);
+            try (TikaInputStream tis = TikaInputStream.get(url, metadata)) {
+                handleStream(tis, metadata);
             }
         } catch (Throwable t) {
             handleError(url.toString(), t);
         }
     }
 
-    private void handleStream(InputStream input, Metadata md) throws Exception {
+    private void handleStream(TikaInputStream tis, Metadata md) throws Exception {
         StringWriter htmlBuffer = new StringWriter();
         StringWriter textBuffer = new StringWriter();
         StringWriter textMainBuffer = new StringWriter();
@@ -324,21 +338,17 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
 
         context.set(DocumentSelector.class, new ImageDocumentSelector());
 
-        input = TikaInputStream.get(input);
-
-        if (input.markSupported()) {
-            int mark = -1;
-            if (input instanceof TikaInputStream) {
-                if (((TikaInputStream) input).hasFile()) {
-                    mark = (int) ((TikaInputStream) input).getLength();
-                }
-            }
-            if (mark == -1) {
-                mark = MAX_MARK;
-            }
-            input.mark(mark);
+        int mark = -1;
+        // hasLength(), not hasFile(): getLength() on a stream whose length is unknown spools
+        // the whole stream to measure it
+        if (tis.hasLength()) {
+            mark = (int) tis.getLength();
         }
-        parser.parse(input, handler, md, context);
+        if (mark == -1) {
+            mark = MAX_MARK;
+        }
+        tis.mark(mark);
+        parser.parse(tis, handler, md, context);
 
         String[] names = md.names();
         Arrays.sort(names);
@@ -363,14 +373,10 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
         setText(text, textBuffer.toString());
         setText(textMain, textMainBuffer.toString());
         setText(html, htmlBuffer.toString());
-        if (!input.markSupported()) {
-            setText(json, "InputStream does not support mark/reset for Recursive Parsing");
-            layout.show(cards, "metadata");
-            return;
-        }
+
         boolean isReset = false;
         try {
-            input.reset();
+            tis.reset();
             isReset = true;
         } catch (IOException e) {
             setText(json, "Error during stream reset.\n" + "There's a limit of " + MAX_MARK + " bytes for this type of processing in the GUI.\n" +
@@ -378,13 +384,18 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
         }
         if (isReset) {
             RecursiveParserWrapperHandler recursiveParserWrapperHandler =
-                    new RecursiveParserWrapperHandler(new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.BODY, -1), -1);
+                    new RecursiveParserWrapperHandler(new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.BODY, -1));
             RecursiveParserWrapper wrapper = new RecursiveParserWrapper(parser);
-            wrapper.parse(input, recursiveParserWrapperHandler, new Metadata(), new ParseContext());
+            ParseContext rpwContext = new ParseContext();
+            wrapper.parse(tis, recursiveParserWrapperHandler, Metadata.newInstance(rpwContext), rpwContext);
             StringWriter jsonBuffer = new StringWriter();
             JsonMetadataList.setPrettyPrinting(true);
             List<Metadata> metadataList = recursiveParserWrapperHandler.getMetadataList();
-            metadataList = tikaConfig.getMetadataListFilter().filter(metadataList);
+            InferenceDispatcher inference = tikaConfig.get(InferenceDispatcher.class);
+            if (inference != null) {
+                inference.text(metadataList, rpwContext);
+            }
+            tikaConfig.loadMetadataFilters().filter(metadataList);
             JsonMetadataList.toJson(metadataList, jsonBuffer);
             setText(json, jsonBuffer.toString());
         }
@@ -593,7 +604,7 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
      */
     private static class ImageDocumentSelector implements DocumentSelector {
         public boolean select(Metadata metadata) {
-            String type = metadata.get(Metadata.CONTENT_TYPE);
+            String type = metadata.get(HttpHeaders.CONTENT_TYPE);
             return type != null && type.startsWith("image/");
         }
     }
@@ -641,15 +652,15 @@ public class TikaGUI extends JFrame implements ActionListener, HyperlinkListener
         }
 
         @Override
-        public void parse(InputStream stream, ContentHandler handler, Metadata metadata, ParseContext context) throws IOException, SAXException, TikaException {
+        public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata, ParseContext context) throws IOException, SAXException, TikaException {
             String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
             if (name != null && wanted.containsKey(name)) {
                 try (FileOutputStream out = new FileOutputStream(wanted.get(name))) {
-                    IOUtils.copy(stream, out);
+                    IOUtils.copy(tis, out);
                 }
             } else {
                 if (downstreamParser != null) {
-                    downstreamParser.parse(stream, handler, metadata, context);
+                    downstreamParser.parse(tis, handler, metadata, context);
                 }
             }
         }

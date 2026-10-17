@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.standard;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -52,8 +51,8 @@ public class OptimaizeMetadataFilterTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(RecursiveMetadataResource.class, TikaResource.class);
-        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource()));
-        sf.setResourceProvider(TikaResource.class, new SingletonResourceProvider(new TikaResource()));
+        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource(tikaResource)));
+        sf.setResourceProvider(TikaResource.class, new SingletonResourceProvider(tikaResource));
 
     }
 
@@ -67,7 +66,12 @@ public class OptimaizeMetadataFilterTest extends CXFTestBase {
 
     @Override
     protected InputStream getTikaConfigInputStream() {
-        return getClass().getResourceAsStream("/config/tika-config-langdetect-optimaize-filter.xml");
+        return getClass().getResourceAsStream("/configs/tika-config-langdetect-optimaize-filter.json");
+    }
+
+    @Override
+    protected InputStream getPipesConfigInputStream() {
+        return getClass().getResourceAsStream("/configs/tika-config-langdetect-optimaize-filter.json");
     }
 
     @Test
@@ -86,11 +90,11 @@ public class OptimaizeMetadataFilterTest extends CXFTestBase {
                 .get(OfficeOpenXMLExtended.APPLICATION));
         assertContains("plundered our seas", metadataList
                 .get(6)
-                .get("X-TIKA:content"));
+                .get("tk:content"));
 
         assertEquals("a38e6c7b38541af87148dee9634cb811", metadataList
                 .get(10)
-                .get("X-TIKA:digest:MD5"));
+                .get("tk:digest:MD5"));
 
         assertEquals("en", metadataList
                 .get(6)
@@ -103,8 +107,7 @@ public class OptimaizeMetadataFilterTest extends CXFTestBase {
     @Test
     public void testTika() throws Exception {
         Response response = WebClient
-                .create(endPoint + TIKA_PATH)
-                .accept("application/json")
+                .create(endPoint + TIKA_PATH + "/json")
                 .put(ClassLoader.getSystemResourceAsStream(TEST_RECURSIVE_DOC));
 
         Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);

@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,15 +14,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.io;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
 import org.junit.jupiter.api.Test;
 
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.utils.StringUtils;
 
 public class FilenameUtilsTest {
@@ -104,6 +112,32 @@ public class FilenameUtilsTest {
     }
 
     @Test
+    public void testResolveWithin() throws Exception {
+        Path dir = Paths.get("base", "isa");
+
+        // plain and nested children resolve to a path under dir
+        assertEquals(Paths.get("base", "isa", "a_assay.txt"),
+                FilenameUtils.resolveWithin(dir, "a_assay.txt"));
+        assertEquals(Paths.get("base", "isa", "sub", "a_assay.txt"),
+                FilenameUtils.resolveWithin(dir, "sub/a_assay.txt"));
+
+        // resolving the directory itself stays within it
+        assertEquals(dir.normalize(), FilenameUtils.resolveWithin(dir, "."));
+
+        // names that resolve out of dir are rejected. These also pin the normalize() call:
+        // without it the resolved path would still textually begin with dir and be accepted.
+        assertThrows(IOException.class, () -> FilenameUtils.resolveWithin(dir, "../outside.txt"));
+        assertThrows(IOException.class, () -> FilenameUtils.resolveWithin(dir, "../../outside.txt"));
+        assertThrows(IOException.class,
+                () -> FilenameUtils.resolveWithin(dir, "sub/../../outside.txt"));
+
+        // element-wise (not string-prefix) containment: a/bc is not within a/b even though
+        // the string "a/bc" starts with the string "a/b".
+        assertThrows(IOException.class,
+                () -> FilenameUtils.resolveWithin(Paths.get("a", "b"), "../bc"));
+    }
+
+    @Test
     public void testExtension() throws Exception {
         assertEquals(".pdf", FilenameUtils.getSuffixFromPath("blah/blah/or/something.pdf"));
         assertEquals(StringUtils.EMPTY, FilenameUtils.getSuffixFromPath("blah \" blaoh .5\""));
@@ -111,6 +145,139 @@ public class FilenameUtilsTest {
 
     private void testFilenameEquality(String expected, String path) {
         assertEquals(expected, FilenameUtils.getName(path));
+    }
+
+    @Test
+    public void testEmbeddedFileNames() throws Exception {
+        String n = "the quick brown fox.docx";
+        assertEquals(n, sanitizeFilename(n));
+        assertEquals(n, sanitizeFilename(n.substring(0, n.length() - 5),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+
+        assertEquals(n, sanitizeFilename("the quick\u0000brown fox.docx"));
+        assertEquals(n, sanitizeFilename(n.substring(0, n.length() - 5),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+
+        assertEquals("the quick brown fox.bin", sanitizeFilename(n.substring(0, n.length() - 5)));
+        assertEquals("brown fox.docx", sanitizeFilename("the quick..\\brown fox.docx"));
+        assertEquals("brown fox.docx", sanitizeFilename("the quick..\\/\\/\\brown fox.docx"));
+        assertEquals("brown fox.docx", sanitizeFilename("the quick../brown fox.docx"));
+        assertEquals("_brown fox.docx", sanitizeFilename("the quick../..brown fox.docx"));
+        assertEquals("brown_ fox.docx", sanitizeFilename("the quick../brown.. fox.docx"));
+        assertEquals("brown_. fox.docx", sanitizeFilename("the quick../brown... fox.docx"));
+        assertEquals("brown_ fox.docx", sanitizeFilename("the quick../brown.... fox.docx"));
+        assertEquals("_brown fox.docx", sanitizeFilename("...brown fox.docx"));
+        assertEquals("_brown fox.docx", sanitizeFilename("....brown fox.docx"));
+        assertEquals("_brown fox.docx", sanitizeFilename(".brown fox.docx"));
+        assertEquals("abcdefghijklmnopqrstuvwxyz_abcdefghijklmno....docx", sanitizeFilename(
+                "abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz.docx"));
+
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("C:\\the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("/the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("~/the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("https://the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("https://tika.apache.org/the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("file:///tika.apache.org/the quick brown fox.xlsx"));
+
+        assertEquals("brown fox.xlsx", sanitizeFilename("a:/the quick:brown fox.xlsx"));
+        assertEquals("_the quick brown fox.xlsx", sanitizeFilename("C:\\a/b/c/..the quick brown fox.xlsx"));
+        assertEquals("_the quick brown fox.xlsx", sanitizeFilename("~/a/b/c/.the quick brown fox.xlsx"));
+        assertEquals("the quick%3Ebrown fox.xlsx", sanitizeFilename("the quick>brown fox.xlsx"));
+        assertEquals("the quick%22brown fox.xlsx", sanitizeFilename("the quick\"brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizeFilename("\"the quick brown fox.xlsx\""));
+
+        assertEquals("_.docx", sanitizeFilename("..................docx"));
+        assertEquals("_.docx", sanitizeFilename("..docx"));
+        assertNull(sanitizeFilename(".docx"));
+        assertNull(sanitizeFilename(""));
+        assertNull(sanitizeFilename(null));
+        assertNull(sanitizeFilename("/"));
+        assertNull(sanitizeFilename("~/"));
+        assertNull(sanitizeFilename("C:"));
+        assertNull(sanitizeFilename("C:/"));
+        assertNull(sanitizeFilename("C:\\"));
+
+    }
+
+    @Test
+    public void testEmbeddedFilePaths() throws Exception {
+        String n = "the quick brown fox.docx";
+        assertEquals(n, sanitizePath(n));
+        assertEquals(n, sanitizePath(n.substring(0, n.length() - 5),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+        assertEquals(n, sanitizeFilename("the quick\u0000brown fox.docx"));
+
+        assertEquals("the quick brown fox.bin", sanitizePath(n.substring(0, n.length() - 5)));
+        assertEquals("the quick/brown fox.docx", sanitizePath("the quick..\\brown fox.docx"));
+        assertEquals("the quick/brown fox.docx", sanitizePath("the quick..\\/\\/\\brown fox.docx"));
+        assertEquals("the quick/brown fox.docx", sanitizePath("the quick../brown fox.docx"));
+        assertEquals("the quick/_brown fox.docx", sanitizePath("the quick../..brown fox.docx"));
+        assertEquals("the quick/brown. fox.docx", sanitizePath("the quick../brown.. fox.docx"));
+        assertEquals("the quick/brown. fox.docx", sanitizePath("the quick../brown... fox.docx"));
+        assertEquals("the quick/brown. fox.docx", sanitizePath("the quick../brown.... fox.docx"));
+        assertEquals("_brown fox.docx", sanitizePath("...brown fox.docx"));
+        assertEquals("_brown fox.docx", sanitizePath("....brown fox.docx"));
+        assertEquals("_brown fox.docx", sanitizePath(".brown fox.docx"));
+        assertEquals("abcdefghijklmnopqrstuvwxyz_abcdefghijklmno....docx", sanitizePath(
+                "abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz.docx"));
+
+        assertEquals("the quick brown fox.xlsx", sanitizePath("C:\\the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizePath("/the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizePath("~/the quick brown fox.xlsx"));
+        assertEquals("the quick brown fox.xlsx", sanitizePath("https://the quick brown fox.xlsx"));
+        assertEquals("tika.apache.org/the quick brown fox.xlsx", sanitizePath("https://tika.apache.org/the quick brown fox.xlsx"));
+        assertEquals("tika.apache.org/the quick brown fox.xlsx", sanitizePath("file:///tika.apache.org/the quick brown fox.xlsx"));
+
+        assertEquals("the quick/brown fox.xlsx", sanitizePath("a:/the quick:brown fox.xlsx"));
+        assertEquals("a/b/c/_the quick brown fox.xlsx", sanitizePath("C:\\a/b/c/..the quick brown fox.xlsx"));
+        assertEquals("a/b/c/_the quick brown fox.xlsx", sanitizePath("~/a/b/c/.the quick brown fox.xlsx"));
+
+        assertEquals(".docx", sanitizePath("..................docx"));
+        assertEquals(".docx", sanitizePath("..docx"));
+        assertEquals(".docx", sanitizePath(".docx"));
+        assertNull(sanitizePath(""));
+        assertNull(sanitizePath(null));
+        assertNull(sanitizePath("/"));
+        assertNull(sanitizePath("~/"));
+        assertNull(sanitizePath("C:"));
+        assertNull(sanitizePath("C:/"));
+        assertNull(sanitizePath("C:\\"));
+
+    }
+
+    @Test
+    public void testCalculateExtensionUnknownValue() {
+        assertEquals(".pdf", FilenameUtils.calculateExtension(
+                getMetadata("the quick brown fox", "application/x-tika-unknown"), ".pdf"));
+    }
+
+    private String sanitizePath(String name) {
+        return FilenameUtils.getSanitizedEmbeddedFilePath(getMetadata(name), ".bin", 50);
+    }
+
+    private String sanitizePath(String name, String mimeType) {
+        return FilenameUtils.getSanitizedEmbeddedFilePath(getMetadata(name, mimeType), ".bin", 50);
+    }
+
+    private String sanitizeFilename(String name, String mimeType) {
+        return FilenameUtils.getSanitizedEmbeddedFileName(getMetadata(name, mimeType), ".bin", 50);
+    }
+
+    private String sanitizeFilename(String name) {
+        return FilenameUtils.getSanitizedEmbeddedFileName(getMetadata(name), ".bin", 50);
+    }
+
+    private Metadata getMetadata(String name, String contentType) {
+        Metadata metadata = getMetadata(name);
+        metadata.set(HttpHeaders.CONTENT_TYPE, contentType);
+        return metadata;
+    }
+
+    private Metadata getMetadata(String name) {
+        Metadata metadata = new Metadata();
+        metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, name);
+        metadata.set(TikaCoreProperties.EMBEDDED_RESOURCE_PATH, name);
+        return metadata;
     }
 
 }

@@ -14,11 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.grib;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -34,18 +32,26 @@ import ucar.nc2.NetcdfFile;
 import ucar.nc2.Variable;
 import ucar.nc2.dataset.NetcdfDataset;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
+import org.apache.tika.parser.climate.ClimateForecast;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class GribParser implements Parser {
 
     public static final String GRIB_MIME_TYPE = "application/x-grib2";
+    public static final KeyPrefix GRIB =
+            KeyPrefix.file("grib:", "GRIB global attribute names");
     private static final long serialVersionUID = 7855458954474247655L;
     private final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.application("x-grib2"));
@@ -54,11 +60,11 @@ public class GribParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         //Set MIME type as grib2
-        metadata.set(Metadata.CONTENT_TYPE, GRIB_MIME_TYPE);
+        metadata.set(HttpHeaders.CONTENT_TYPE, GRIB_MIME_TYPE);
         //grib was not cleaning up its temp files no matter what we tried
         //this is a work around the creates a temp directory then copies the full input file
         //into that tmp directory.  We then delete the directory in the finally statement.
@@ -67,22 +73,21 @@ public class GribParser implements Parser {
         try {
             XHTMLContentHandler xhtml;
             Path gribFile = Files.createTempFile(tmpDir, "tika-file", ".grib2");
-            Files.copy(stream, gribFile, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(tis, gribFile, StandardCopyOption.REPLACE_EXISTING);
 
             try (NetcdfFile ncFile = NetcdfDataset.openFile(gribFile.toString(), null)) {
 
                 // first parse out the set of global attributes
                 for (Attribute attr : ncFile.getGlobalAttributes()) {
-                    Property property = resolveMetadataKey(attr.getFullName());
                     if (attr.getDataType().isString()) {
-                        metadata.add(property, attr.getStringValue());
+                        addGlobalAttribute(metadata, attr.getFullName(), attr.getStringValue());
                     } else if (attr.getDataType().isNumeric()) {
-                        int value = attr.getNumericValue().intValue();
-                        metadata.add(property, String.valueOf(value));
+                        addGlobalAttribute(metadata, attr.getFullName(),
+                                String.valueOf(attr.getNumericValue().intValue()));
                     }
                 }
 
-                xhtml = new XHTMLContentHandler(handler, metadata);
+                xhtml = new XHTMLContentHandler(handler, metadata, context);
 
                 xhtml.startDocument();
 
@@ -121,11 +126,22 @@ public class GribParser implements Parser {
         }
     }
 
-    private Property resolveMetadataKey(String localName) {
-        if ("title".equals(localName)) {
-            return TikaCoreProperties.TITLE;
+    private static void addGlobalAttribute(Metadata metadata, String name, String value) {
+        if ("title".equals(name)) {
+            metadata.add(TikaCoreProperties.TITLE, value);
+            return;
         }
-        return Property.internalText(localName);
+        Property cfProperty = ClimateForecast.byName(name);
+        if (cfProperty != null) {
+            if (cfProperty.isMultiValuePermitted()) {
+                metadata.add(cfProperty, value);
+            } else {
+                // malformed files can repeat attribute names; SIMPLE CF keys take last-wins, not a throw
+                metadata.set(cfProperty, value);
+            }
+        } else {
+            metadata.add(GRIB, name, value);
+        }
     }
 
 }

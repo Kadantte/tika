@@ -27,6 +27,7 @@ import org.apache.tika.TikaTest;
 import org.apache.tika.detect.DefaultDetector;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -42,9 +43,9 @@ public class OldExcelParserTest extends TikaTest {
     @Test
     public void testDetection() throws Exception {
         Detector detector = new DefaultDetector();
-        try (TikaInputStream stream = getTestFile(file)) {
+        try (TikaInputStream tis = getTestFile(file)) {
             assertEquals(MediaType.application("vnd.ms-excel.sheet.4"),
-                    detector.detect(stream, new Metadata()));
+                    detector.detect(tis, new Metadata(), new ParseContext()));
         }
     }
 
@@ -52,16 +53,16 @@ public class OldExcelParserTest extends TikaTest {
     @Test
     @Disabled
     public void testMetadata() throws Exception {
-        TikaInputStream stream = getTestFile(file);
+        TikaInputStream tis = getTestFile(file);
 
         Metadata metadata = new Metadata();
         ContentHandler handler = new BodyContentHandler();
 
         OldExcelParser parser = new OldExcelParser();
-        parser.parse(stream, handler, metadata, new ParseContext());
+        parser.parse(tis, handler, metadata, new ParseContext());
 
         // We can get the content type
-        assertEquals("application/vnd.ms-excel.sheet.4", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.ms-excel.sheet.4", metadata.get(HttpHeaders.CONTENT_TYPE));
 
         // But no other metadata
         assertEquals(null, metadata.get(TikaCoreProperties.TITLE));
@@ -76,8 +77,8 @@ public class OldExcelParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (TikaInputStream stream = getTestFile(file)) {
-            new OldExcelParser().parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getTestFile(file)) {
+            new OldExcelParser().parse(tis, handler, metadata, new ParseContext());
         }
 
         String text = handler.toString();

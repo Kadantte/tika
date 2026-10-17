@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.detect;
 
 import java.util.Collection;
@@ -23,15 +22,19 @@ import javax.imageio.spi.ServiceRegistry;
 import org.apache.tika.config.ServiceLoader;
 
 /**
- * A composite encoding detector based on all the {@link EncodingDetector} implementations
- * available through the {@link ServiceRegistry service provider mechanism}.  Those
- * loaded via the service provider mechanism are ordered by how they appear in the
- * file, if there is a single service file.  If multiple, there is no guarantee of order.
- * <p>
- * <p>
- * If you need to control the order of the Detectors, you should instead
- * construct your own {@link CompositeDetector} and pass in the list
- * of Detectors in the required order.
+ * A composite encoding detector over all {@link EncodingDetector}
+ * implementations available through the
+ * {@link ServiceRegistry service provider mechanism}.
+ *
+ * <p>The 4.x default chain (via {@code META-INF/services}): BOM and
+ * metadata-charset detectors (tika-core), the HTML {@code <meta>} detector,
+ * MojibusterEncodingDetector, and JunkFilterEncodingDetector — a
+ * {@link MetaEncodingDetector} that arbitrates the candidates by decode quality
+ * and always runs last, so detector order is irrelevant.</p>
+ *
+ * <p>UniversalEncodingDetector and Icu4jEncodingDetector are no longer
+ * distributed by default and are not auto-discovered; add the jar and enable
+ * them in a {@code tika-config} to use them.</p>
  *
  * @since Apache Tika 1.15
  */
@@ -48,7 +51,7 @@ public class DefaultEncodingDetector extends CompositeEncodingDetector {
     public DefaultEncodingDetector(ServiceLoader loader,
                                    Collection<Class<? extends EncodingDetector>>
                                            excludeEncodingDetectors) {
-        super(loader.loadServiceProviders(EncodingDetector.class), excludeEncodingDetectors);
+        super(loader.loadServiceProviders(EncodingDetector.class),
+                excludeEncodingDetectors);
     }
-
 }

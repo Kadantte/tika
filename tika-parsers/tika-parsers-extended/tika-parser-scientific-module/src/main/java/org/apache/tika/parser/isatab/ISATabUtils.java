@@ -31,15 +31,23 @@ import org.apache.commons.csv.CSVRecord;
 import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.AutoDetectReader;
+import org.apache.tika.detect.DefaultEncodingDetector;
+import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 public class ISATabUtils {
+
+    // Field names come verbatim from ISA-Tab CSV records. Package-visible: ISArchiveParser
+    // reads back a few of these same keys (investigation/study identifiers, assay file names)
+    // and must use the identical prefixed form.
+    static final KeyPrefix ISATAB =
+            KeyPrefix.file("isatab:", "ISA-Tab investigation/study/assay field names");
 
     /**
      * INVESTIGATION
@@ -79,12 +87,10 @@ public class ISATabUtils {
             throws IOException, TikaException, SAXException {
         TikaInputStream tis = TikaInputStream.get(stream);
         // Automatically detect the character encoding
-        TikaConfig tikaConfig = context.get(TikaConfig.class);
-        if (tikaConfig == null) {
-            tikaConfig = TikaConfig.getDefaultConfig();
-        }
-        try (AutoDetectReader reader = new AutoDetectReader(CloseShieldInputStream.wrap(tis),
-                metadata, tikaConfig.getEncodingDetector());
+        EncodingDetector encodingDetector = getEncodingDetector(context);
+        tis.setCloseShield();
+        try (AutoDetectReader reader = new AutoDetectReader(tis,
+                metadata, encodingDetector);
                 CSVParser csvParser = CSVParser.builder().setReader(reader).setFormat(CSVFormat.TDF).get()) {
             Iterator<CSVRecord> iterator = csvParser.iterator();
 
@@ -115,7 +121,17 @@ public class ISATabUtils {
             xhtml.endElement("tbody");
 
             xhtml.endElement("table");
+        } finally {
+            tis.removeCloseShield();
         }
+    }
+
+    private static EncodingDetector getEncodingDetector(ParseContext context) {
+        EncodingDetector encodingDetector = context.get(EncodingDetector.class);
+        if (encodingDetector != null) {
+            return encodingDetector;
+        }
+        return new DefaultEncodingDetector();
     }
 
     public static void parseAssay(InputStream stream, XHTMLContentHandler xhtml, Metadata metadata,
@@ -124,13 +140,10 @@ public class ISATabUtils {
         TikaInputStream tis = TikaInputStream.get(stream);
 
         // Automatically detect the character encoding
-
-        TikaConfig tikaConfig = context.get(TikaConfig.class);
-        if (tikaConfig == null) {
-            tikaConfig = TikaConfig.getDefaultConfig();
-        }
-        try (AutoDetectReader reader = new AutoDetectReader(CloseShieldInputStream.wrap(tis),
-                metadata, tikaConfig.getEncodingDetector());
+        EncodingDetector encodingDetector = getEncodingDetector(context);
+        tis.setCloseShield();
+        try (AutoDetectReader reader = new AutoDetectReader(tis,
+                metadata, encodingDetector);
                 CSVParser csvParser = CSVParser.builder().setReader(reader).setFormat(CSVFormat.TDF).get()) {
             xhtml.startElement("table");
 
@@ -161,6 +174,8 @@ public class ISATabUtils {
             xhtml.endElement("tbody");
 
             xhtml.endElement("table");
+        } finally {
+            tis.removeCloseShield();
         }
     }
 
@@ -204,19 +219,22 @@ public class ISATabUtils {
         }
     }
 
+    // a field name legitimately repeats across the trailing columns of one record and
+    // across records/files sharing the same field (e.g. multiple "Term Source Name" columns),
+    // so values accumulate
     private static void addMetadata(String field, CSVRecord record, Metadata metadata) {
         if ((record == null) || (record.size() <= 1)) {
             return;
         }
 
         for (int i = 1; i < record.size(); i++) {
-            metadata.add(field, record.get(i));
+            metadata.add(ISATAB, field, record.get(i));
         }
     }
 
     private static void mapStudyToMetadata(Map<String, String> map, Metadata metadata) {
         for (Map.Entry<String, String> entry : map.entrySet()) {
-            metadata.add(entry.getKey(), entry.getValue());
+            metadata.add(ISATAB, entry.getKey(), entry.getValue());
         }
     }
 }

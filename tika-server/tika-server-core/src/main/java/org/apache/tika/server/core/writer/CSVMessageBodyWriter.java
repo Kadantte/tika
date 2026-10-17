@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core.writer;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -39,7 +38,7 @@ import org.apache.commons.csv.CSVPrinter;
 import org.apache.tika.metadata.Metadata;
 
 @Provider
-@Produces("text/csv")
+@Produces("text/csv;charset=UTF-8")
 public class CSVMessageBodyWriter implements MessageBodyWriter<Metadata> {
 
     public boolean isWriteable(Class<?> type, Type genericType, Annotation[] annotations, MediaType mediaType) {

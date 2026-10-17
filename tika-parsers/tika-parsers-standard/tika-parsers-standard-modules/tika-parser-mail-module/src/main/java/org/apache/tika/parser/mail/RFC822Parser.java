@@ -16,11 +16,18 @@
  */
 package org.apache.tika.parser.mail;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
+
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Set;
 
+import org.apache.commons.io.IOUtils;
 import org.apache.james.mime4j.MimeException;
 import org.apache.james.mime4j.message.DefaultBodyDescriptorBuilder;
 import org.apache.james.mime4j.parser.MimeStreamParser;
@@ -28,10 +35,14 @@ import org.apache.james.mime4j.stream.MimeConfig;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.exception.ZeroByteFileException;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.BoundedInputStream;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
@@ -43,32 +54,80 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * Uses apache-mime4j to parse emails. Each part is treated with the
  * corresponding parser and displayed within elements.
  * <p/>
+ * Also handles Apple Mail's emlx framing: a first line carrying the message's
+ * byte count, and an XML plist after the message. Both are dropped when the
+ * count checks out; an edited file whose count no longer lands on the plist
+ * is parsed whole rather than cut.
+ * <p/>
  * A {@link MimeConfig} object can be passed in the parsing context
  * to better control the parsing process.
  *
  * @author jnioche@digitalpebble.com
  */
+@TikaComponent(name = "rfc822-parser")
 public class RFC822Parser implements Parser {
     /**
      * Serial version UID
      */
     private static final long serialVersionUID = -5504243905998074168L;
 
-    private static final Set<MediaType> SUPPORTED_TYPES =
-            Collections.singleton(MediaType.parse("message/rfc822"));
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        private boolean extractAllAlternatives = false;
+
+        public boolean isExtractAllAlternatives() {
+            return extractAllAlternatives;
+        }
+
+        public void setExtractAllAlternatives(boolean extractAllAlternatives) {
+            this.extractAllAlternatives = extractAllAlternatives;
+        }
+    }
+
+    private static final Set<MediaType> SUPPORTED_TYPES = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(MediaType.parse("message/rfc822"),
+                    MediaType.parse("message/x-emlx"))));
+
+    // digits, then Apple Mail's space padding to 10 columns, then the newline
+    private static final int EMLX_COUNT_LINE_MAX = 11;
+
+    private static final byte[] PLIST_START = "<?xml".getBytes(US_ASCII);
 
     //rely on the detector to be thread-safe
     //built lazily and then reused
     private Detector detector;
 
-    @Field
-    private boolean extractAllAlternatives = false;
+    private Config defaultConfig = new Config();
+
+    public RFC822Parser() {
+    }
+
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public RFC822Parser(Config config) {
+        this.defaultConfig = config;
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public RFC822Parser(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
 
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         // Get the mime4j configuration, or use a default one
         MimeConfig config =
@@ -79,26 +138,25 @@ public class RFC822Parser implements Parser {
         if (localDetector == null) {
             //lazily load this if necessary
             if (detector == null) {
-                EmbeddedDocumentUtil embeddedDocumentUtil = new EmbeddedDocumentUtil(context);
-                detector = embeddedDocumentUtil.getDetector();
+                detector = EmbeddedDocumentUtil.getDetector(context);
             }
             localDetector = detector;
         }
         MimeStreamParser parser =
                 new MimeStreamParser(config, null, new DefaultBodyDescriptorBuilder());
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
 
         MailContentHandler mch = new MailContentHandler(xhtml, localDetector, metadata, context,
-                config.isStrictParsing(), extractAllAlternatives);
+                config.isStrictParsing(), defaultConfig.isExtractAllAlternatives());
         parser.setContentHandler(mch);
         parser.setContentDecoding(true);
         parser.setNoRecurse();
         xhtml.startDocument();
-        TikaInputStream tstream = TikaInputStream.get(stream);
+        checkForZeroByte(tis);//avoid stackoverflow
         try {
-            parser.parse(tstream);
+            parser.parse(stripEmlxFraming(tis));
         } catch (IOException e) {
-            tstream.throwIfCauseOf(e);
+            tis.throwIfCauseOf(e);
             throw new TikaException("Failed to parse an email message", e);
         } catch (MimeException e) {
             // Unwrap the exception in case it was not thrown by mime4j
@@ -115,18 +173,71 @@ public class RFC822Parser implements Parser {
     }
 
     /**
-     * Until version 1.17, Tika handled all body parts as embedded objects (see TIKA-2478).
-     * In 1.17, we modified the parser to select only the best alternative body
-     * parts for multipart/alternative sections, and we inline the content
-     * as we do for .msg files.
-     * <p>
-     * The legacy behavior can be set by setting {@link #extractAllAlternatives}
-     * to <code>true</code>.  As of 1.17, the default value is <code>false</code>
+     * Consumes the emlx byte-count line if the stream starts with one, and bounds the
+     * message to that count when the plist really starts there.
      *
-     * @param extractAllAlternatives whether or not to extract all alternative parts
-     * @since 1.17
+     * @return the stream to hand to mime4j
      */
-    public void setExtractAllAlternatives(boolean extractAllAlternatives) {
-        this.extractAllAlternatives = extractAllAlternatives;
+    private static InputStream stripEmlxFraming(TikaInputStream tis) throws IOException {
+        byte[] head = new byte[EMLX_COUNT_LINE_MAX];
+        int n = tis.peek(head);
+        long count = 0;
+        int digits = 0;
+        boolean padding = false;
+        int lineLength = -1;
+        for (int i = 0; i < n; i++) {
+            int c = head[i];
+            if (c >= '0' && c <= '9' && !padding) {
+                count = count * 10 + (c - '0');
+                digits++;
+            } else if (c == ' ' && digits > 0) {
+                padding = true;
+            } else if (c == '\n' && digits > 0) {
+                lineLength = i + 1;
+                break;
+            } else {
+                break;
+            }
+        }
+        if (lineLength < 0) {
+            return tis;
+        }
+        boolean verified = plistStartsAt(tis, lineLength + count);
+        IOUtils.skipFully(tis, lineLength);
+        return verified ? new BoundedInputStream(count, tis) : tis;
+    }
+
+    private static boolean plistStartsAt(TikaInputStream tis, long offset) {
+        // must run before any byte is consumed: a passthrough source refuses a seekable
+        // view once its position has moved
+        try (SeekableByteChannel channel = tis.getSeekableByteChannel()) {
+            if (offset + PLIST_START.length > channel.size()) {
+                return false;
+            }
+            ByteBuffer buffer = ByteBuffer.allocate(PLIST_START.length);
+            channel.position(offset);
+            while (buffer.hasRemaining() && channel.read(buffer) != -1) {
+                // fill
+            }
+            return !buffer.hasRemaining() && Arrays.equals(buffer.array(), PLIST_START);
+        } catch (IOException e) {
+            // unverifiable is not a reason to cut; a real read failure recurs in mime4j
+            return false;
+        }
+    }
+
+    private void checkForZeroByte(TikaInputStream tstream) throws IOException, ZeroByteFileException {
+        tstream.mark(1);
+        try {
+            if (tstream.read() < 0) {
+                throw new ZeroByteFileException("rfc822 parser found zero bytes");
+            }
+        } finally {
+            tstream.reset();
+        }
+    }
+
+    public Config getDefaultConfig() {
+        return defaultConfig;
     }
 }

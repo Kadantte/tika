@@ -17,45 +17,42 @@
 package org.apache.tika.pipes.grpc;
 
 import java.io.File;
-import java.io.IOException;
 import java.net.InetAddress;
-import java.net.ServerSocket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.ImmutableMap;
 import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
+import io.grpc.StatusRuntimeException;
 import io.grpc.TlsChannelCredentials;
 import io.grpc.netty.shaded.io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.grpc.stub.StreamObserver;
 import org.apache.commons.io.FileUtils;
 import org.awaitility.Awaitility;
 import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.server.handler.ResourceHandler;
-import org.eclipse.jetty.util.resource.PathResource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.FetchAndParseReply;
-import org.apache.tika.FetchAndParseRequest;
-import org.apache.tika.SaveFetcherReply;
-import org.apache.tika.SaveFetcherRequest;
-import org.apache.tika.TikaGrpc;
-import org.apache.tika.pipes.fetcher.http.HttpFetcher;
+import org.apache.tika.pipes.grpc.proto.FetchAndParseReply;
+import org.apache.tika.pipes.grpc.proto.FetchAndParseRequest;
+import org.apache.tika.pipes.grpc.proto.TikaGrpc;
 
 /**
  * This test will start an HTTP server using jetty.
@@ -66,10 +63,10 @@ import org.apache.tika.pipes.fetcher.http.HttpFetcher;
 class PipesBiDirectionalStreamingIntegrationTest {
     static final Logger LOGGER = LoggerFactory.getLogger(PipesBiDirectionalStreamingIntegrationTest.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    static File tikaConfigXmlTemplate = Paths
-            .get("src", "test", "resources", "tika-pipes-test-config.xml")
+    static File tikaConfigTemplate = Paths
+            .get("src", "test", "resources", "tika-pipes-test-config.json")
             .toFile();
-    static File tikaConfigXml = new File("target", "tika-config-" + UUID.randomUUID() + ".xml");
+    static File tikaConfig = new File("target", "tika-config-" + UUID.randomUUID() + ".json");
     static TikaGrpcServer grpcServer;
     static int grpcPort;
     static String httpServerUrl;
@@ -80,25 +77,18 @@ class PipesBiDirectionalStreamingIntegrationTest {
     String httpFetcherId = "httpFetcherIdHere";
     List<String> files = Arrays.asList("014760.docx", "017091.docx", "017097.docx", "018367.docx");
 
-    static int findAvailablePort() throws IOException {
-        try (ServerSocket serverSocket = new ServerSocket(0)) {
-            return serverSocket.getLocalPort();
-        }
-    }
-
     @BeforeAll
     static void setUpHttpServer() throws Exception {
-        // Specify the folder from which files will be served
-        httpServerPort = findAvailablePort();
-        httpServer = new Server(httpServerPort);
+        // bind port 0 and read back what the OS gave us: a port picked and released
+        // before binding is a port another process can take in between
+        httpServer = new Server(0);
 
         ResourceHandler resourceHandler = new ResourceHandler();
         resourceHandler.setDirAllowed(true);
-        // TODO when using jetty 12:
-        // resourceHandler.setBaseResourceAsString("src/test/resources/test-files")        
-        resourceHandler.setBaseResource(new PathResource(Paths.get("src", "test", "resources", "test-files")));
+        resourceHandler.setBaseResourceAsString("src/test/resources/test-files");
         httpServer.setHandler(resourceHandler);
         httpServer.start();
+        httpServerPort = ((ServerConnector) httpServer.getConnectors()[0]).getLocalPort();
 
         httpServerUrl = "http://" + InetAddress
                 .getByName("localhost")
@@ -107,18 +97,43 @@ class PipesBiDirectionalStreamingIntegrationTest {
 
     @BeforeAll
     static void setUpGrpcServer() throws Exception {
-        grpcPort = findAvailablePort();
-        FileUtils.copyFile(tikaConfigXmlTemplate, tikaConfigXml);
+        // Read the template config
+        String configContent = FileUtils.readFileToString(tikaConfigTemplate, StandardCharsets.UTF_8);
+
+        // Parse it as JSON to inject the correct javaPath
+        @SuppressWarnings("unchecked")
+        Map<String, Object> configMap = OBJECT_MAPPER.readValue(configContent, Map.class);
+        configMap.put("plugin-roots",
+                Paths.get("target").toAbsolutePath().resolve("plugins").toString());
+
+        // Get or create the pipes section
+        @SuppressWarnings("unchecked")
+        Map<String, Object> pipesSection = (Map<String, Object>) configMap.get("pipes");
+        if (pipesSection == null) {
+            pipesSection = new HashMap<>();
+            configMap.put("pipes", pipesSection);
+        }
+
+        // Set javaPath to the same Java running the test
+        String javaHome = System.getProperty("java.home");
+        String javaPath = javaHome + File.separator + "bin" + File.separator + "java";
+        pipesSection.put("javaPath", javaPath);
+        pipesSection.put("numClients", 1);
+
+        // Write the modified config
+        String modifiedConfig = OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(configMap);
+        FileUtils.writeStringToFile(tikaConfig, modifiedConfig, StandardCharsets.UTF_8);
 
         grpcServer = new TikaGrpcServer();
-        grpcServer.setTikaConfigXml(tikaConfigXml);
-        grpcServer.setPort(grpcPort);
+        grpcServer.setTikaConfig(tikaConfig);
+        grpcServer.setPort(0);
         grpcServer.setSecure(true);
         grpcServer.setCertChain(Paths.get("src", "test", "resources", "certs", "server1.pem").toFile());
         grpcServer.setPrivateKey(Paths.get("src", "test", "resources", "certs", "server1.key").toFile());
         grpcServer.setTrustCertCollection(Paths.get("src", "test", "resources", "certs", "ca.pem").toFile());
         grpcServer.setClientAuthRequired(true);
         grpcServer.start();
+        grpcPort = grpcServer.getPort();
 
         String target = InetAddress
                 .getByName("localhost")
@@ -154,45 +169,41 @@ class PipesBiDirectionalStreamingIntegrationTest {
 
     @AfterAll
     static void cleanConfig() throws Exception {
-        FileUtils.deleteQuietly(tikaConfigXml);
-    }
-
-    @BeforeEach
-    void createHttpFetcher() throws Exception {
-        SaveFetcherRequest saveFetcherRequest = SaveFetcherRequest
-                .newBuilder()
-                .setFetcherId(httpFetcherId)
-                .setFetcherClass(HttpFetcher.class.getName())
-                .setFetcherConfigJson(OBJECT_MAPPER.writeValueAsString(ImmutableMap
-                        .builder()
-                        .put("requestTimeout", 30_000)
-                        .put("socketTimeout", 30_000)
-                        .put("connectTimeout", 20_000)
-                        .put("maxConnectionsPerRoute", 200)
-                        .put("maxRedirects", 0)
-                        .put("maxSpoolSize", -1)
-                        .put("overallTimeout", 50_000)
-                        .build()))
-                .build();
-        SaveFetcherReply saveFetcherReply = tikaBlockingStub.saveFetcher(saveFetcherRequest);
-        Assertions.assertEquals(saveFetcherReply.getFetcherId(), httpFetcherId);
+        FileUtils.deleteQuietly(tikaConfig);
     }
 
     @Test
     void testHttpFetchScenario() throws Exception {
         AtomicInteger numParsed = new AtomicInteger();
+        AtomicInteger numErrors = new AtomicInteger();
         Map<String, Map<String, String>> result = Collections.synchronizedMap(new HashMap<>());
+        List<String> errorMessages = Collections.synchronizedList(new ArrayList<>());
         StreamObserver<FetchAndParseReply> responseObserver = new StreamObserver<>() {
             @Override
             public void onNext(FetchAndParseReply fetchAndParseReply) {
-                LOGGER.info("Parsed: {}", fetchAndParseReply.getFetchKey());
-                numParsed.incrementAndGet();
-                result.put(fetchAndParseReply.getFetchKey(), fetchAndParseReply.getFieldsMap());
+                String status = fetchAndParseReply.getStatus();
+                LOGGER.info("Parsed: {} with status: {}", fetchAndParseReply.getFetchKey(), status);
+                
+                // Check if this is an error status
+                if (status.contains("EXCEPTION") || status.contains("ERROR")) {
+                    numErrors.incrementAndGet();
+                    String errorMsg = String.format(Locale.ROOT, "Failed to parse %s - status: %s, message: %s",
+                        fetchAndParseReply.getFetchKey(), 
+                        status,
+                        fetchAndParseReply.getErrorMessage());
+                    errorMessages.add(errorMsg);
+                    LOGGER.error(errorMsg);
+                } else {
+                    numParsed.incrementAndGet();
+                    result.put(fetchAndParseReply.getFetchKey(), fetchAndParseReply.getFieldsMap());
+                }
             }
 
             @Override
             public void onError(Throwable throwable) {
                 LOGGER.error("Error occurred", throwable);
+                numErrors.incrementAndGet();
+                errorMessages.add("Stream error: " + throwable.getMessage());
             }
 
             @Override
@@ -210,8 +221,40 @@ class PipesBiDirectionalStreamingIntegrationTest {
         }
         request.onCompleted();
 
-        Awaitility.await().atMost(Duration.ofSeconds(600)).until(() -> result.size() == files.size());
+        Awaitility.await().atMost(Duration.ofSeconds(600)).until(() -> 
+            (result.size() + numErrors.get()) >= files.size());
 
+        // Fail the test if there were any errors
+        if (numErrors.get() > 0) {
+            Assertions.fail("Test failed with " + numErrors.get() + " errors:\n" + 
+                String.join("\n", errorMessages));
+        }
+        
         Assertions.assertEquals(files.size(), numParsed.get());
+        Assertions.assertEquals(files.size(), result.size());
+    }
+
+    @Test
+    void testClientAuthRequiredRejectsCertlessClient() throws Exception {
+        // Same running server as the other tests, but this channel presents no client
+        // certificate, so the call should fail at the handshake.
+        String target = InetAddress
+                .getByName("localhost")
+                .getHostAddress() + ":" + grpcPort;
+        TlsChannelCredentials.Builder channelCredBuilder = TlsChannelCredentials.newBuilder();
+        channelCredBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE.getTrustManagers());
+        ManagedChannel certlessChannel = Grpc
+                .newChannelBuilder(target, channelCredBuilder.build())
+                .build();
+        try {
+            TikaGrpc.TikaBlockingStub certlessStub = TikaGrpc.newBlockingStub(certlessChannel);
+            Assertions.assertThrows(StatusRuntimeException.class, () -> certlessStub.fetchAndParse(FetchAndParseRequest
+                    .newBuilder()
+                    .setFetcherId(httpFetcherId)
+                    .setFetchKey(httpServerUrl + "/" + files.get(0))
+                    .build()));
+        } finally {
+            certlessChannel.shutdownNow();
+        }
     }
 }

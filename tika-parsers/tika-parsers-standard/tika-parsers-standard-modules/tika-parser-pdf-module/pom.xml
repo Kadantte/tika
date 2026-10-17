@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-parsers-standard-modules</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
   <modelVersion>4.0.0</modelVersion>
@@ -52,11 +52,6 @@
         </exclusion>
       </exclusions>
     </dependency>
-    <dependency>
-      <groupId>org.apache.pdfbox</groupId>
-      <artifactId>jempbox</artifactId>
-      <version>${jempbox.version}</version>
-    </dependency>
     <!-- TIKA-370: PDFBox declares the Bouncy Castle dependencies
          as optional, but we prefer to have them always to avoid
          problems with encrypted PDFs. -->
@@ -67,15 +62,6 @@
     <dependency>
       <groupId>org.bouncycastle</groupId>
       <artifactId>bcprov-jdk18on</artifactId>
-    </dependency>
-    <!-- for java 10
-       See TIKA-2778 for why we need to do this now.
-        May the gods of API design fix this in the future.
-        only required for jackcess-encrypt
-       -->
-    <dependency>
-      <groupId>org.glassfish.jaxb</groupId>
-      <artifactId>jaxb-runtime</artifactId>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
@@ -89,8 +75,23 @@
     </dependency>
   </dependencies>
 
+  <properties>
+    <!-- TIKA-4816 metadata string-key ban, main sources; see tika-parent -->
+    <forbiddenapis.module.signaturesFile>${metadata.forbiddenapis.signaturesFile}</forbiddenapis.module.signaturesFile>
+  </properties>
+
   <build>
     <plugins>
+      <!-- needs an entry or it will fail?! -->
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>src/test/resources/test-documents/**</inputExclude>
+          </inputExcludes>
+        </configuration>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
@@ -113,6 +114,6 @@
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

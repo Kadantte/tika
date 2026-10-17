@@ -17,7 +17,6 @@
 package org.apache.tika.parser.odf;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -26,10 +25,10 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.DublinCore;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
-import org.apache.tika.metadata.OfficeOpenXMLCore;
 import org.apache.tika.metadata.OfficeOpenXMLExtended;
 import org.apache.tika.metadata.PagedText;
 import org.apache.tika.metadata.Property;
@@ -50,6 +49,10 @@ import org.apache.tika.sax.xpath.XPathParser;
  * Parser for OpenDocument <code>meta.xml</code> files.
  */
 public class OpenDocumentMetaParser extends XMLParser {
+
+    // Writes only meta:keyword: Office.KEYWORDS' dc:subject secondary would clobber the
+    // subject captured there; parse() merges subject + keywords into dc:subject itself.
+    private static final Property META_KEYWORD_ONLY = Property.internalTextBag("meta:keyword");
 
     public static final String ODF_VERSION_KEY = "odf:version";
     /**
@@ -84,7 +87,7 @@ public class OpenDocumentMetaParser extends XMLParser {
         // custom:Info1=Text1
         ContentHandler branch = new MatchingContentHandler(
                 new AttributeDependantMetadataHandler(md, "meta:name",
-                        Office.USER_DEFINED_METADATA_NAME_PREFIX), matcher);
+                        Office.USER_DEFINED), matcher);
         return new TeeContentHandler(ch, branch);
     }
 
@@ -131,18 +134,19 @@ public class OpenDocumentMetaParser extends XMLParser {
                         getDublinCoreHandler(md, TikaCoreProperties.RIGHTS, "rights"));
         ch = getVersion(ch, md);
         // Process the OO Meta Attributes
-        ch = getMeta(ch, md, TikaCoreProperties.CREATED, "creation-date");
+        ch = new TeeContentHandler(ch,
+                new DateElementHandler(META_NS, "creation-date", md, TikaCoreProperties.CREATED));
         // ODF uses dc:date for modified
         ch = new TeeContentHandler(ch,
-                new ElementMetadataHandler(DublinCore.NAMESPACE_URI_DC, "date", md,
+                new DateElementHandler(DublinCore.NAMESPACE_URI_DC, "date", md,
                         TikaCoreProperties.MODIFIED));
 
         // ODF uses dc:subject for description
         ch = new TeeContentHandler(ch,
                 new ElementMetadataHandler(DublinCore.NAMESPACE_URI_DC, "subject", md,
-                        OfficeOpenXMLCore.SUBJECT));
+                        TikaCoreProperties.SUBJECT));
 
-        ch = getMeta(ch, md, Office.KEYWORDS, "keyword");
+        ch = getMeta(ch, md, META_KEYWORD_ONLY, "keyword");
 
         ch = getMeta(ch, md, OfficeOpenXMLExtended.TOTAL_TIME, "editing-duration");
         ch = getMeta(ch, md, Property.externalText("editing-cycles"), "editing-cycles");
@@ -179,11 +183,11 @@ public class OpenDocumentMetaParser extends XMLParser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        super.parse(stream, handler, metadata, context);
+        super.parse(tis, handler, metadata, context);
         // Copy subject to description for OO2
-        String odfSubject = metadata.get(OfficeOpenXMLCore.SUBJECT);
+        String odfSubject = metadata.get(TikaCoreProperties.SUBJECT);
         if (odfSubject != null && !odfSubject.equals("") &&
                 (metadata.get(TikaCoreProperties.DESCRIPTION) == null ||
                         metadata.get(TikaCoreProperties.DESCRIPTION).equals(""))) {
@@ -197,8 +201,8 @@ public class OpenDocumentMetaParser extends XMLParser {
             subjects.addAll(Arrays.asList(metadata.getValues(Office.KEYWORDS)));
         }
 
-        if (metadata.getValues(OfficeOpenXMLCore.SUBJECT) != null) {
-            subjects.addAll(Arrays.asList(metadata.getValues(OfficeOpenXMLCore.SUBJECT)));
+        if (metadata.getValues(TikaCoreProperties.SUBJECT) != null) {
+            subjects.addAll(Arrays.asList(metadata.getValues(TikaCoreProperties.SUBJECT)));
         }
 
         if (subjects.size() > 0) {

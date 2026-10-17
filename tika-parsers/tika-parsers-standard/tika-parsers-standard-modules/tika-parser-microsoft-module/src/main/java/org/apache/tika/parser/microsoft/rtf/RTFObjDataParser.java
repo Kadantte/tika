@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,8 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-
 package org.apache.tika.parser.microsoft.rtf;
 
 import java.io.FileNotFoundException;
@@ -43,9 +41,11 @@ import org.apache.tika.exception.TikaMemoryLimitException;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.BoundedInputStream;
 import org.apache.tika.io.EndianUtils;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.RTFMetadata;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.microsoft.OfficeParser.POIFSDocumentType;
 
 /**
@@ -62,32 +62,25 @@ class RTFObjDataParser {
         this.memoryLimitInKb = memoryLimitInKb;
     }
 
-    /**
-     * Parses the embedded object/pict string
-     *
-     * @param is actual bytes (already converted from the
-     *              hex pair string stored in the embedded object data into actual bytes or read
-     *              as raw binary bytes)
-     * @return a SimpleRTFEmbObj or null
-     * @throws IOException if there are any surprise surprises during parsing
-     */
-
     private static boolean hasPOIFSHeader(InputStream is) throws IOException {
         return FileMagic.valueOf(is) == FileMagic.OLE2;
     }
 
     /**
-     * @param bytes
+     * Parses the embedded object/pict bytes (already converted from the hex pair string
+     * stored in the embedded object data, or read as raw binary bytes).
+     *
      * @param metadata             incoming metadata
-     * @param unknownFilenameCount
-     * @return byte[] for contents of obj data
-     * @throws IOException
+     * @param context              parse context, for the exception-reporting policy
+     * @param unknownFilenameCount counter for naming embedded objects that have no name
+     * @return byte[] for contents of obj data, or null if this is not an embedded object
      */
-    protected byte[] parse(byte[] bytes, Metadata metadata, AtomicInteger unknownFilenameCount)
+    protected byte[] parse(byte[] bytes, Metadata metadata, ParseContext context,
+                           AtomicInteger unknownFilenameCount)
             throws IOException, TikaException {
         UnsynchronizedByteArrayInputStream is = UnsynchronizedByteArrayInputStream.builder().setByteArray(bytes).get();
         long version = readUInt(is);
-        metadata.add(RTFMetadata.EMB_APP_VERSION, Long.toString(version));
+        metadata.add(RTFMetadata.EMBEDDED_APP_VERSION, Long.toString(version));
 
         long formatId = readUInt(is);
         //2 is an embedded object. 1 is a link.
@@ -99,13 +92,13 @@ class RTFObjDataParser {
         String itemName = readLengthPrefixedAnsiString(is).trim();
 
         if (className.length() > 0) {
-            metadata.add(RTFMetadata.EMB_CLASS, className);
+            metadata.add(RTFMetadata.EMBEDDED_CLASS, className);
         }
         if (topicName.length() > 0) {
-            metadata.add(RTFMetadata.EMB_TOPIC, topicName);
+            metadata.add(RTFMetadata.EMBEDDED_TOPIC, topicName);
         }
         if (itemName.length() > 0) {
-            metadata.add(RTFMetadata.EMB_ITEM, itemName);
+            metadata.add(RTFMetadata.EMBEDDED_ITEM, itemName);
         }
 
         long dataSz = readUInt(is);
@@ -124,14 +117,14 @@ class RTFObjDataParser {
             try {
                 hasPoifs = hasPOIFSHeader(embIs);
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
                 return embObjBytes;
             }
             if (hasPoifs) {
                 try {
                     return handleEmbeddedPOIFS(embIs, metadata, unknownFilenameCount);
                 } catch (Exception e) {
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
                 }
             }
         }
@@ -200,10 +193,11 @@ class RTFObjDataParser {
                                 memoryLimitInKb * 1024);
                     }
                     ret = out.toByteArray();
-                    metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
-                            "file_" + unknownFilenameCount.getAndIncrement() + "." +
-                                    type.getExtension());
-                    metadata.set(Metadata.CONTENT_TYPE, type.getType().toString());
+                    EmbeddedDocumentUtil.setGeneratedResourceName(metadata,
+                            EmbeddedDocumentUtil.EmbeddedResourcePrefix.EMBEDDED,
+                            unknownFilenameCount.getAndIncrement(),
+                            type.getType().toString());
+                    metadata.set(HttpHeaders.CONTENT_TYPE, type.getType().toString());
                 }
             }
         }
@@ -344,4 +338,3 @@ class RTFObjDataParser {
 
     }
 }
-

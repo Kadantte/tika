@@ -1,0 +1,592 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.core;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.PipesResult;
+import org.apache.tika.pipes.api.emitter.EmitKey;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
+
+/**
+ * Integration tests for shared server mode.
+ * <p>
+ * These tests verify that multiple PipesClients can share a single PipesServer
+ * process, reducing memory overhead while maintaining correct functionality.
+ */
+public class SharedServerModeTest {
+
+    private static final String FETCHER_NAME = "fsf";
+    private static final String EMITTER_NAME = "fse";
+
+    private static final String MOCK_OK = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+            "<mock>" +
+            "<metadata action=\"add\" name=\"dc:creator\">Test Author</metadata>" +
+            "<write element=\"p\">Test content</write>" +
+            "</mock>";
+
+    private static final String MOCK_SLOW = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+            "<mock>" +
+            "<metadata action=\"add\" name=\"dc:creator\">Slow Author</metadata>" +
+            "<write element=\"p\">Slow content</write>" +
+            "<fakeload millis=\"500\" cpu=\"1\" mb=\"10\"/>" +
+            "</mock>";
+
+    private static final String MOCK_OOM = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+            "<mock>" +
+            "<throw class=\"java.lang.OutOfMemoryError\">oom message</throw>" +
+            "</mock>";
+
+    // hangs 60s with no runtime TimeoutLimits override, so tika-config-shared-server.json's
+    // progressTimeoutMillis is what detects it: keep that short or this stops testing anything
+    private static final String MOCK_TIMEOUT = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+            "<mock>" +
+            "<metadata action=\"add\" name=\"dc:creator\">Timeout Author</metadata>" +
+            "<write element=\"p\">Timeout content</write>" +
+            "<fakeload millis=\"60000\" cpu=\"1\" mb=\"10\"/>" +
+            "</mock>";
+
+    private static final String MOCK_INFLIGHT = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+            "<mock>" +
+            "<metadata action=\"add\" name=\"dc:creator\">In-flight Author</metadata>" +
+            "<write element=\"p\">In-flight content</write>" +
+            "<fakeload millis=\"3000\" cpu=\"1\" mb=\"10\"/>" +
+            "</mock>";
+
+    @Test
+    public void testSharedModeMatchesPerClientMode(@TempDir Path tmp) throws Exception {
+        Path inputDir = setupInputDir(tmp);
+        String testFile = "compare.xml";
+        Files.writeString(inputDir.resolve(testFile), MOCK_OK, StandardCharsets.UTF_8);
+        int numFiles = 20;
+        for (int i = 0; i < numFiles; i++) {
+            Files.writeString(inputDir.resolve("test" + i + ".xml"), MOCK_OK, StandardCharsets.UTF_8);
+        }
+
+        Path outputDir = tmp.resolve("output");
+        Files.createDirectories(outputDir);
+
+        Path perClientConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(tmp, inputDir, outputDir);
+        TikaJsonConfig perClientConfig = TikaJsonConfig.load(perClientConfigPath);
+        PipesConfig perClientPipesConfig = PipesConfig.load(perClientConfig);
+        assertFalse(perClientPipesConfig.isUseSharedServer(), "Shared server mode should be disabled by default");
+
+        Metadata perClientMetadata;
+        try (PipesParser parser = PipesParser.load(perClientConfig, perClientPipesConfig)) {
+            assertFalse(parser.isSharedMode(), "PipesParser should NOT be in shared mode");
+            PipesResult result = parse(parser, testFile);
+            assertTrue(result.isSuccess(), "Parse should succeed in per-client mode");
+            perClientMetadata = result.emitData().getMetadataList().get(0);
+        }
+
+        Path sharedConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, outputDir, false);
+        TikaJsonConfig sharedConfig = TikaJsonConfig.load(sharedConfigPath);
+        PipesConfig sharedPipesConfig = PipesConfig.load(sharedConfig);
+        assertTrue(sharedPipesConfig.isUseSharedServer(), "Shared server mode should be enabled");
+
+        try (PipesParser pipesParser = PipesParser.load(sharedConfig, sharedPipesConfig)) {
+            assertTrue(pipesParser.isSharedMode(), "PipesParser should be in shared mode");
+
+            PipesResult result = parse(pipesParser, testFile);
+            assertTrue(result.isSuccess(), "Parse should succeed");
+            assertNotNull(result.emitData().getMetadataList());
+            assertEquals(1, result.emitData().getMetadataList().size());
+            Metadata sharedMetadata = result.emitData().getMetadataList().get(0);
+            assertEquals("Test Author", sharedMetadata.get("dc:creator"));
+
+            assertEquals(
+                    perClientMetadata.get(TikaCoreProperties.RESOURCE_NAME_KEY),
+                    sharedMetadata.get(TikaCoreProperties.RESOURCE_NAME_KEY),
+                    "Resource name should match between modes");
+            assertEquals(
+                    perClientMetadata.get("dc:creator"),
+                    sharedMetadata.get("dc:creator"),
+                    "Creator should match between modes");
+            assertEquals(
+                    perClientMetadata.get(TikaCoreProperties.TIKA_CONTENT),
+                    sharedMetadata.get(TikaCoreProperties.TIKA_CONTENT),
+                    "Content should match between modes");
+
+            // sequential requests on the same parser
+            for (int i = 0; i < 3; i++) {
+                String fileName = "test" + i + ".xml";
+                result = parse(pipesParser, fileName);
+                assertTrue(result.isSuccess(), "Parse of " + fileName + " should succeed");
+                assertNotNull(result.emitData().getMetadataList());
+            }
+
+            // concurrent requests
+            ExecutorService executor = Executors.newFixedThreadPool(8);
+            try {
+                List<Future<PipesResult>> futures = new ArrayList<>();
+                for (int i = 0; i < numFiles; i++) {
+                    String fileName = "test" + i + ".xml";
+                    futures.add(executor.submit(() -> parse(pipesParser, fileName)));
+                }
+                int successCount = 0;
+                for (Future<PipesResult> future : futures) {
+                    PipesResult concurrentResult = future.get();
+                    if (concurrentResult.isSuccess()) {
+                        successCount++;
+                        assertNotNull(concurrentResult.emitData().getMetadataList());
+                        assertEquals("Test Author",
+                                concurrentResult.emitData().getMetadataList().get(0).get("dc:creator"));
+                    }
+                }
+                assertEquals(numFiles, successCount, "All concurrent requests should succeed");
+            } finally {
+                executor.shutdown();
+            }
+        }
+    }
+
+    @Test
+    public void testGracefulShutdown(@TempDir Path tmp) throws Exception {
+        Path inputDir = setupInputDir(tmp);
+        Files.writeString(inputDir.resolve("test.xml"), MOCK_OK, StandardCharsets.UTF_8);
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        // Create and close parser multiple times to verify graceful shutdown/restart
+        for (int iteration = 0; iteration < 2; iteration++) {
+            try (PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig)) {
+                PipesResult result = pipesParser.parse(new FetchEmitTuple(
+                        "test.xml",
+                        new FetchKey(FETCHER_NAME, "test.xml"),
+                        new EmitKey(EMITTER_NAME, ""),
+                        new Metadata(),
+                        new ParseContext(),
+                        FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+                assertTrue(result.isSuccess(),
+                        "Parse should succeed on iteration " + iteration);
+            }
+            // PipesParser closed - server should shut down cleanly
+        }
+    }
+
+    /**
+     * Verifies that close() unblocks an in-flight parse and returns promptly when
+     * the parser is shut down at a randomized point in the parse lifecycle.
+     * <p>
+     * After a warmup parse to ensure the shared server is fully started, this picks
+     * a random sleep in [0, 4000]ms before calling close(). Given the inflight
+     * fakeload runs ~3000ms, the chosen delay can land in init, mid-parse, near the
+     * tail of parse, or post-completion. The seed is logged and included in every
+     * assertion message so a CI failure can be reproduced via
+     * {@code -DcloseInFlightSeed=<seed>}.
+     */
+    @Test
+    public void testCloseAtRandomPhase(@TempDir Path tmp) throws Exception {
+        long seed = Long.getLong("closeInFlightSeed", System.nanoTime());
+        java.util.Random rng = new java.util.Random(seed);
+        long sleepBeforeCloseMs = rng.nextInt(4001); // [0, 4000]
+        String repro = "[seed=" + seed + ", sleep=" + sleepBeforeCloseMs + "ms]";
+        System.out.println("testCloseAtRandomPhase " + repro);
+
+        Path inputDir = setupInputDir(tmp);
+        Files.writeString(inputDir.resolve("warmup.xml"), MOCK_OK, StandardCharsets.UTF_8);
+        Files.writeString(inputDir.resolve("inflight.xml"), MOCK_INFLIGHT, StandardCharsets.UTF_8);
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            // Warmup so the shared server is fully started; without this, short
+            // sleeps would always land in init rather than reaching mid-parse.
+            PipesResult warmup = pipesParser.parse(new FetchEmitTuple(
+                    "warmup.xml",
+                    new FetchKey(FETCHER_NAME, "warmup.xml"),
+                    new EmitKey(EMITTER_NAME, ""),
+                    new Metadata(),
+                    new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertTrue(warmup.isSuccess(), "Warmup parse must succeed " + repro);
+
+            Future<PipesResult> future = executor.submit(() -> pipesParser.parse(new FetchEmitTuple(
+                    "inflight.xml",
+                    new FetchKey(FETCHER_NAME, "inflight.xml"),
+                    new EmitKey(EMITTER_NAME, ""),
+                    new Metadata(),
+                    new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP)));
+
+            if (sleepBeforeCloseMs > 0) {
+                Thread.sleep(sleepBeforeCloseMs);
+            }
+
+            long closeStart = System.currentTimeMillis();
+            pipesParser.close();
+            long closeDuration = System.currentTimeMillis() - closeStart;
+
+            assertTrue(closeDuration < 15000,
+                    "close() should return promptly even with in-flight work; took " +
+                            closeDuration + "ms " + repro);
+
+            // The in-flight request must return - not deadlock waiting on a closed socket
+            PipesResult result = future.get(15, TimeUnit.SECONDS);
+            assertNotNull(result, "In-flight parse should return a result, not hang " + repro);
+            // Result may be SUCCESS (parse finished before close) or a crash/init-failure
+            // status (close tore down the socket mid-flight) - both are acceptable.
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    public void testEachOomForksReplacementServer(@TempDir Path tmp) throws Exception {
+        // Each OOM must kill the shared JVM and fork a replacement; reconnecting to the
+        // same (corrupted) server was a real bug when ConnectionHandler didn't System.exit().
+        Path inputDir = setupInputDir(tmp);
+        Files.writeString(inputDir.resolve("warmup.xml"), MOCK_OK, StandardCharsets.UTF_8);
+        // three: generations > 1 must be replaced too, and the restart bookkeeping must not drift
+        for (int i = 0; i < 3; i++) {
+            Files.writeString(inputDir.resolve("oom" + i + ".xml"), MOCK_OOM, StandardCharsets.UTF_8);
+            Files.writeString(inputDir.resolve("ok" + i + ".xml"), MOCK_OK, StandardCharsets.UTF_8);
+        }
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig)) {
+            assertTrue(parse(pipesParser, "warmup.xml").isSuccess(), "warmup should succeed");
+            assertTrue(pipesParser.getCurrentServerPort() > 0, "should have a port after warmup");
+            long generation = pipesParser.getGeneration();
+
+            for (int i = 0; i < 3; i++) {
+                assertEquals(PipesResult.RESULT_STATUS.OOM, parse(pipesParser, "oom" + i + ".xml").status(),
+                        "OOM " + i);
+                PipesResult okResult = parse(pipesParser, "ok" + i + ".xml");
+                assertTrue(okResult.isSuccess(), "after OOM " + i + ": " + okResult.status());
+                assertEquals("Test Author", okResult.emitData().getMetadataList().get(0).get("dc:creator"));
+
+                // generation, not the port: bind(0) may legitimately hand back the port just freed
+                assertEquals(generation + i + 1, pipesParser.getGeneration(),
+                        "exactly one fork per OOM, after OOM " + i);
+                assertTrue(pipesParser.getCurrentServerPort() > 0, "replacement must be listening");
+            }
+        }
+    }
+
+    private static PipesResult parse(PipesParser pipesParser, String name) throws Exception {
+        return pipesParser.parse(new FetchEmitTuple(name, new FetchKey(FETCHER_NAME, name),
+                new EmitKey(EMITTER_NAME, ""), new Metadata(), new ParseContext(),
+                FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+    }
+
+    @Test
+    public void testTimeoutRecovery(@TempDir Path tmp) throws Exception {
+        // Test that timeout causes server crash and subsequent requests succeed after restart
+        Path inputDir = setupInputDir(tmp);
+        Files.writeString(inputDir.resolve("timeout.xml"), MOCK_TIMEOUT, StandardCharsets.UTF_8);
+        Files.writeString(inputDir.resolve("ok.xml"), MOCK_OK, StandardCharsets.UTF_8);
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig)) {
+            // Trigger timeout
+            PipesResult timeoutResult = pipesParser.parse(new FetchEmitTuple(
+                    "timeout.xml",
+                    new FetchKey(FETCHER_NAME, "timeout.xml"),
+                    new EmitKey(EMITTER_NAME, ""),
+                    new Metadata(),
+                    new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            // Timeout should be reported
+            assertEquals(PipesResult.RESULT_STATUS.TIMEOUT, timeoutResult.status(),
+                    "Timeout file should return TIMEOUT status");
+
+            // Verify recovery
+            PipesResult okResult = pipesParser.parse(new FetchEmitTuple(
+                    "ok.xml",
+                    new FetchKey(FETCHER_NAME, "ok.xml"),
+                    new EmitKey(EMITTER_NAME, ""),
+                    new Metadata(),
+                    new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            assertTrue(okResult.isSuccess(),
+                    "After timeout, server should restart and subsequent request should succeed. Got: " + okResult.status());
+        }
+    }
+
+    @Test
+    public void testOomWithConcurrentSlowRequestsThenRecovery(@TempDir Path tmp) throws Exception {
+        // Test: 5 slow requests + 1 OOM concurrently, then pause, then 5 OK requests concurrently
+        // This verifies the server properly restarts and can handle new concurrent requests
+        Path inputDir = setupInputDir(tmp);
+
+        // Create slow files
+        for (int i = 0; i < 5; i++) {
+            Files.writeString(inputDir.resolve("slow" + i + ".xml"), MOCK_SLOW, StandardCharsets.UTF_8);
+        }
+        // Create OOM file
+        Files.writeString(inputDir.resolve("oom.xml"), MOCK_OOM, StandardCharsets.UTF_8);
+        // Create OK files for recovery test
+        for (int i = 0; i < 5; i++) {
+            Files.writeString(inputDir.resolve("ok" + i + ".xml"), MOCK_OK, StandardCharsets.UTF_8);
+        }
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig)) {
+            ExecutorService executor = Executors.newFixedThreadPool(6);
+
+            // Phase 1: Submit 5 slow requests + 1 OOM concurrently
+            List<Future<PipesResult>> phase1Futures = new ArrayList<>();
+
+            // Submit slow requests
+            for (int i = 0; i < 5; i++) {
+                final int idx = i;
+                phase1Futures.add(executor.submit(() -> pipesParser.parse(new FetchEmitTuple(
+                        "slow" + idx + ".xml",
+                        new FetchKey(FETCHER_NAME, "slow" + idx + ".xml"),
+                        new EmitKey(EMITTER_NAME, ""),
+                        new Metadata(),
+                        new ParseContext(),
+                        FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP))));
+            }
+
+            // Let the slow parses get in flight so the OOM kills live siblings
+            Thread.sleep(100);
+            phase1Futures.add(executor.submit(() -> pipesParser.parse(new FetchEmitTuple(
+                    "oom.xml",
+                    new FetchKey(FETCHER_NAME, "oom.xml"),
+                    new EmitKey(EMITTER_NAME, ""),
+                    new Metadata(),
+                    new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP))));
+
+            // Wait for all phase 1 requests to complete
+            int phase1OomCount = 0;
+            int phase1SuccessCount = 0;
+            int phase1CrashCount = 0;
+            for (Future<PipesResult> future : phase1Futures) {
+                PipesResult result = future.get();
+                if (result.status() == PipesResult.RESULT_STATUS.OOM) {
+                    phase1OomCount++;
+                } else if (result.isSuccess()) {
+                    phase1SuccessCount++;
+                } else if (result.isProcessCrash()) {
+                    phase1CrashCount++;
+                }
+            }
+
+            // At least one OOM should have been detected
+            assertTrue(phase1OomCount >= 1, "At least one OOM should be detected in phase 1");
+
+            // Brief pause to ensure server has fully restarted
+            Thread.sleep(500);
+
+            // Phase 2: Submit 5 OK requests concurrently - all should succeed
+            List<Future<PipesResult>> phase2Futures = new ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                final int idx = i;
+                phase2Futures.add(executor.submit(() -> pipesParser.parse(new FetchEmitTuple(
+                        "ok" + idx + ".xml",
+                        new FetchKey(FETCHER_NAME, "ok" + idx + ".xml"),
+                        new EmitKey(EMITTER_NAME, ""),
+                        new Metadata(),
+                        new ParseContext(),
+                        FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP))));
+            }
+
+            // All phase 2 requests must succeed to prove recovery
+            int phase2SuccessCount = 0;
+            for (Future<PipesResult> future : phase2Futures) {
+                PipesResult result = future.get();
+                if (result.isSuccess()) {
+                    phase2SuccessCount++;
+                    assertEquals("Test Author", result.emitData().getMetadataList().get(0).get("dc:creator"));
+                }
+            }
+
+            executor.shutdown();
+
+            // All 5 recovery requests must succeed
+            assertEquals(5, phase2SuccessCount,
+                    "All 5 phase 2 requests should succeed after server recovery. " +
+                    "Phase 1 had: " + phase1OomCount + " OOMs, " + phase1SuccessCount + " successes, " +
+                    phase1CrashCount + " crashes");
+
+            assertRestartsAttributedToOom(pipesParser);
+            assertOneForkPerDeath(pipesParser, 1);
+        }
+    }
+
+    /**
+     * The shared JVM died {@code deaths} times. Siblings whose in-flight parses were killed by a
+     * death report a crash <em>result</em>, which is correct -- but none of them is another death,
+     * so none may cause another fork. Generation counts forks directly, so it cannot be satisfied
+     * by relabelling a spurious restart: one death, one replacement.
+     */
+    private void assertOneForkPerDeath(PipesParser pipesParser, int deaths) {
+        long forks = pipesParser.getGeneration();
+        assertEquals(deaths + 1, forks,
+                "expected the initial fork plus exactly " + deaths + " replacement(s); a sibling's "
+                        + "report about an already-replaced process must not restart its healthy "
+                        + "successor (forks=" + forks + ")");
+    }
+
+    /**
+     * The conservation law behind every restart-accounting bug in this class: a fork must be
+     * caused by something. At most {@code ooms} worker deaths can occur (one document can kill the
+     * shared JVM once), no file limit is reached in these short rounds, so the manager may fork at
+     * most that many replacements on top of its initial start.
+     * <p>
+     * Unlike the fixed OOM fixtures, this does not depend on catching one lucky interleaving --
+     * it holds under every schedule, so a spurious restart is caught whether or not the timing
+     * that produced it happened to repeat. Seeds are fixed so a failure is reproducible; the
+     * concurrency supplies the variation.
+     */
+    @Test
+    @Timeout(600)
+    public void testForksNeverExceedInjectedFaults(@TempDir Path tmp) throws Exception {
+        for (int seed = 1; seed <= 3; seed++) {
+            runFaultRound(seed, Files.createDirectories(tmp.resolve("seed" + seed)));
+        }
+    }
+
+    private void runFaultRound(int seed, Path tmp) throws Exception {
+        Random random = new Random(seed);
+        Path inputDir = setupInputDir(tmp);
+
+        int ooms = 1 + random.nextInt(2);
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < ooms; i++) {
+            String name = "oom" + i + ".xml";
+            Files.writeString(inputDir.resolve(name), MOCK_OOM, StandardCharsets.UTF_8);
+            names.add(name);
+        }
+        for (int i = 0; i < 4; i++) {
+            String name = "slow" + i + ".xml";
+            Files.writeString(inputDir.resolve(name), MOCK_SLOW, StandardCharsets.UTF_8);
+            names.add(name);
+        }
+        for (int i = 0; i < 6; i++) {
+            String name = "ok" + i + ".xml";
+            Files.writeString(inputDir.resolve(name), MOCK_OK, StandardCharsets.UTF_8);
+            names.add(name);
+        }
+        Collections.shuffle(names, random);
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-shared-server.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesParser pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig)) {
+            ExecutorService executor = Executors.newFixedThreadPool(6);
+            try {
+                List<Future<PipesResult>> futures = new ArrayList<>();
+                for (String name : names) {
+                    futures.add(executor.submit(() -> pipesParser.parse(new FetchEmitTuple(
+                            name,
+                            new FetchKey(FETCHER_NAME, name),
+                            new EmitKey(EMITTER_NAME, ""),
+                            new Metadata(),
+                            new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP))));
+                }
+                for (Future<PipesResult> future : futures) {
+                    future.get();
+                }
+            } finally {
+                executor.shutdown();
+                executor.awaitTermination(30, TimeUnit.SECONDS);
+            }
+
+            long forks = pipesParser.getGeneration();
+            assertTrue(forks - 1 <= ooms,
+                    "seed=" + seed + ": the shared worker forked " + (forks - 1) + " replacement(s) "
+                            + "but at most " + ooms + " death(s) could have occurred; a report about "
+                            + "an already-replaced process must not restart its healthy successor");
+            assertTrue(forks >= 1, "seed=" + seed + ": the worker must have started at least once");
+        }
+    }
+
+    /**
+     * The shared JVM died once, from OOM. Siblings whose in-flight parses were killed by that
+     * death report a crash <em>result</em>, which is correct; none of them is a second process
+     * death, so nothing may be booked as an extra restart.
+     */
+    private void assertRestartsAttributedToOom(PipesParser pipesParser) {
+        long oom = pipesParser.getRestartCount(RestartReason.OOM);
+        long crash = pipesParser.getRestartCount(RestartReason.CRASH);
+        String counts = " (oom=" + oom + ", crash=" + crash + ", timeout=" +
+                pipesParser.getRestartCount(RestartReason.TIMEOUT) + ", maxFiles=" +
+                pipesParser.getRestartCount(RestartReason.MAX_FILES) + ")";
+        assertTrue(oom >= 1, "the OOM death should be attributed to OOM" + counts);
+        assertEquals(0, crash,
+                "no restart may be attributed to CRASH: the only process death was the OOM" + counts);
+        // Reason tags alone cannot distinguish "the phantom restart is gone" from "the phantom
+        // restart is now labelled OOM". Total restarts is the honest observable: one death, one
+        // restart, whatever it is called.
+        long total = 0;
+        for (RestartReason r : RestartReason.values()) {
+            total += pipesParser.getRestartCount(r);
+        }
+        assertEquals(1, total, "exactly one restart may follow a single process death" + counts);
+    }
+
+    private Path setupInputDir(Path tmp) throws Exception {
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        return inputDir;
+    }
+}

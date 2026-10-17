@@ -18,9 +18,12 @@ package org.apache.tika.parser.microsoft.libpst;
 
 import java.io.Serializable;
 
+import org.apache.tika.config.OperatorOnly;
+import org.apache.tika.exception.TikaConfigException;
+
 public class LibPstParserConfig implements Serializable {
 
-    private long timeoutSeconds = 600;
+    private long timeoutMillis = 600_000;
     /**
      * In initial tests, setting this to true resulted in more emails
      * being extracted. It did dramatically slow down processing time. :(
@@ -41,12 +44,18 @@ public class LibPstParserConfig implements Serializable {
      */
     private int maxEmails = -1;
 
-    public long getTimeoutSeconds() {
-        return timeoutSeconds;
+    /**
+     * This should include the path up to but not including 'readpst', e.g. "C:\my_bin" where
+     * readpst is at "C:\my_bin\readpst"
+     */
+    private String readPstPath = "";
+
+    public long getTimeoutMillis() {
+        return timeoutMillis;
     }
 
-    public void setTimeoutSeconds(long timeoutSeconds) {
-        this.timeoutSeconds = timeoutSeconds;
+    public void setTimeoutMillis(long timeoutMillis) {
+        this.timeoutMillis = timeoutMillis;
     }
 
     public boolean isDebug() {
@@ -79,5 +88,14 @@ public class LibPstParserConfig implements Serializable {
 
     public void setMaxEmails(int maxEmails) {
         this.maxEmails = maxEmails;
+    }
+
+    public String getReadPstPath() {
+        return readPstPath;
+    }
+
+    @OperatorOnly
+    public void setReadPstPath(String readPstPath) throws TikaConfigException {
+        this.readPstPath = readPstPath;
     }
 }

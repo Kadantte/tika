@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core;
 
 import java.io.InputStream;
@@ -35,7 +34,7 @@ public class TikaMimeTypesTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(TikaMimeTypes.class);
-        sf.setResourceProvider(TikaMimeTypes.class, new SingletonResourceProvider(new TikaMimeTypes()));
+        sf.setResourceProvider(TikaMimeTypes.class, new SingletonResourceProvider(new TikaMimeTypes(tikaResource)));
     }
 
     @Override

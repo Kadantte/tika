@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.language.translate.impl;
 
 import java.io.IOException;
@@ -22,6 +21,7 @@ import java.util.HashMap;
 
 import com.fasterxml.jackson.databind.util.LRUMap;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.language.detect.LanguageResult;
 import org.apache.tika.language.translate.Translator;
@@ -29,6 +29,7 @@ import org.apache.tika.language.translate.Translator;
 /**
  * CachedTranslator. Saves a map of previous translations in order to prevent repetitive translation requests.
  */
+@TikaComponent
 public class CachedTranslator extends AbstractTranslator {
     private static final int INITIAL_ENTRIES = 100;
     private static final int MAX_ENTRIES = 1000;

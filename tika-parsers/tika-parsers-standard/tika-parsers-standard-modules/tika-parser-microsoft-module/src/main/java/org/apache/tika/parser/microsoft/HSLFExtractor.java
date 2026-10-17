@@ -17,13 +17,13 @@
 package org.apache.tika.parser.microsoft;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.apache.poi.common.usermodel.Hyperlink;
 import org.apache.poi.hslf.exceptions.EncryptedPowerPointFileException;
 import org.apache.poi.hslf.model.HeadersFooters;
@@ -38,6 +38,7 @@ import org.apache.poi.hslf.usermodel.HSLFNotes;
 import org.apache.poi.hslf.usermodel.HSLFObjectData;
 import org.apache.poi.hslf.usermodel.HSLFObjectShape;
 import org.apache.poi.hslf.usermodel.HSLFPictureData;
+import org.apache.poi.hslf.usermodel.HSLFPictureShape;
 import org.apache.poi.hslf.usermodel.HSLFShape;
 import org.apache.poi.hslf.usermodel.HSLFSlide;
 import org.apache.poi.hslf.usermodel.HSLFSlideShow;
@@ -58,9 +59,12 @@ import org.xml.sax.helpers.AttributesImpl;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
+import org.apache.tika.metadata.PageAnchoring;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
@@ -221,10 +225,15 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                 continue;
             }
             String filename = d.getFileName();
+            boolean inferredExtension = false;
             if (StringUtils.isBlank(filename)) {
-                filename = "UNKNOWN-" + i;
+                filename = EmbeddedDocumentUtil.generateResourceName(
+                        EmbeddedDocumentUtil.EmbeddedResourcePrefix.EMBEDDED,
+                        i, getDetectedMediaType(d));
+                inferredExtension = true;
             }
-            try (TikaInputStream tis = TikaInputStream.get(d.getInputStream())) {
+            try (TikaInputStream tis = TikaInputStream.get(d::getInputStream,
+                    new TemporaryResources(), null)) {
                 if (FileMagic.valueOf(tis) == FileMagic.OLE2) {
                     try (POIFSFileSystem pfs = new POIFSFileSystem(tis)) {
                         //coz ppts can have empty pfs...shrug...
@@ -232,7 +241,13 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                         if (pfs.getRoot().getEntryNames().size() < 1) {
                             return;
                         }
-                        handleEmbeddedOfficeDoc(pfs.getRoot(), filename, xhtml, outputHtml);
+                        Metadata metadata = Metadata.newInstance(context);
+                        if (inferredExtension) {
+                            metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED,
+                                    true);
+                        }
+                        handleEmbeddedOfficeDoc(pfs.getRoot(), metadata, filename,
+                                xhtml, outputHtml);
                     }
                 } else {
                     boolean shouldProcess = false;
@@ -244,11 +259,17 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                         tis.reset();
                     }
                     if (shouldProcess) {
-                        handleEmbeddedResource(tis, filename, null, null, xhtml, true);
+                        Metadata metadata = Metadata.newInstance(context);
+                        if (inferredExtension) {
+                            metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED,
+                                    true);
+                        }
+                        handleEmbeddedResource(tis, metadata, filename, null,
+                                null, null, xhtml, true);
                     }
                 }
             } catch (IOException | TikaException e) {
-                EmbeddedDocumentUtil.recordException(e, parentMetadata);
+                EmbeddedDocumentUtil.recordException(e, parentMetadata, context);
             }
             i++;
         }
@@ -406,12 +427,12 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                         objData.getInputStream())) {
                     try {
                         OfficeParser.extractMacros(poifsFileSystem, xhtml,
-                                EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context));
-                    } catch (IOException | SAXException inner) {
-                        EmbeddedDocumentUtil.recordException(inner, parentMetadata);
+                                EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context), context);
+                    } catch (IOException | SAXException | TikaException inner) {
+                        EmbeddedDocumentUtil.recordException(inner, parentMetadata, context);
                     }
                 } catch (IOException e) {
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);//swallow
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                 }
             }
         }
@@ -537,6 +558,12 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
 
     private void handleSlideEmbeddedPictures(HSLFSlideShow slideshow, XHTMLContentHandler xhtml)
             throws TikaException, SAXException, IOException {
+        // Build picture-index → slide numbers map so each image carries its page number
+        Map<Integer, Set<Integer>> picToSlides = new HashMap<>();
+        for (HSLFSlide slide : slideshow.getSlides()) {
+            collectPictureSlides(slide, slide.getSlideNumber(), picToSlides);
+        }
+
         for (HSLFPictureData pic : slideshow.getPictureData()) {
             String mediaType;
 
@@ -560,11 +587,47 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
             } catch (SecurityException e) {
                 throw e;
             } catch (Exception e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                 continue;
             }
             try (TikaInputStream picIs = TikaInputStream.get(data)) {
-                handleEmbeddedResource(picIs, null, null, mediaType, xhtml, false);
+                String picName = EmbeddedDocumentUtil.generateResourceName(
+                        EmbeddedDocumentUtil.EmbeddedResourcePrefix.IMAGE,
+                        pic.getIndex(), mediaType);
+                Metadata picMetadata = Metadata.newInstance(context);
+                picMetadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
+                PageAnchoring.applyPageMetadata(picMetadata, picToSlides.get(pic.getIndex()));
+                handleEmbeddedResource(picIs, picMetadata, picName, null,
+                        null, mediaType, xhtml, false);
+            }
+        }
+    }
+
+    /**
+     * Walks all shapes in {@code container} and records, for each
+     * {@link HSLFPictureShape}, the 1-based slide number in {@code picToSlides}.
+     */
+    private void collectPictureSlides(ShapeContainer container, int slideNum,
+                                      Map<Integer, Set<Integer>> picToSlides) {
+        List<HSLFShape> shapes = getShapes(container);
+        if (shapes == null) {
+            return;
+        }
+        for (HSLFShape shape : shapes) {
+            if (shape instanceof HSLFPictureShape) {
+                HSLFPictureData pd;
+                try {
+                    pd = ((HSLFPictureShape) shape).getPictureData();
+                } catch (IndexOutOfBoundsException e) {
+                    // corrupt Escher BSE record -- skip page anchoring for this shape
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
+                    continue;
+                }
+                if (pd != null) {
+                    picToSlides.computeIfAbsent(pd.getIndex(), k -> new HashSet<>()).add(slideNum);
+                }
+            } else if (shape instanceof HSLFGroupShape) {
+                collectPictureSlides((HSLFGroupShape) shape, slideNum, picToSlides);
             }
         }
     }
@@ -586,7 +649,7 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                     data = oleShape.getObjectData();
                 } catch (NullPointerException e) {
                     /* getObjectData throws NPE some times. */
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                     continue;
                 }
 
@@ -602,50 +665,47 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
                     attributes.addAttribute("", "id", "id", "CDATA", objID);
                     xhtml.startElement("div", attributes);
                     xhtml.endElement("div");
-                    InputStream dataStream = null;
+                    //open once now so a broken record is recorded here, not mid-parse
                     try {
-                        dataStream = data.getInputStream();
+                        data.getInputStream().close();
                     } catch (Exception e) {
-                        EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                        EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                         continue;
                     }
-                    handleDataStream(dataStream, objID, oleShape.getProgId(), xhtml);
+                    handleDataStream(data, objID, oleShape.getProgId(), xhtml);
                 }
             }
         }
     }
 
-    private void handleDataStream(InputStream dataStream, String objID, String progId,
+    private void handleDataStream(HSLFObjectData data, String objID, String progId,
                                   XHTMLContentHandler xhtml) {
         //TODO -- inject progId into the metadata of the embedded file
-        try (TikaInputStream stream = TikaInputStream.get(dataStream)) {
+        try (TikaInputStream tis = TikaInputStream.get(data::getInputStream,
+                new TemporaryResources(), null)) {
             String mediaType = null;
             if ("Excel.Chart.8".equals(progId)) {
                 mediaType = "application/vnd.ms-excel";
             } else {
-                MediaType mt =
-                        getTikaConfig().getDetector().detect(stream, new Metadata());
+                MediaType mt = getDetector().detect(tis, Metadata.newInstance(context), context);
                 mediaType = mt.toString();
             }
             if (mediaType
                     .equals("application/x-tika-msoffice-embedded; format=comp_obj") ||
                     mediaType.equals("application/x-tika-msoffice")) {
-                POIFSFileSystem poifs = new POIFSFileSystem(CloseShieldInputStream.wrap(stream));
-
-                try {
+                tis.setCloseShield();
+                try (POIFSFileSystem poifs = new POIFSFileSystem(tis)) {
                     handleEmbeddedOfficeDoc(poifs.getRoot(), objID, xhtml, false);
                 } finally {
-                    if (poifs != null) {
-                        poifs.close();
-                    }
+                    tis.removeCloseShield();
                 }
             } else {
-                handleEmbeddedResource(stream, objID, objID, mediaType, xhtml, false);
+                handleEmbeddedResource(tis, objID, objID, mediaType, xhtml, false);
             }
         } catch (SecurityException e) {
             throw e;
         } catch (Exception e) {
-            EmbeddedDocumentUtil.recordException(e, parentMetadata);
+            EmbeddedDocumentUtil.recordException(e, parentMetadata, context);
         }
     }
 
@@ -656,9 +716,18 @@ public class HSLFExtractor extends AbstractPOIFSExtractor {
         } catch (NullPointerException e) {
             // Sometimes HSLF hits problems
             // Please open POI bugs for any you come across!
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
             return null;
         }
     }
 
+    private String getDetectedMediaType(HSLFObjectData objectData) {
+        try (TikaInputStream tis = TikaInputStream.get(objectData.getInputStream())) {
+            Metadata m = Metadata.newInstance(context);
+            MediaType mt = getDetector().detect(tis, m, context);
+            return mt.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }

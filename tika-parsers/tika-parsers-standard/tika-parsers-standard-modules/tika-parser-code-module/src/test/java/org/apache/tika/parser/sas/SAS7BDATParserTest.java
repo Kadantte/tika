@@ -18,15 +18,13 @@ package org.apache.tika.parser.sas;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import java.io.InputStream;
-import java.text.DateFormatSymbols;
 import java.util.Arrays;
-import java.util.Locale;
 
 import org.junit.jupiter.api.Test;
 import org.xml.sax.ContentHandler;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Database;
 import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.MachineMetadata;
@@ -39,8 +37,6 @@ import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.BodyContentHandler;
 
 public class SAS7BDATParserTest extends TikaTest {
-    private static final String[] SHORT_MONTHS =
-            new DateFormatSymbols(Locale.getDefault()).getShortMonths();
     private Parser parser = new SAS7BDATParser();
 
     @Test
@@ -48,11 +44,11 @@ public class SAS7BDATParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/testSAS.sas7bdat")) {
-            parser.parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testSAS.sas7bdat")) {
+            parser.parse(tis, handler, metadata, new ParseContext());
         }
 
-        assertEquals("application/x-sas-data", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-sas-data", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("TESTING", metadata.get(TikaCoreProperties.TITLE));
 
         // Mon Jan 30 07:31:47 GMT 2017
@@ -83,11 +79,11 @@ public class SAS7BDATParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/test-columnar.sas7bdat")) {
-            AUTO_DETECT_PARSER.parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/test-columnar.sas7bdat")) {
+            AUTO_DETECT_PARSER.parse(tis, handler, metadata, new ParseContext());
         }
 
-        assertEquals("application/x-sas-data", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-sas-data", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("TESTING", metadata.get(TikaCoreProperties.TITLE));
 
         assertEquals("2018-05-18T11:38:30Z", metadata.get(TikaCoreProperties.CREATED));
@@ -111,7 +107,7 @@ public class SAS7BDATParserTest extends TikaTest {
         assertContains("2\t4\tThis", content);
         assertContains("4\t16\tThis", content);
         assertContains("\t01-01-1960\t", content);
-        assertContains("\t01" + SHORT_MONTHS[0] + "1960:00:00", content);
+        assertContains("\t01Jan1960:00:00", content);
     }
 
     @Test
@@ -143,6 +139,6 @@ public class SAS7BDATParserTest extends TikaTest {
         assertContains("<th title=\"date\">date</th>", xml);
         // Check formatting of dates
         assertContains("<td>01-01-1960</td>", xml);
-        assertContains("<td>01" + SHORT_MONTHS[0] + "1960:00:00:10.00</td>", xml);
+        assertContains("<td>01Jan1960:00:00:10.00</td>", xml);
     }
 }

@@ -28,9 +28,11 @@ import org.apache.poi.util.LittleEndian;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -42,6 +44,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * ActiveMime is a macro container format used in some mso files.  See, e.g.
  * <a href="https://mastodon.social/@Ange/110027138524274526">Ange's toot</a>.
  */
+@TikaComponent
 public class ActiveMimeParser implements Parser {
 
     private static final MediaType MEDIA_TYPE = MediaType.application("x-activemime");
@@ -53,29 +56,29 @@ public class ActiveMimeParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         //based on: https://mastodon.social/@Ange/110027138524274526
-        IOUtils.skipFully(stream, 12); //header
-        IOUtils.skipFully(stream, 2); //version
-        IOUtils.skipFully(stream, 4); //flag1 04000000
-        IOUtils.skipFully(stream, 4);//reserved ffffffff
-        IOUtils.skipFully(stream, 4);//flag2 000006F0
+        IOUtils.skipFully(tis, 12); //header
+        IOUtils.skipFully(tis, 2); //version
+        IOUtils.skipFully(tis, 4); //flag1 04000000
+        IOUtils.skipFully(tis, 4);//reserved ffffffff
+        IOUtils.skipFully(tis, 4);//flag2 000006F0
         // do something with this?  If so, use readUInt
-        // long datasize = LittleEndian.readUInt(stream);
-        IOUtils.skipFully(stream, 4); //datasize
-        long zlibOffset = LittleEndian.readUInt(stream);
-        IOUtils.skipFully(stream, 4);//flag
-        IOUtils.skipFully(stream, 4);//uncompressed size
-        IOUtils.skipFully(stream, 4);//don't know
+        // long datasize = LittleEndian.readUInt(tis);
+        IOUtils.skipFully(tis, 4); //datasize
+        long zlibOffset = LittleEndian.readUInt(tis);
+        IOUtils.skipFully(tis, 4);//flag
+        IOUtils.skipFully(tis, 4);//uncompressed size
+        IOUtils.skipFully(tis, 4);//don't know
 
-        IOUtils.skipFully(stream, zlibOffset);
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        IOUtils.skipFully(tis, zlibOffset);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         EmbeddedDocumentExtractor ex = EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-        try (InputStream payload = new DeflateCompressorInputStream(stream)) {
+        try (InputStream payload = new DeflateCompressorInputStream(tis)) {
             try (POIFSFileSystem poifs = new POIFSFileSystem(payload)) {
-                OfficeParser.extractMacros(poifs, xhtml, ex);
+                OfficeParser.extractMacros(poifs, xhtml, ex, context);
             }
         }
         xhtml.endDocument();

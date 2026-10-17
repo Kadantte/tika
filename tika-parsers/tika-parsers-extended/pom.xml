@@ -21,7 +21,7 @@
   <parent>
     <groupId>org.apache.tika</groupId>
     <artifactId>tika-parsers</artifactId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
   <modelVersion>4.0.0</modelVersion>
@@ -33,6 +33,7 @@
   <modules>
     <module>tika-parser-sqlite3-module</module>
     <module>tika-parser-scientific-module</module>
+    <module>tika-parser-ocr-encode-module</module>
     <module>tika-parser-sqlite3-package</module>
     <module>tika-parser-scientific-package</module>
     <module>tika-parsers-extended-integration-tests</module>
@@ -48,18 +49,22 @@
   </dependencies>
 
   <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>tika-parser-scientific-module/src/test/resources/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-scientific-package/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-tagsoup-module/target/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-tagsoup-package/target/**</inputExclude> <!-- already checked -->
+          </inputExcludes>
+        </configuration>
+      </plugin>
+    </plugins>
     <pluginManagement>
       <plugins>
-        <plugin>
-          <groupId>org.apache.rat</groupId>
-          <artifactId>apache-rat-plugin</artifactId>
-          <version>${rat.version}</version>
-          <configuration>
-            <excludes>
-              <exclude>src/test/resources/test-documents/**</exclude>
-            </excludes>
-          </configuration>
-        </plugin>
         <plugin>
           <groupId>org.apache.felix</groupId>
           <artifactId>maven-bundle-plugin</artifactId>
@@ -87,6 +92,6 @@
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

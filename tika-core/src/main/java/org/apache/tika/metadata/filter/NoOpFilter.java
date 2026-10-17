@@ -16,19 +16,25 @@
  */
 package org.apache.tika.metadata.filter;
 
+import java.util.List;
+
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
 
 /**
  * This filter performs no operations on the metadata
  * and leaves it untouched.
  */
+@TikaComponent
 public class NoOpFilter extends MetadataFilter {
 
     public static final NoOpFilter NOOP_FILTER = new NoOpFilter();
 
+
     @Override
-    public void filter(Metadata metadata) throws TikaException {
-        //no op
+    protected void doFilter(List<Metadata> metadataList, ParseContext parseContext) throws TikaException {
+        // no-op
     }
 }

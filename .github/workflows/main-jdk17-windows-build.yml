@@ -1,0 +1,78 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# The one Windows job. Two things it uniquely covers:
+#   - path handling: the checkout dir below deliberately contains a space
+#   - child JVMs (tika-server, pipes forks) started under a non-en_US locale
+#
+# In-process tests can run under a random default locale
+# (-Dtika.test.locale=random, RandomLocaleListener; nightly-locale-build does, the
+# PR jobs will again once it stays green, TIKA-4920); this one runs them under
+# de_DE. Pipes forks receive their parent's locale as -D flags, but JVMs the
+# tests start themselves (tika-server) inherit only the environment, hence
+# JAVA_TOOL_OPTIONS here, which every JVM reads at startup.
+# NOT LANG/LC_ALL: the Windows JVM reads the OS locale via Win32 and ignores them.
+#
+# push-only, like the jdk21/jdk25 builds. This is the most expensive
+# job in CI -- a full reactor on a 2x-cost runner, ~48 min -- and it gated PR
+# wall clock all by itself while every Linux job finished in ~22. Windows-only
+# regressions are real but rare, so they are caught on main within the hour
+# rather than paid for on every PR push.
+name: main jdk17 windows build
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        java: [ '17' ]
+
+    steps:
+      # The space in this path is deliberate -- it is what catches path-quoting bugs.
+      - uses: actions/checkout@v7
+        with:
+          path: 'tika build dir'
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+      - name: Cache Maven repository
+        # Explicit, not setup-java's cache: 'maven', so our own snapshots stay out of the tarball.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.m2/repository
+            !~/.m2/repository/org/apache/tika
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+      - name: Build with Maven (de_DE child JVMs)
+        working-directory: 'tika build dir'
+        env:
+          JAVA_TOOL_OPTIONS: -Duser.language=de -Duser.country=DE
+        # No -T1C here (TIKA-4867): this is the heaviest job (locale + e2e + javadoc)
+        # on a 4-core runner; parallel modules starved the tika-server integration
+        # tests into startup timeouts. Serial reactor also needs no annotation-
+        # processor pre-install.
+        run: mvn clean test install javadoc:aggregate -Pci -Pe2e -B "-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"

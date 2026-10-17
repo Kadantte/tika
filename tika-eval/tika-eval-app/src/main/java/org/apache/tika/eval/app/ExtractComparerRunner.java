@@ -17,6 +17,10 @@
 package org.apache.tika.eval.app;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
@@ -25,6 +29,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -37,16 +42,19 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.help.HelpFormatter;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.eval.app.db.Cols;
 import org.apache.tika.eval.app.db.JDBCUtil;
 import org.apache.tika.eval.app.db.MimeBuffer;
@@ -55,10 +63,15 @@ import org.apache.tika.eval.app.io.DBWriter;
 import org.apache.tika.eval.app.io.ExtractReader;
 import org.apache.tika.eval.app.io.ExtractReaderException;
 import org.apache.tika.eval.app.io.IDBWriter;
-import org.apache.tika.pipes.FetchEmitTuple;
-import org.apache.tika.pipes.pipesiterator.CallablePipesIterator;
-import org.apache.tika.pipes.pipesiterator.PipesIterator;
-import org.apache.tika.pipes.pipesiterator.fs.FileSystemPipesIterator;
+import org.apache.tika.eval.app.io.PipesReport;
+import org.apache.tika.eval.app.reports.ResultsReporter;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.mime.MimeTypes;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.pipesiterator.PipesIterator;
+import org.apache.tika.pipes.core.pipesiterator.CallablePipesIterator;
+import org.apache.tika.pipes.iterator.fs.FileSystemPipesIterator;
+import org.apache.tika.plugins.ExtensionConfig;
 
 public class ExtractComparerRunner {
 
@@ -75,10 +88,24 @@ public class ExtractComparerRunner {
                 .addOption(Option.builder("b").longOpt("extractsB").hasArg().desc("required: directory of 'B' extracts").get())
                 .addOption(Option.builder("i").longOpt("inputDir").hasArg().desc("optional: directory for original binary input documents."
                         + " If not specified, -extracts is crawled as is.").get())
-                .addOption(Option.builder("d").longOpt("db").hasArg().desc("optional: db path").get())
+                .addOption(Option.builder("d").longOpt("db").hasArg().desc("optional: db path (uses temp file if not specified)").get())
                 .addOption(Option.builder("c").longOpt("config").hasArg().desc("tika-eval json config file").get())
+                .addOption(Option.builder("n").longOpt("numWorkers").hasArg().desc("number of worker threads").get())
+                .addOption(Option.builder("m").longOpt("maxExtractLength").hasArg().desc("maximum extract length").get())
+                .addOption(Option.builder("r").longOpt("report").desc("automatically run Report and tgz after Compare").get())
+                .addOption(Option.builder("rd").longOpt("reportsDir").hasArg().desc("directory for reports (default: 'reports')").get())
+                .addOption(Option.builder("pa").longOpt("pipesReportA").hasArg()
+                        .desc("optional: jsonl from tika-pipes' file-system-jsonl-reporter for A; default: <extractsA>/.run-info/crashes-*.jsonl").get())
+                .addOption(Option.builder("pb").longOpt("pipesReportB").hasArg()
+                        .desc("optional: same, for B").get())
+                .addOption(Option.builder("ra").longOpt("runInfoA").hasArg()
+                        .desc("optional: run-info json from run-batch.sh for A; default: <extractsA>/.run-info/run-info-*.json").get())
+                .addOption(Option.builder("rb").longOpt("runInfoB").hasArg()
+                        .desc("optional: same, for B").get())
+                .addOption(Option.builder("z").longOpt("gzip").desc("gzip the H2 db file (<db>.mv.db.gz) after Compare for transfer; requires -d").get())
                 ;
     }
+
     public static void main(String[] args) throws Exception {
         DefaultParser defaultCLIParser = new DefaultParser();
         CommandLine commandLine = defaultCLIParser.parse(OPTIONS, args);
@@ -86,22 +113,73 @@ public class ExtractComparerRunner {
         Path extractsADir = commandLine.hasOption('a') ? Paths.get(commandLine.getOptionValue('a')) : Paths.get(USAGE_FAIL("Must specify extractsA dir: -a"));
         Path extractsBDir = commandLine.hasOption('b') ? Paths.get(commandLine.getOptionValue('b')) : Paths.get(USAGE_FAIL("Must specify extractsB dir: -b"));
         Path inputDir = commandLine.hasOption('i') ? Paths.get(commandLine.getOptionValue('i')) : extractsADir;
-        String dbPath = commandLine.hasOption('d') ? commandLine.getOptionValue('d') : USAGE_FAIL("Must specify the db name: -d");
-        String jdbcString = getJdbcConnectionString(dbPath);
-        execute(inputDir, extractsADir, extractsBDir, jdbcString, evalConfig);
-    }
 
-    private static String getJdbcConnectionString(String dbPath) {
-        if (dbPath.startsWith("jdbc:")) {
-            return dbPath;
+        RunInfo.Side sideA = RunInfo.loadSide(optPath(commandLine, "pa"), optPath(commandLine, "ra"), extractsADir);
+        RunInfo.Side sideB = RunInfo.loadSide(optPath(commandLine, "pb"), optPath(commandLine, "rb"), extractsBDir);
+        Map<String, String> runInfoA = new LinkedHashMap<>(sideA.batchInfo());
+        runInfoA.putAll(RunInfo.pipesReportInfo(sideA.pipesReport()));
+        runInfoA.putAll(RunInfo.extractsInfo(extractsADir));
+        Map<String, String> runInfoB = new LinkedHashMap<>(sideB.batchInfo());
+        runInfoB.putAll(RunInfo.pipesReportInfo(sideB.pipesReport()));
+        runInfoB.putAll(RunInfo.extractsInfo(extractsBDir));
+
+        boolean usesTempDb = !commandLine.hasOption('d');
+        Path tempDbDir = null;
+        String dbPath;
+        if (usesTempDb) {
+            tempDbDir = Files.createTempDirectory("tika-eval-");
+            dbPath = tempDbDir.resolve("eval-db").toAbsolutePath().toString();
+        } else {
+            dbPath = commandLine.getOptionValue('d');
         }
-        //default to h2
-        Path p = Paths.get(dbPath);
-        return "jdbc:h2:file:" + p.toAbsolutePath();
 
+        if (commandLine.hasOption('n')) {
+            evalConfig.setNumWorkers(Integer.parseInt(commandLine.getOptionValue('n')));
+        }
+
+        if (commandLine.hasOption('m')) {
+            evalConfig.setMaxExtractLength(Long.parseLong(commandLine.getOptionValue('m')));
+        }
+
+        try {
+            String jdbcString = JDBCUtil.getJdbcConnectionString(dbPath);
+            Map<String, String> runInfo = RunInfo.evalInfo(args, evalConfig, inputDir);
+            execute(inputDir, extractsADir, extractsBDir, jdbcString, evalConfig, sideA.pipesReport(), sideB.pipesReport(), runInfo, runInfoA, runInfoB);
+
+            if (commandLine.hasOption('r')) {
+                String reportsDir = commandLine.getOptionValue("rd", "reports");
+                LOG.info("Running Report...");
+                if (dbPath.startsWith("jdbc:")) {
+                    ResultsReporter.main(new String[]{"-jdbc", dbPath, "-rd", reportsDir});
+                } else {
+                    ResultsReporter.main(new String[]{"-d", dbPath, "-rd", reportsDir});
+                }
+                Path reportsDirPath = Paths.get(reportsDir);
+                if (Files.isDirectory(reportsDirPath)) {
+                    Path tgzPath = reportsDirPath.resolveSibling(reportsDirPath.getFileName() + ".tgz");
+                    LOG.info("Creating {}", tgzPath);
+                    createTarGz(reportsDirPath, tgzPath);
+                    LOG.info("Reports archived to {}", tgzPath);
+                }
+            }
+
+            if (commandLine.hasOption('z')) {
+                gzipDb(dbPath, usesTempDb);
+            }
+        } finally {
+            if (usesTempDb && tempDbDir != null) {
+                deleteDirectory(tempDbDir);
+            }
+        }
     }
 
-    private static void execute(Path inputDir, Path extractsA, Path extractsB, String dbPath, EvalConfig evalConfig) throws SQLException, IOException {
+    private static Path optPath(CommandLine commandLine, String opt) {
+        return commandLine.hasOption(opt) ? Paths.get(commandLine.getOptionValue(opt)) : null;
+    }
+
+    private static void execute(Path inputDir, Path extractsA, Path extractsB, String dbPath, EvalConfig evalConfig, PipesReport pipesReportA,
+                                PipesReport pipesReportB, Map<String, String> runInfo, Map<String, String> runInfoA, Map<String, String> runInfoB)
+            throws SQLException, IOException {
 
         //parameterize this? if necesssary
         try {
@@ -114,6 +192,12 @@ public class ExtractComparerRunner {
         ExtractComparerBuilder builder = new ExtractComparerBuilder();
         MimeBuffer mimeBuffer = initTables(jdbcUtil, builder, dbPath, evalConfig);
         builder.populateRefTables(jdbcUtil, mimeBuffer);
+        // before workers start, so an aborted run still says what it was
+        IDBWriter runInfoWriter = builder.getDBWriter(List.of(RunInfo.RUN_INFO_TABLE, RunInfo.RUN_INFO_TABLE_A, RunInfo.RUN_INFO_TABLE_B), jdbcUtil, mimeBuffer);
+        RunInfo.write(runInfoWriter, RunInfo.RUN_INFO_TABLE, runInfo);
+        RunInfo.write(runInfoWriter, RunInfo.RUN_INFO_TABLE_A, runInfoA);
+        RunInfo.write(runInfoWriter, RunInfo.RUN_INFO_TABLE_B, runInfoB);
+        runInfoWriter.close();
 
         AtomicInteger enqueued = new AtomicInteger(0);
         AtomicInteger processed = new AtomicInteger(0);
@@ -133,7 +217,7 @@ public class ExtractComparerRunner {
         for (int i = 0; i < evalConfig.getNumWorkers(); i++) {
             ExtractReader extractReader = new ExtractReader(ExtractReader.ALTER_METADATA_LIST.AS_IS, evalConfig.getMinExtractLength(), evalConfig.getMaxExtractLength());
             ExtractComparer extractComparer = new ExtractComparer(inputDir, extractsA, extractsB, extractReader,
-                    builder.getDBWriter(builder.getNonRefTableInfos(), jdbcUtil, mimeBuffer));
+                    builder.getDBWriter(builder.getNonRefTableInfos(), jdbcUtil, mimeBuffer), pipesReportA, pipesReportB);
             executorCompletionService.submit(new ComparerWorker(queue, extractComparer, processed));
         }
 
@@ -159,17 +243,33 @@ public class ExtractComparerRunner {
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         } finally {
+            Map<TableInfo, PipesReport> ledgers = new HashMap<>();
+            ledgers.put(RunInfo.RUN_INFO_TABLE_A, pipesReportA);
+            ledgers.put(RunInfo.RUN_INFO_TABLE_B, pipesReportB);
+            RunInfo.finish(runInfoWriter, RunInfo.RUN_INFO_TABLE, ledgers);
             mimeBuffer.close();
             executorService.shutdownNow();
+            try {
+                jdbcUtil.getConnection().close();
+            } catch (SQLException e) {
+                LOG.warn("failed to close db connection", e);
+            }
         }
 
     }
 
-    private static PipesIterator createIterator(Path inputDir) {
-        FileSystemPipesIterator fs = new FileSystemPipesIterator(inputDir);
-        fs.setFetcherName("");
-        fs.setEmitterName("");
-        return fs;
+    private static PipesIterator createIterator(Path inputDir) throws IOException {
+        String json = null;
+        try (InputStream is = ExtractProfileRunner.class.getResourceAsStream("/pipes-iterator-template.json")) {
+            json = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        json = json.replace("FETCHER_BASE_PATH", inputDir.toAbsolutePath().toString());
+        json = json.replace("\\", "/");
+        try {
+            return FileSystemPipesIterator.build(new ExtensionConfig("", "", json));
+        } catch (TikaConfigException e) {
+            throw new IOException(e);
+        }
     }
 
     private static MimeBuffer initTables(JDBCUtil jdbcUtil, ExtractComparerBuilder builder, String connectionString, EvalConfig evalConfig) throws SQLException, IOException {
@@ -179,7 +279,92 @@ public class ExtractComparerRunner {
         jdbcUtil.createTables(builder.getRefTableInfos(), JDBCUtil.CREATE_TABLE.THROW_EX_IF_EXISTS);
 
         //step 2. create mime buffer
-        return new MimeBuffer(jdbcUtil.getConnection(), builder.getMimeTable(), TikaConfig.getDefaultConfig());
+        return new MimeBuffer(jdbcUtil.getConnection(), builder.getMimeTable(), MimeTypes.getDefaultMimeTypes());
+    }
+
+    private static void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException e) {
+                            LOG.warn("Failed to delete {}", p, e);
+                        }
+                    });
+        }
+    }
+
+    /**
+     * Gzip the H2 db file (&lt;dbPath&gt;.mv.db -&gt; &lt;dbPath&gt;.mv.db.gz) so it can be
+     * transferred. The db connection is already closed by {@link #execute} before
+     * this runs, so the file is unlocked. No-op (with a warning) when there is no
+     * on-disk file db to gzip: a temp db (no -d), or a non-file jdbc connection
+     * (e.g. mem/tcp). A {@code jdbc:h2:file:} URL is supported by extracting its
+     * file path.
+     */
+    private static void gzipDb(String dbPath, boolean usesTempDb) throws IOException {
+        if (usesTempDb) {
+            LOG.warn("-z (gzip) ignored: no -d db specified, so there is no db file to transfer");
+            return;
+        }
+        String filePath = dbPath;
+        if (dbPath.startsWith("jdbc:")) {
+            String prefix = "jdbc:h2:file:";
+            if (!dbPath.startsWith(prefix)) {
+                LOG.warn("-z (gzip) ignored: db is a non-file jdbc connection ({}), no local file to transfer",
+                        dbPath);
+                return;
+            }
+            // Strip the jdbc:h2:file: prefix and any ;OPTION=... suffix to get the file base path.
+            filePath = dbPath.substring(prefix.length());
+            int semi = filePath.indexOf(';');
+            if (semi >= 0) {
+                filePath = filePath.substring(0, semi);
+            }
+        }
+        Path dbFile = Paths.get(filePath + ".mv.db");
+        if (!Files.isRegularFile(dbFile)) {
+            LOG.warn("-z (gzip) ignored: expected db file {} not found", dbFile);
+            return;
+        }
+        Path gzPath = dbFile.resolveSibling(dbFile.getFileName() + ".gz");
+        LOG.info("Creating {}", gzPath);
+        gzipFile(dbFile, gzPath);
+        LOG.info("Db archived to {}", gzPath);
+    }
+
+    private static void gzipFile(Path source, Path output) throws IOException {
+        try (InputStream is = Files.newInputStream(source);
+             OutputStream fos = Files.newOutputStream(output);
+             GzipCompressorOutputStream gzo = new GzipCompressorOutputStream(fos)) {
+            is.transferTo(gzo);
+        }
+    }
+
+    private static void createTarGz(Path sourceDir, Path output) throws IOException {
+        try (OutputStream fos = Files.newOutputStream(output);
+             GzipCompressorOutputStream gzo = new GzipCompressorOutputStream(fos);
+             TarArchiveOutputStream tar = new TarArchiveOutputStream(gzo)) {
+            tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
+            try (Stream<Path> walk = Files.walk(sourceDir)) {
+                walk.filter(Files::isRegularFile).forEach(file -> {
+                    try {
+                        String entryName = sourceDir.getFileName()
+                                .resolve(sourceDir.relativize(file)).toString();
+                        TarArchiveEntry entry = new TarArchiveEntry(file, entryName);
+                        tar.putArchiveEntry(entry);
+                        Files.copy(file, tar);
+                        tar.closeArchiveEntry();
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        }
     }
 
     private static void USAGE() throws IOException {
@@ -220,6 +405,9 @@ public class ExtractComparerRunner {
                     queue.put(PipesIterator.COMPLETED_SEMAPHORE);
                     return COMPARER_WORKER_COMPLETED_VALUE;
                 }
+                if (RunInfo.isRunInfoPath(t.getFetchKey().getFetchKey())) {
+                    continue;
+                }
                 extractComparer.processFileResource(t.getFetchKey());
                 processed.incrementAndGet();
             }
@@ -240,6 +428,7 @@ public class ExtractComparerRunner {
             tableInfosA.add(ExtractComparer.EXCEPTION_TABLE_A);
             tableInfosA.add(ExtractComparer.TAGS_TABLE_A);
             tableInfosA.add(ExtractComparer.CONTENTS_TABLE_A);
+            tableInfosA.add(ExtractComparer.ENCODINGS_TABLE_A);
             tableInfosA.add(ExtractComparer.EXTRACT_EXCEPTION_TABLE_A);
             tableInfosA.add(ExtractComparer.EMBEDDED_FILE_PATH_TABLE_A);
 
@@ -248,11 +437,15 @@ public class ExtractComparerRunner {
             tableInfosB.add(ExtractComparer.EXTRACT_EXCEPTION_TABLE_B);
             tableInfosB.add(ExtractComparer.TAGS_TABLE_B);
             tableInfosB.add(ExtractComparer.CONTENTS_TABLE_B);
+            tableInfosB.add(ExtractComparer.ENCODINGS_TABLE_B);
             tableInfosB.add(ExtractComparer.EMBEDDED_FILE_PATH_TABLE_B);
 
             tableInfosAandB.add(ExtractComparer.COMPARISON_CONTAINERS);
             tableInfosAandB.add(ExtractComparer.CONTENT_COMPARISONS);
             tableInfosAandB.add(ProfilerBase.MIME_TABLE);
+            tableInfosAandB.add(RunInfo.RUN_INFO_TABLE);
+            tableInfosAandB.add(RunInfo.RUN_INFO_TABLE_A);
+            tableInfosAandB.add(RunInfo.RUN_INFO_TABLE_B);
 
             List<TableInfo> refTableInfos = new ArrayList<>();
             refTableInfos.add(ExtractComparer.REF_PAIR_NAMES);

@@ -27,9 +27,9 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.Parser;
 
 @Disabled("need to have magika on the path")
@@ -37,8 +37,8 @@ public class TestMagikaIntegration extends TikaTest {
 
     @Test
     public void testIntegration() throws Exception {
-        TikaConfig tikaConfig = new TikaConfig(getConfig("tika-config.xml"));
-        Parser p = new AutoDetectParser(tikaConfig);
+        TikaLoader tikaLoader = TikaLoader.load(getConfig("tika-config.json"));
+        Parser p = tikaLoader.loadAutoDetectParser();
         List<Metadata> metadataList = getRecursiveMetadata("testPDF.pdf", p);
         debug(getRecursiveMetadata("testPDF.pdf", p));
         Metadata m = metadataList.get(0);
@@ -47,7 +47,7 @@ public class TestMagikaIntegration extends TikaTest {
         assertEquals("document", m.get(MagikaDetector.MAGIKA_GROUP));
         assertEquals("0.1.0-rc.1", m.get(MagikaDetector.MAGIKA_VERSION));
         assertEquals("application/pdf", m.get(MagikaDetector.MAGIKA_MIME));
-        assertEquals("application/pdf", m.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/pdf", m.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("ok", m.get(MagikaDetector.MAGIKA_STATUS));
     }
 

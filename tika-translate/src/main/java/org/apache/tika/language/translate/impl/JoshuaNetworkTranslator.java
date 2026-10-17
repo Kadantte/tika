@@ -40,6 +40,7 @@ import org.apache.cxf.jaxrs.client.WebClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 
 /**
@@ -62,6 +63,7 @@ import org.apache.tika.exception.TikaException;
  * Joshua requires input to be pre-formatted into sentences, one per line,
  * so this translation implementation takes care of that.
  */
+@TikaComponent
 public class JoshuaNetworkTranslator extends AbstractTranslator {
 
     private static final Logger LOG = LoggerFactory.getLogger(JoshuaNetworkTranslator.class);
@@ -93,7 +95,7 @@ public class JoshuaNetworkTranslator extends AbstractTranslator {
                 networkServer = props.getProperty(JOSHUA_SERVER);
             }
         } catch (IOException e) {
-            LOG.error("An error occured whilst reading translator.joshua.properties file", e);
+            LOG.error("An error occurred whilst reading translator.joshua.properties file", e);
         }
     }
 
@@ -101,7 +103,7 @@ public class JoshuaNetworkTranslator extends AbstractTranslator {
      * <p>Initially then check if the source language has been provided.
      * If no source language (or a null value) has been provided then
      * we make an attempt to guess the source using Tika's
-     * {@link org.apache.tika.langdetect.OptimaizeLangDetector}. If we
+     * {@link org.apache.tika.language.detect.LanguageDetector}. If we
      * are still unable to guess the language then we return the source
      * text.</p>
      *

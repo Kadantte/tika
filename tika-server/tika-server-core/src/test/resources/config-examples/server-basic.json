@@ -1,0 +1,23 @@
+{
+  "server": {
+    "port": 9998,
+    "host": "localhost",
+    "allowPipes": false,
+    "allowPerRequestConfig": false
+  },
+  "parse-context": {
+    "timeout-limits": {
+      "totalTaskTimeoutMillis": 3600000,
+      "progressTimeoutMillis": 120000
+    },
+    "exception-reporting": {
+      "level": "MESSAGE_REDACTED",
+      "maxLength": 10000
+    }
+  },
+  "parsers": [
+    {
+      "default-parser": {}
+    }
+  ]
+}

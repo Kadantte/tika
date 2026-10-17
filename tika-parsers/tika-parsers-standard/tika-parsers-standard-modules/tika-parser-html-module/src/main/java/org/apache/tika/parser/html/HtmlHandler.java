@@ -38,13 +38,18 @@ import org.xml.sax.helpers.AttributesImpl;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.Geographic;
 import org.apache.tika.metadata.HTML;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.datauri.DataURIScheme;
+import org.apache.tika.parser.datauri.DataURISchemeParseException;
+import org.apache.tika.parser.datauri.DataURISchemeUtil;
 import org.apache.tika.sax.TextContentHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.apache.tika.utils.StringUtils;
@@ -91,13 +96,13 @@ class HtmlHandler extends TextContentHandler {
         this.context = context;
         this.extractScripts = extractScripts;
         // Try to determine the default base URL, if one has not been given
-        if (metadata.get(Metadata.CONTENT_LOCATION) == null) {
+        if (metadata.get(HttpHeaders.CONTENT_LOCATION) == null) {
             String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
             if (name != null) {
                 name = name.trim();
                 try {
                     new URL(name); // test URL format
-                    metadata.set(Metadata.CONTENT_LOCATION, name);
+                    metadata.set(HttpHeaders.CONTENT_LOCATION, name);
                 } catch (MalformedURLException e) {
                     // The resource name is not a valid URL, ignore it
                 }
@@ -107,7 +112,7 @@ class HtmlHandler extends TextContentHandler {
 
     public HtmlHandler(HtmlMapper mapper, ContentHandler handler, Metadata metadata,
                        ParseContext context, boolean extractScripts) {
-        this(mapper, new XHTMLContentHandler(handler, metadata), metadata, context, extractScripts);
+        this(mapper, new XHTMLContentHandler(handler, metadata, context), metadata, context, extractScripts);
     }
 
     @Override
@@ -115,7 +120,7 @@ class HtmlHandler extends TextContentHandler {
             throws SAXException {
 
         if ("HTML".equals(name) && atts.getValue("lang") != null) {
-            metadata.set(Metadata.CONTENT_LANGUAGE, atts.getValue("lang"));
+            metadata.set(HttpHeaders.CONTENT_LANGUAGE, atts.getValue("lang"));
         }
         if ("SCRIPT".equals(name)) {
             scriptLevel++;
@@ -145,11 +150,11 @@ class HtmlHandler extends TextContentHandler {
                     metadata.add(HTML.PREFIX_HTML_META + atts.getValue("property"), atts.getValue("content"));
                 }
             } else if ("BASE".equals(name) && atts.getValue("href") != null) {
-                startElementWithSafeAttributes("base", atts);
+                startElementWithMappedAttributes("base", atts);
                 xhtml.endElement("base");
-                metadata.set(Metadata.CONTENT_LOCATION, resolve(atts.getValue("href")));
+                metadata.set(HttpHeaders.CONTENT_LOCATION, resolve(atts.getValue("href")));
             } else if ("LINK".equals(name)) {
-                startElementWithSafeAttributes("link", atts);
+                startElementWithMappedAttributes("link", atts);
                 xhtml.endElement("link");
             } else if ("SCRIPT".equals(name)) {
                 scriptAtts = atts;
@@ -159,7 +164,7 @@ class HtmlHandler extends TextContentHandler {
         if (bodyLevel > 0 && discardLevel == 0) {
             String safe = mapper.mapSafeElement(name);
             if (safe != null) {
-                startElementWithSafeAttributes(safe, atts);
+                startElementWithMappedAttributes(safe, atts);
             }
         }
 
@@ -196,16 +201,16 @@ class HtmlHandler extends TextContentHandler {
             Matcher m = ICBM.matcher(value);
             if (m.matches()) {
                 metadata.set("ICBM", m.group(1) + ", " + m.group(2));
-                metadata.set(Metadata.LATITUDE, m.group(1));
-                metadata.set(Metadata.LONGITUDE, m.group(2));
+                metadata.set(Geographic.LATITUDE, m.group(1));
+                metadata.set(Geographic.LONGITUDE, m.group(2));
             } else {
                 metadata.set("ICBM", value);
             }
             return;
         }
 
-        if (name.equalsIgnoreCase(Metadata.CONTENT_TYPE)) {
-            //don't overwrite Metadata.CONTENT_TYPE!
+        if (name.equalsIgnoreCase(HttpHeaders.CONTENT_TYPE.getName())) {
+            //don't overwrite HttpHeaders.CONTENT_TYPE!
             MediaType type = MediaType.parse(value);
             if (type != null) {
                 metadata.set(TikaCoreProperties.CONTENT_TYPE_HINT, type.toString());
@@ -232,7 +237,7 @@ class HtmlHandler extends TextContentHandler {
         }
     }
 
-    private void startElementWithSafeAttributes(String name, Attributes atts) throws SAXException {
+    private void startElementWithMappedAttributes(String name, Attributes atts) throws SAXException {
         if (atts.getLength() == 0) {
             xhtml.startElement(name);
             return;
@@ -245,7 +250,7 @@ class HtmlHandler extends TextContentHandler {
             if (codebase != null) {
                 codebase = resolve(codebase);
             } else {
-                codebase = metadata.get(Metadata.CONTENT_LOCATION);
+                codebase = metadata.get(HttpHeaders.CONTENT_LOCATION);
             }
         }
 
@@ -295,7 +300,7 @@ class HtmlHandler extends TextContentHandler {
             scriptLevel--;
             if (scriptLevel == 0) {
                 if (scriptAtts.getLength() > 0) {
-                    startElementWithSafeAttributes("script", scriptAtts);
+                    startElementWithMappedAttributes("script", scriptAtts);
                     xhtml.endElement("script");
                 }
                 scriptAtts = EMPTY_ATTS;
@@ -332,18 +337,19 @@ class HtmlHandler extends TextContentHandler {
         }
     }
     private void handleSrcDoc(String string) throws SAXException {
-        Metadata m = new Metadata();
+        Metadata m = Metadata.newInstance(context);
         m.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                 TikaCoreProperties.EmbeddedResourceType.INLINE.toString());
+        m.set(HttpHeaders.CONTENT_TYPE, "text/html");
         m.set(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE, "text/html");
         //TODO add metadata about iframe content?
         EmbeddedDocumentExtractor embeddedDocumentExtractor =
                 EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-        if (embeddedDocumentExtractor.shouldParseEmbedded(m)) {
+        if (embeddedDocumentExtractor.shouldParseEmbedded(m, context)) {
             try (TikaInputStream tis = TikaInputStream.get(string.getBytes(StandardCharsets.UTF_8))) {
-                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, true);
+                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, context, true);
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
             }
         }
     }
@@ -358,19 +364,19 @@ class HtmlHandler extends TextContentHandler {
         }
 
         //do anything with attrs?
-        Metadata m = new Metadata();
+        Metadata m = Metadata.newInstance(context);
         m.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                 TikaCoreProperties.EmbeddedResourceType.INLINE.toString());
         if (dataURIScheme.getMediaType() != null) {
-            m.set(Metadata.CONTENT_TYPE, dataURIScheme.getMediaType().toString());
+            m.set(HttpHeaders.CONTENT_TYPE, dataURIScheme.getMediaType().toString());
         }
         EmbeddedDocumentExtractor embeddedDocumentExtractor =
                 EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-        if (embeddedDocumentExtractor.shouldParseEmbedded(m)) {
+        if (embeddedDocumentExtractor.shouldParseEmbedded(m, context)) {
             try (TikaInputStream tis = TikaInputStream.get(dataURIScheme.getInputStream())) {
-                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, true);
+                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, context, true);
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
             }
         }
     }
@@ -382,7 +388,7 @@ class HtmlHandler extends TextContentHandler {
             return;
         }
         //do anything with attrs?
-        Metadata m = new Metadata();
+        Metadata m = Metadata.newInstance(context);
         m.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                 TikaCoreProperties.EmbeddedResourceType.MACRO.toString());
         String src = scriptAtts.getValue("src");
@@ -395,14 +401,14 @@ class HtmlHandler extends TextContentHandler {
         //try to scrape dataURISchemes from javascript
         List<DataURIScheme> dataURISchemes = dataURISchemeUtil.extract(script.toString());
         for (DataURIScheme dataURIScheme : dataURISchemes) {
-            Metadata dataUriMetadata = new Metadata();
+            Metadata dataUriMetadata = Metadata.newInstance(context);
             dataUriMetadata.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                     TikaCoreProperties.EmbeddedResourceType.INLINE.toString());
-            dataUriMetadata.set(Metadata.CONTENT_TYPE, dataURIScheme.getMediaType().toString());
-            if (embeddedDocumentExtractor.shouldParseEmbedded(dataUriMetadata)) {
+            dataUriMetadata.set(HttpHeaders.CONTENT_TYPE, dataURIScheme.getMediaType().toString());
+            if (embeddedDocumentExtractor.shouldParseEmbedded(dataUriMetadata, context)) {
                 try (TikaInputStream tis = TikaInputStream.get(dataURIScheme.getInputStream())) {
                     embeddedDocumentExtractor
-                            .parseEmbedded(tis, xhtml, dataUriMetadata, true);
+                            .parseEmbedded(tis, xhtml, dataUriMetadata, context, true);
                 } catch (IOException e) {
                     //swallow
                 }
@@ -410,7 +416,7 @@ class HtmlHandler extends TextContentHandler {
         }
 
         try (TikaInputStream tis = TikaInputStream.get(script.toString().getBytes(StandardCharsets.UTF_8))) {
-            embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, true);
+            embeddedDocumentExtractor.parseEmbedded(tis, xhtml, m, context, true);
         } catch (IOException e) {
             //shouldn't ever happen
         } finally {
@@ -440,7 +446,7 @@ class HtmlHandler extends TextContentHandler {
     }
 
     private String resolve(String url) {
-        return resolve(metadata.get(Metadata.CONTENT_LOCATION), url);
+        return resolve(metadata.get(HttpHeaders.CONTENT_LOCATION), url);
     }
 
     private String resolve(String base, String url) {

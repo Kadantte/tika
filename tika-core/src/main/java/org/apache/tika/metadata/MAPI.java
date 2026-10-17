@@ -20,13 +20,14 @@ package org.apache.tika.metadata;
  *
  * Properties that typically appear in MSG/PST message format files.
  *
- * @since Apache Tika 4.0
+ * @since Apache Tika 4.0.0
  */
 public interface MAPI {
 
     String PREFIX_MAPI_META = "mapi" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
     String PREFIX_MAPI_ATTACH_META = "mapi:attach" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
     String PREFIX_MAPI_PROPERTY = PREFIX_MAPI_META + "property" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+    KeyPrefix PROPERTY = KeyPrefix.file(PREFIX_MAPI_PROPERTY, "MAPI named properties");
 
     /**
      * MAPI message class.  What type of .msg/MAPI file is it?
@@ -47,6 +48,16 @@ public interface MAPI {
     Property FROM_REPRESENTING_EMAIL = Property.internalText(PREFIX_MAPI_META + "from-representing-email");
 
     Property SUBMISSION_ACCEPTED_AT_TIME = Property.internalDate(PREFIX_MAPI_META + "msg-submission-accepted-at-time");
+
+    // PidTagClientSubmitTime -- distinct MAPI prop from the provider-side SUBMISSION_ACCEPTED_AT_TIME.
+    Property CLIENT_SUBMIT_TIME = Property.internalDate(PREFIX_MAPI_META + "msg-client-submit-time");
+
+    // CREATED/MODIFIED fallback when no CLIENT_SUBMIT_TIME.
+    Property MESSAGE_DELIVERY_TIME = Property.internalDate(PREFIX_MAPI_META + "message-delivery-time");
+
+    // Storage-level timestamps, not content dates -- don't use for CREATED/MODIFIED (TIKA-4798).
+    Property CREATION_TIME = Property.internalDate(PREFIX_MAPI_META + "creation-time");
+    Property LAST_MODIFICATION_TIME = Property.internalDate(PREFIX_MAPI_META + "last-modification-time");
 
     Property SUBMISSION_ID = Property.internalText(PREFIX_MAPI_META + "msg-submission-id");
 
@@ -77,5 +88,18 @@ public interface MAPI {
     Property ATTACH_MIME = Property.internalText(PREFIX_MAPI_ATTACH_META + "mime");
     Property ATTACH_LANGUAGE = Property.internalText(PREFIX_MAPI_ATTACH_META + "language");
 
-}
+    /**
+     * PidTagAttachFlags (0x3714) — indicates which body formats might reference this attachment.
+     * Bit 1 (0x1) = ATT_INVISIBLE_IN_HTML
+     * Bit 2 (0x2) = ATT_INVISIBLE_IN_RTF
+     * Bit 3 (0x4) = ATT_RENDERED_IN_BODY
+     */
+    Property ATTACH_FLAGS = Property.internalInteger(PREFIX_MAPI_ATTACH_META + "flags");
 
+    /**
+     * PidTagAttachmentHidden (0x7FFE) — indicates whether this attachment is hidden from the end
+     * user. Inline images typically have this set to true.
+     */
+    Property ATTACH_HIDDEN = Property.internalBoolean(PREFIX_MAPI_ATTACH_META + "hidden");
+
+}

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core;
 
 import java.io.InputStream;
@@ -36,7 +35,7 @@ import org.apache.tika.server.core.resource.TikaWelcome;
 
 public class TikaWelcomeTest extends CXFTestBase {
     protected static final String WELCOME_PATH = "/";
-    protected static final String PATH_RESOURCE = "/detect/stream"; // TIKA-1567
+    protected static final String PATH_RESOURCE = "/detect"; // TIKA-1567
     protected static final String PATH_RESOURCE_2 = "/meta/form"; //TIKA-1567
     private static final String VERSION_PATH = TikaVersionTest.VERSION_PATH;
 
@@ -44,8 +43,8 @@ public class TikaWelcomeTest extends CXFTestBase {
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         List<ResourceProvider> rpsCore = new ArrayList<>();
         rpsCore.add(new SingletonResourceProvider(new TikaVersion()));
-        rpsCore.add(new SingletonResourceProvider(new DetectorResource(new ServerStatus("", 0))));
-        rpsCore.add(new SingletonResourceProvider(new MetadataResource()));
+        rpsCore.add(new SingletonResourceProvider(new DetectorResource(new ServerStatus(), tikaResource)));
+        rpsCore.add(new SingletonResourceProvider(new MetadataResource(tikaResource)));
         List<ResourceProvider> all = new ArrayList<>(rpsCore);
         all.add(new SingletonResourceProvider(new TikaWelcome(rpsCore)));
         sf.setResourceProviders(all);

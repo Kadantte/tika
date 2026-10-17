@@ -1,0 +1,169 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Content Handler Requirements for Inference
+
+The `tika-inference` module's text embedding pipeline (`AbstractEmbeddingFilter` and
+subclasses such as `OpenAIEmbeddingFilter`) reads extracted text from the `tk:content`
+metadata field, splits it with the `MarkdownChunker`, and sends the resulting chunks to an
+embeddings endpoint. The chunker splits on markdown structure, so the content handler that
+produced `tk:content` has to be `MARKDOWN` for it to do its job.
+
+NOTE: `tika-inference` is experimental. Its classes, configuration keys and the `tk:chunks`
+layout may change in minor releases without a deprecation cycle, and no compatibility shims
+are kept for earlier shapes.
+
+Since 4.x that is the default, so the common case needs no configuration. This page records
+why, and what happens if you override it.
+
+== Why Markdown
+
+`MarkdownChunker` looks for structural boundaries in priority order:
+
+. **Headings** (`# H1`, `## H2`, ... up to `######`) — the strongest semantic boundary, and
+  the only split it makes when a section already fits inside `maxChunkChars`.
+. **Blank lines** — paragraph boundaries, used to subdivide an oversized section.
+. **A hard character split** at `maxChunkChars` — the last resort for a single paragraph
+  that is still too long.
+
+Plain text offers only the last two. The practical differences:
+
+* A 10-page PDF with headings chunks at its heading boundaries in markdown, but at arbitrary
+  paragraph breaks in plain text.
+* Tables, code blocks, and lists keep their structure in markdown, which improves embedding
+  quality.
+* The heading text itself lands inside the chunk, giving the embedding model context about
+  what the chunk is about.
+
+Nothing fails when the content is plain text — the chunks are simply worse.
+
+[#default-enforcement]
+== How the Default Is Enforced
+
+Two mechanisms, one preventive and one diagnostic:
+
+* **The default handler type is `MARKDOWN`.** `BasicContentHandlerFactory` defaults to
+  `HANDLER_TYPE.MARKDOWN`, so a config that does not mention `content-handler-factory` is
+  already correct for inference. Markdown is close enough to a superset of plain text for
+  search and indexing; a consumer that genuinely needs plain text sets `"type": "TEXT"`.
+* **A runtime warning when it is overridden.** The content handler factory records its type
+  in `tk:content-handler-type` (written on both the pipes CONCATENATE path and the RMETA
+  path). `AbstractEmbeddingFilter` reads that field and logs a `WARN` if it is not
+  `MARKDOWN`. This is a deterministic check on a recorded value, not a heuristic inspection
+  of the content, and it works even when the filter runs outside pipes — for example from
+  the Java API.
+
+== Configuration Example
+
+The minimum for an inference run is the embedding filter itself:
+
+[source,json]
+----
+{
+  "metadata-filters": [
+    {
+      "openai-embedding-filter": {
+        "baseUrl": "http://localhost:8000",
+        "model": "text-embedding-3-small"
+      }
+    }
+  ]
+}
+----
+
+A full pipeline, with the handler type stated explicitly and chunks emitted to Elasticsearch:
+
+[source,json]
+----
+{
+  "content-handler-factory": {
+    "basic-content-handler-factory": {
+      "type": "MARKDOWN",
+      "writeLimit": -1
+    }
+  },
+  "metadata-filters": [
+    {
+      "openai-embedding-filter": {
+        "baseUrl": "https://api.openai.com",
+        "model": "text-embedding-3-small",
+        "apiKey": "${env:OPENAI_API_KEY}",
+        "maxChunkChars": 1500,
+        "overlapChars": 200
+      }
+    }
+  ],
+  "fetchers": {
+    "fs": {
+      "file-system-fetcher": {
+        "basePath": "/data/documents"
+      }
+    }
+  },
+  "emitters": {
+    "es": {
+      "es-emitter": {
+        "esUrl": "http://localhost:9200/documents",
+        "idField": "doc_id"
+      }
+    }
+  },
+  "pipes-iterator": {
+    "file-system-pipes-iterator": {
+      "basePath": "/data/documents",
+      "fetcherId": "fs",
+      "emitterId": "es"
+    }
+  },
+  "pipes": {
+    "parseMode": "CONCATENATE",
+    "numClients": 4
+  }
+}
+----
+
+NOTE: Use `CONCATENATE` or `RMETA` for inference. `CONTENT_ONLY` parses the same way but
+emits only the raw `tk:content` string, so the chunks and vectors the embedding filter
+produces are discarded at emit time.
+
+== Alternatives Considered
+
+[cols="1,2,3"]
+|===
+|Option |Approach |Why not
+
+|A
+|`TikaLoader` validates at load time that an embedding filter implies a `MARKDOWN` handler,
+and throws `TikaConfigException` otherwise.
+|Would be the first cross-component validation in `TikaLoader`, which loads components
+independently, and would make deliberate chunking of plain text impossible.
+
+|C
+|`TikaLoader` silently upgrades the handler to `MARKDOWN` when it sees an embedding filter.
+|Implicit behavior. Would change `tk:content` under downstream consumers that asked for
+`TEXT` and do not expect markdown.
+
+|E
+|`AbstractEmbeddingFilter` implements `Initializable` and validates the handler type in
+`checkInitialization()`.
+|Not viable as it stands: a `MetadataFilter` runs post-parse and has no access to the
+`ContentHandlerFactory` or `ParseContext` at initialization time. Would require passing the
+handler type through first.
+|===
+
+Options B (warn at runtime) and D (change the global default) are what shipped; see
+<<default-enforcement,How the Default Is Enforced>>.

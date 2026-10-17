@@ -16,9 +16,8 @@
  */
 package org.apache.tika.parser.ocr;
 
+import java.io.File;
 import java.io.Serializable;
-import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
@@ -27,25 +26,17 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.commons.io.FilenameUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.config.OperatorOnly;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.utils.StringUtils;
 
 /**
  * Configuration for TesseractOCRParser.
  * This class is not thread safe and must be synchronized externally.
- * <p>
- * This class will remember all set* field forever,
- * and on {@link #cloneAndUpdate(TesseractOCRConfig)},
- * it will update all the fields that have been set on the "update" config.
- * So, for example, if you want to change language to "fra"
- * from "eng" and then on another parse,
- * you want to change depth to 5 on the same update object,
- * but you expect the language to revert to "eng", you'll be wrong.
- * Create a new update config for each parse unless you're only changing the
- * same field(s) with every parse.
  */
 public class TesseractOCRConfig implements Serializable {
 
@@ -92,11 +83,16 @@ public class TesseractOCRConfig implements Serializable {
     // runtime switch to turn off OCR
     private boolean skipOcr = false;
     // Maximum time (seconds) to wait for the ocring process termination
-    private int timeoutSeconds = 120;
+    private long timeoutMillis = 120_000;
     // See addOtherTesseractConfig.
-    private Map<String, String> otherTesseractConfig = new HashMap<>();
-    private Set<String> userConfigured = new HashSet<>();
+    private HashMap<String, String> otherTesseractConfig = new HashMap<>();
     private boolean inlineContent = false;
+    private boolean preloadLangs = false;
+
+    private String tesseractPath = "";
+    private String tessdataPath = "";
+    private String imageMagickPath = "";
+
 
     /**
      * This takes a language string, parses it and then bins individual langs into
@@ -120,9 +116,10 @@ public class TesseractOCRConfig implements Serializable {
         // Split on the + sign
         final String[] langs = language.split("\\+");
         for (String lang : langs) {
-            // First, make sure it conforms to the correct syntax
+            // Script models are capitalized and ship as either script/Latin or a top-level
+            // Latin.traineddata (Debian's tesseract-ocr-script-* packages); accept both.
             if (!lang.matches(
-                    "([a-zA-Z]{3}(_[a-zA-Z]{3,4}){0,2})|script(/|\\\\)[A-Z][a-zA-Z_]+")) {
+                    "([a-zA-Z]{3}(_[a-zA-Z]{3,4}){0,2})|(script(/|\\\\))?[A-Z][a-zA-Z_]+")) {
                 invalidLangs.add(lang + " (invalid syntax)");
             } else {
                 validLangs.add(lang);
@@ -143,9 +140,12 @@ public class TesseractOCRConfig implements Serializable {
      * <ol>
      *   <li>Nominally an ISO-639-2 code but compound codes are allowed separated by underscore:
      *   e.g., chi_tra_vert, aze_cyrl</li>
-     *   <li>A file path in the script directory.  The name starts with upper-case letter.
-     *       Some of them have underscores and other upper-case letters: e.g., script/Arabic,
-     *       script/HanS_vert, script/Japanese_vert, script/Canadian_Aboriginal</li>
+     *   <li>A script model. The name starts with an upper-case letter and may contain
+     *       underscores and other upper-case letters: e.g., Arabic, HanS_vert, Japanese_vert,
+     *       Canadian_Aboriginal. Prefix with script/ when the model lives in tessdata's
+     *       script subdirectory (script/Arabic); use the bare name when it sits at the
+     *       tessdata top level, as the Debian/Ubuntu tesseract-ocr-script-* packages install
+     *       it.</li>
      * </ol>
      * Multiple languages may be specified, separated by plus characters.
      * e.g. "chi_tra+chi_sim+script/Arabic"
@@ -158,7 +158,6 @@ public class TesseractOCRConfig implements Serializable {
             throw new IllegalArgumentException("Invalid language code(s): " + invalidCodes);
         }
         this.language = languageString;
-        userConfigured.add("language");
     }
 
     /**
@@ -177,7 +176,6 @@ public class TesseractOCRConfig implements Serializable {
             throw new IllegalArgumentException("Invalid page segmentation mode");
         }
         this.pageSegMode = pageSegMode;
-        userConfigured.add("pageSegMode");
     }
 
     /**
@@ -208,7 +206,6 @@ public class TesseractOCRConfig implements Serializable {
                     "If you trust this value, set it with setTrustedPageSeparator");
         }
         setTrustedPageSeparator(pageSeparator);
-        userConfigured.add("pageSeparator");
     }
 
     /**
@@ -217,6 +214,7 @@ public class TesseractOCRConfig implements Serializable {
      *
      * @param pageSeparator
      */
+    @OperatorOnly
     public void setTrustedPageSeparator(String pageSeparator) {
         this.pageSeparator = pageSeparator;
     }
@@ -235,7 +233,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setPreserveInterwordSpacing(boolean preserveInterwordSpacing) {
         this.preserveInterwordSpacing = preserveInterwordSpacing;
-        userConfigured.add("preserveInterwordSpacing");
     }
 
     /**
@@ -251,7 +248,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setMinFileSizeToOcr(long minFileSizeToOcr) {
         this.minFileSizeToOcr = minFileSizeToOcr;
-        userConfigured.add("minFileSizeToOcr");
     }
 
     /**
@@ -267,24 +263,22 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setMaxFileSizeToOcr(long maxFileSizeToOcr) {
         this.maxFileSizeToOcr = maxFileSizeToOcr;
-        userConfigured.add("maxFileSizeToOcr");
     }
 
     /**
      * @return timeout value for Tesseract
-     * @see #setTimeoutSeconds(int timeout)
+     * @see #setTimeoutMillis(long timeout)
      */
-    public int getTimeoutSeconds() {
-        return timeoutSeconds;
+    public long getTimeoutMillis() {
+        return timeoutMillis;
     }
 
     /**
-     * Set maximum time (seconds) to wait for the ocring process to terminate.
-     * Default value is 120s.
+     * Set maximum time (millis) to wait for the ocring process to terminate.
+     * Default value is 120000ms.
      */
-    public void setTimeoutSeconds(int timeoutSeconds) {
-        this.timeoutSeconds = timeoutSeconds;
-        userConfigured.add("timeoutSeconds");
+    public void setTimeoutMillis(long timeoutMillis) {
+        this.timeoutMillis = timeoutMillis;
     }
 
     /**
@@ -300,7 +294,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setOutputType(OUTPUT_TYPE outputType) {
         this.outputType = outputType;
-        userConfigured.add("outputType");
     }
 
     public void setOutputType(String outputType) {
@@ -331,7 +324,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setEnableImagePreprocessing(boolean enableImagePreprocessing) {
         this.enableImagePreprocessing = enableImagePreprocessing;
-        userConfigured.add("enableImagePreprocessing");
     }
 
     /**
@@ -351,7 +343,6 @@ public class TesseractOCRConfig implements Serializable {
                     "Invalid density value. Valid range of values is 150-1200.");
         }
         this.density = density;
-        userConfigured.add("density");
     }
 
     /**
@@ -370,7 +361,6 @@ public class TesseractOCRConfig implements Serializable {
         for (int allowedValue : allowedValues) {
             if (depth == allowedValue) {
                 this.depth = depth;
-                userConfigured.add("depth");
                 return;
             }
         }
@@ -387,7 +377,7 @@ public class TesseractOCRConfig implements Serializable {
 
     /**
      * @param colorspace the colorspace to set
-     *                   Deafult value is gray.
+     *                   Default value is gray.
      */
     public void setColorspace(String colorspace) {
         if (colorspace == null) {
@@ -398,7 +388,6 @@ public class TesseractOCRConfig implements Serializable {
                     "colorspace must match this pattern: (?i)^[-_A-Z0-9]+$");
         }
         this.colorspace = colorspace;
-        userConfigured.add("colorspace");
     }
 
     /**
@@ -426,7 +415,6 @@ public class TesseractOCRConfig implements Serializable {
         for (String allowedFilter : allowedFilters) {
             if (filter.equalsIgnoreCase(allowedFilter)) {
                 this.filter = filter;
-                userConfigured.add("filter");
                 return;
             }
         }
@@ -447,7 +435,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setSkipOcr(boolean skipOcr) {
         this.skipOcr = skipOcr;
-        userConfigured.add("skipOcr");
     }
 
     /**
@@ -459,13 +446,12 @@ public class TesseractOCRConfig implements Serializable {
 
     /**
      * @param resize the resize to set. Valid range of values is 100-900.
-     *               Default value is 900.
+     *               Default value is 200 (see the {@code resize} field initializer).
      */
     public void setResize(int resize) {
         for (int i = 1; i < 10; i++) {
             if (resize == i * 100) {
                 this.resize = resize;
-                userConfigured.add("resize");
                 return;
             }
         }
@@ -483,11 +469,18 @@ public class TesseractOCRConfig implements Serializable {
 
     public void setInlineContent(boolean inlineContent) {
         this.inlineContent = inlineContent;
-        userConfigured.add("inlineContent");
     }
 
     public boolean isInlineContent() {
         return inlineContent;
+    }
+
+    public boolean isPreloadLangs() {
+        return preloadLangs;
+    }
+
+    public void setPreloadLangs(boolean preloadLangs) {
+        this.preloadLangs = preloadLangs;
     }
 
     /**
@@ -497,7 +490,6 @@ public class TesseractOCRConfig implements Serializable {
      */
     public void setApplyRotation(boolean applyRotation) {
         this.applyRotation = applyRotation;
-        userConfigured.add("applyRotation");
     }
 
     /**
@@ -508,12 +500,24 @@ public class TesseractOCRConfig implements Serializable {
     }
 
     /**
+     * Set the map of other Tesseract config parameters.
+     * Each key-value pair is passed to Tesseract using its -c command line option.
+     * To see the possible options, run tesseract --print-parameters.
+     *
+     * @param otherTesseractConfig map of key-value pairs
+     */
+    @OperatorOnly
+    public void setOtherTesseractConfig(Map<String, String> otherTesseractConfig) {
+        if (otherTesseractConfig != null) {
+            for (Map.Entry<String, String> entry : otherTesseractConfig.entrySet()) {
+                addOtherTesseractConfig(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    /**
      * Add a key-value pair to pass to Tesseract using its -c command line option.
      * To see the possible options, run tesseract --print-parameters.
-     * <p>
-     * You may also add these parameters in TesseractOCRConfig.properties; any
-     * key-value pair in the properties file where the key contains an underscore
-     * is passed directly to Tesseract.
      *
      * @param key
      * @param value
@@ -535,43 +539,45 @@ public class TesseractOCRConfig implements Serializable {
             throw new IllegalArgumentException("Value contains illegal characters: " + value);
         }
         otherTesseractConfig.put(key.trim(), value.trim());
-        userConfigured.add("otherTesseractConfig");
     }
 
-    public TesseractOCRConfig cloneAndUpdate(TesseractOCRConfig updates) throws TikaException {
-        TesseractOCRConfig updated = new TesseractOCRConfig();
-        for (Field field : this.getClass().getDeclaredFields()) {
-            if (Modifier.isFinal(field.getModifiers())) {
-                continue;
-            } else if (Modifier.isStatic(field.getModifiers())) {
-                continue;
-            }
-            if ("userConfigured".equals(field.getName())) {
-                continue;
-            }
-            if ("otherTesseractConfig".equals(field.getName()) &&
-                    updates.userConfigured.contains(field.getName())) {
-                //deep copy
-                for (Map.Entry<String, String> e : updates.getOtherTesseractConfig().entrySet()) {
-                    updated.addOtherTesseractConfig(e.getKey(), e.getValue());
-                }
-                continue;
-            }
-            if (updates.userConfigured.contains(field.getName())) {
-                try {
-                    field.set(updated, field.get(updates));
-                } catch (IllegalAccessException e) {
-                    throw new TikaException("can't update " + field.getName(), e);
-                }
-            } else {
-                try {
-                    field.set(updated, field.get(this));
-                } catch (IllegalAccessException e) {
-                    throw new TikaException("can't update " + field.getName(), e);
-                }
-            }
+    public String getTesseractPath() {
+        return tesseractPath;
+    }
+
+    @OperatorOnly
+    public void setTesseractPath(String tesseractPath) throws TikaConfigException {
+        tesseractPath = FilenameUtils.normalize(tesseractPath);
+        if (!tesseractPath.isEmpty() && !tesseractPath.endsWith(File.separator)) {
+            tesseractPath += File.separator;
         }
-        return updated;
+        this.tesseractPath = tesseractPath;
+    }
+
+    public String getTessdataPath() {
+        return tessdataPath;
+    }
+
+    @OperatorOnly
+    public void setTessdataPath(String tessdataPath) throws TikaConfigException {
+        tessdataPath = FilenameUtils.normalize(tessdataPath);
+        if (!tessdataPath.isEmpty() && !tessdataPath.endsWith(File.separator)) {
+            tessdataPath += File.separator;
+        }
+        this.tessdataPath = tessdataPath;
+    }
+
+    public String getImageMagickPath() {
+        return imageMagickPath;
+    }
+
+    @OperatorOnly
+    public void setImageMagickPath(String imageMagickPath) throws TikaConfigException {
+        imageMagickPath = FilenameUtils.normalize(imageMagickPath);
+        if (!imageMagickPath.isEmpty() && !imageMagickPath.endsWith(File.separator)) {
+            imageMagickPath += File.separator;
+        }
+        this.imageMagickPath = imageMagickPath;
     }
 
     public enum OUTPUT_TYPE {

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core.resource;
 
 import java.io.IOException;
@@ -24,7 +23,6 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 
 import jakarta.ws.rs.BadRequestException;
@@ -33,39 +31,58 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
-import org.apache.tika.pipes.FetchEmitTuple;
-import org.apache.tika.pipes.async.AsyncProcessor;
-import org.apache.tika.pipes.async.OfferLargerThanQueueSize;
-import org.apache.tika.pipes.emitter.EmitData;
-import org.apache.tika.pipes.emitter.EmitterManager;
-import org.apache.tika.pipes.extractor.EmbeddedDocumentBytesConfig;
-import org.apache.tika.pipes.fetcher.FetchKey;
-import org.apache.tika.serialization.pipes.JsonFetchEmitTupleList;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
+import org.apache.tika.pipes.core.async.AsyncProcessor;
+import org.apache.tika.pipes.core.async.OfferLargerThanQueueSize;
+import org.apache.tika.pipes.core.emitter.EmitDataImpl;
+import org.apache.tika.pipes.core.emitter.EmitterManager;
+import org.apache.tika.pipes.core.extractor.UnpackConfig;
+import org.apache.tika.pipes.core.fetcher.FetcherManager;
+import org.apache.tika.pipes.core.serialization.JsonFetchEmitTupleList;
+import org.apache.tika.plugins.TikaPluginManager;
+import org.apache.tika.serialization.ParseContextUtils;
+import org.apache.tika.server.core.TikaServerConfig;
 
 @Path("/async")
 public class AsyncResource {
 
     private static final Logger LOG = LoggerFactory.getLogger(AsyncResource.class);
     private final AsyncProcessor asyncProcessor;
-    private final Set<String> supportedFetchers;
     private final EmitterManager emitterManager;
-    long maxQueuePauseMs = 60000;
+    private final FetcherManager fetcherManager;
+    long maxQueuePauseMillis = TikaServerConfig.DEFAULT_MAX_QUEUE_PAUSE_MILLIS;
     private ArrayBlockingQueue<FetchEmitTuple> queue;
 
-    public AsyncResource(java.nio.file.Path tikaConfigPath, Set<String> supportedFetchers) throws TikaException, IOException, SAXException {
-        this.asyncProcessor = new AsyncProcessor(tikaConfigPath);
-        this.supportedFetchers = supportedFetchers;
-        this.emitterManager = EmitterManager.load(tikaConfigPath);
+    public AsyncResource(java.nio.file.Path tikaConfigPath) throws TikaException, IOException, SAXException {
+        this.asyncProcessor = AsyncProcessor.load(tikaConfigPath);
+        // One bad tuple must not halt the shared workers and brick /async until restart.
+        this.asyncProcessor.setStopOnlyOnFatal(true);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        TikaPluginManager pluginManager = TikaPluginManager.load(tikaJsonConfig);
+        this.emitterManager = EmitterManager.load(pluginManager, tikaJsonConfig);
+        this.fetcherManager = FetcherManager.load(pluginManager, tikaJsonConfig);
+    }
+
+    /** How long a full /async queue blocks a POST before returning 429; see TikaServerConfig. */
+    public void setMaxQueuePauseMillis(long maxQueuePauseMillis) {
+        this.maxQueuePauseMillis = maxQueuePauseMillis;
+    }
+
+    public AsyncProcessor getAsyncProcessor() {
+        return asyncProcessor;
     }
 
     public ArrayBlockingQueue<FetchEmitTuple> getFetchEmitQueue(int queueSize) {
@@ -73,29 +90,27 @@ public class AsyncResource {
         return queue;
     }
 
-    public ArrayBlockingQueue<EmitData> getEmitDataQueue(int size) {
+    public ArrayBlockingQueue<EmitDataImpl> getEmitDataQueue(int size) {
         return new ArrayBlockingQueue<>(size);
     }
 
     /**
-     * The client posts a json request.  At a minimum, this must be a
-     * json object that contains an emitter and a fetcherString key with
-     * the key to fetch the inputStream. Optionally, it may contain a metadata
-     * object that will be used to populate the metadata key for pass
-     * through of metadata from the client.
+     * The client posts a JSON object {@code {"tuples":[...]}}. Each tuple names
+     * a fetcher and fetch key for input and an emitter for output; it may also
+     * carry a metadata object (passed through to the emitted metadata) and a
+     * parse context.
      * <p>
      * The extracted text content is stored with the key
      * {@link TikaCoreProperties#TIKA_CONTENT}
-     * <p>
-     * Must specify a fetcherString and an emitter in the posted json.
      *
      * @param info uri info
-     * @return InputStream that can be deserialized as a list of {@link Metadata} objects
+     * @return JSON body reporting acceptance ({@code {"status":"ok","added":n}});
+     *         the parses themselves run asynchronously
      * @throws Exception
      */
     @POST
     @Produces("application/json")
-    public Map<String, Object> post(InputStream is, @Context HttpHeaders httpHeaders, @Context UriInfo info) throws Exception {
+    public Response post(InputStream is, @Context HttpHeaders httpHeaders, @Context UriInfo info) throws Exception {
 
         AsyncRequest request = deserializeASyncRequest(is);
 
@@ -103,25 +118,34 @@ public class AsyncResource {
         //the requested fetchers and emitters
         //throw early
         for (FetchEmitTuple t : request.getTuples()) {
-            if (!supportedFetchers.contains(t
-                    .getFetchKey()
-                    .getFetcherName())) {
+            PipesParsingHelper.rejectReservedComponentIds(t);
+            if (!fetcherManager
+                    .getSupported()
+                    .contains(t
+                            .getFetchKey()
+                            .getFetcherId())) {
                 return badFetcher(t.getFetchKey());
             }
             if (!emitterManager
                     .getSupported()
                     .contains(t
                             .getEmitKey()
-                            .getEmitterName())) {
+                            .getEmitterId())) {
                 return badEmitter(t
                         .getEmitKey()
-                        .getEmitterName());
+                        .getEmitterId());
             }
             ParseContext parseContext = t.getParseContext();
-            EmbeddedDocumentBytesConfig embeddedDocumentBytesConfig = parseContext.get(EmbeddedDocumentBytesConfig.class);
-            if (embeddedDocumentBytesConfig != null && embeddedDocumentBytesConfig.isExtractEmbeddedDocumentBytes() &&
-                    !StringUtils.isAllBlank(embeddedDocumentBytesConfig.getEmitter())) {
-                String bytesEmitter = embeddedDocumentBytesConfig.getEmitter();
+            // Configs are lazy; resolve before reading UnpackConfig for the bytes-emitter check.
+            try {
+                ParseContextUtils.resolveAll(parseContext, getClass().getClassLoader());
+            } catch (TikaConfigException e) {
+                throw new BadRequestException(
+                        "Could not resolve the parseContext in the /async request body: " + e.getMessage(), e);
+            }
+            UnpackConfig unpackConfig = parseContext.get(UnpackConfig.class);
+            if (unpackConfig != null && !StringUtils.isAllBlank(unpackConfig.getEmitter())) {
+                String bytesEmitter = unpackConfig.getEmitter();
                 if (!emitterManager
                         .getSupported()
                         .contains(bytesEmitter)) {
@@ -131,16 +155,16 @@ public class AsyncResource {
         }
         //Instant start = Instant.now();
         try {
-            boolean offered = asyncProcessor.offer(request.getTuples(), maxQueuePauseMs);
+            boolean offered = asyncProcessor.offer(request.getTuples(), maxQueuePauseMillis);
             if (offered) {
-                LOG.info("accepted {} tuples, capacity={}", request
+                LOG.debug("accepted {} tuples, capacity={}", request
                         .getTuples()
                         .size(), asyncProcessor.getCapacity());
                 return ok(request
                         .getTuples()
                         .size());
             } else {
-                LOG.info("throttling {} tuples, capacity={}", request
+                LOG.debug("throttling {} tuples, capacity={}", request
                         .getTuples()
                         .size(), asyncProcessor.getCapacity());
                 return throttle(request
@@ -148,41 +172,51 @@ public class AsyncResource {
                         .size());
             }
         } catch (OfferLargerThanQueueSize e) {
-            LOG.info("throttling {} tuples, capacity={}", request
-                    .getTuples()
-                    .size(), asyncProcessor.getCapacity());
-            return throttle(request
-                    .getTuples()
-                    .size());
+            // Bigger than the queue can EVER hold -- retrying is futile, so 400, not 429.
+            throw new BadRequestException("Batch of " + e.getSizeOffered() +
+                    " tuples exceeds the queue capacity (" + e.getQueueSize() +
+                    "); split the batch", e);
         }
     }
 
-    private Map<String, Object> ok(int size) {
+    private Response ok(int size) {
         Map<String, Object> map = new HashMap<>();
         map.put("status", "ok");
         map.put("added", size);
-        return map;
+        return Response.ok(map).build();
     }
 
-    private Map<String, Object> throttle(int requestSize) {
+    /**
+     * 429, not 200. The queue was full for the whole {@code maxQueuePauseMillis} wait, so nothing
+     * was accepted -- a 200 made a rejected batch indistinguishable from an accepted one to
+     * any client that checks status rather than parsing the body, and there are such clients.
+     */
+    private Response throttle(int requestSize) {
         Map<String, Object> map = new HashMap<>();
         map.put("status", "throttled");
-        map.put("msg", "not able to receive request of size " + requestSize + " at this time");
+        map.put("message", "not able to receive request of size " + requestSize + " at this time");
         map.put("capacity", asyncProcessor.getCapacity());
-        return map;
+        return Response
+                .status(Response.Status.TOO_MANY_REQUESTS)
+                .header(HttpHeaders.RETRY_AFTER, PipesParsingHelper.retryAfterSeconds(maxQueuePauseMillis))
+                .entity(map)
+                .build();
     }
 
-    private Map<String, Object> badEmitter(String emitterName) {
+    private Response badEmitter(String emitterName) {
         throw new BadRequestException("can't find emitter for " + emitterName);
     }
 
-    private Map<String, Object> badFetcher(FetchKey fetchKey) {
-        throw new BadRequestException("can't find fetcher for " + fetchKey.getFetcherName());
+    private Response badFetcher(FetchKey fetchKey) {
+        throw new BadRequestException("can't find fetcher for " + fetchKey.getFetcherId());
     }
 
     private AsyncRequest deserializeASyncRequest(InputStream is) throws IOException {
         try (Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8)) {
             return new AsyncRequest(JsonFetchEmitTupleList.fromJson(reader));
+        } catch (IOException e) {
+            // A malformed body is the caller's error, not a server fault -- 400 with the reason.
+            throw new BadRequestException("Could not parse the /async request body: " + e.getMessage(), e);
         }
     }
 

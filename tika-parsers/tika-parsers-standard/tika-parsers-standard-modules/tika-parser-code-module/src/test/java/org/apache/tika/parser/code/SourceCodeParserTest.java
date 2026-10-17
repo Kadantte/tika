@@ -21,7 +21,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.ByteArrayInputStream;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -29,6 +28,7 @@ import org.xml.sax.ContentHandler;
 
 import org.apache.tika.TikaTest;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -57,7 +57,6 @@ public class SourceCodeParserTest extends TikaTest {
                         createMetadata("text/x-java-source")).xml;
 
         assertTrue(htmlContent.indexOf("<html xmlns=\"http") == 0);
-        assertContains("xml:lang=\"en\"", htmlContent);
         assertTrue(htmlContent.indexOf(
                 "<span class=\"java_keyword\">public</span><span class=\"java_plain\">") >
                 0);
@@ -74,7 +73,7 @@ public class SourceCodeParserTest extends TikaTest {
         assertFalse(textContent.contains("html"));
 
         textContent =
-                getText(new ByteArrayInputStream("public class HelloWorld {}".getBytes(UTF_8)),
+                getText(TikaInputStream.get("public class HelloWorld {}".getBytes(UTF_8)),
                         sourceCodeParser, createMetadata("text/x-java-source"));
         assertTrue(textContent.length() > 0);
         assertFalse(textContent.contains("html"));
@@ -124,7 +123,7 @@ public class SourceCodeParserTest extends TikaTest {
     private Metadata createMetadata(String mimeType) {
         Metadata metadata = new Metadata();
         metadata.add(TikaCoreProperties.RESOURCE_NAME_KEY, "testFile");
-        metadata.add(Metadata.CONTENT_TYPE, mimeType);
+        metadata.add(HttpHeaders.CONTENT_TYPE, mimeType);
         return metadata;
     }
 

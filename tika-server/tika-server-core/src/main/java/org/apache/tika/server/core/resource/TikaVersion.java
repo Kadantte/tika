@@ -27,13 +27,12 @@ public class TikaVersion {
     private Tika tika;
 
     public TikaVersion() {
-        this.tika = new Tika(TikaResource.getConfig());
+        this.tika = new Tika();
     }
 
     @GET
     @Produces("text/plain")
     public String getVersion() {
-        TikaResource.checkIsOperating();
         return tika.toString();
     }
 }

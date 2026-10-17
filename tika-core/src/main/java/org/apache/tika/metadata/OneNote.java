@@ -1,0 +1,90 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.metadata;
+
+/**
+ * OneNote file-header and revision metadata. Key suffixes are the [MS-ONESTORE]/[MS-FSSHTTPB]
+ * field names verbatim (external-standard spellings), under the {@code onenote:} namespace,
+ * except the GUID keys below, which are projected from the source object that carries the
+ * value (the section file identity, or a NotebookManagementEntityGuid keyed by the carrying
+ * object's JCID).
+ * Previously these were minted per parse via the registering Property factories
+ * (TIKA-4816 round-3 review: per-record global-lock interning); a bounded, spec-defined
+ * vocabulary belongs in curated constants.
+ *
+ * <p>The GUID bags (pageGuids, pageSeriesGuids, pageNodeGuids, conflictPageGuids) are
+ * unordered, deduplicated, lexically sorted inventories: do not join them positionally
+ * to each other or to page content, and do not treat values as unique across files.
+ * Page order and page-to-content association are available only through the FSSHTTPB
+ * XHTML output, where each recognized page is wrapped in a div whose id is the page
+ * GUID when one was recovered (fallback content can be unwrapped).
+ */
+public interface OneNote {
+
+    String PREFIX = "onenote" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+
+    Property BUILD_NUMBER_CREATED = Property.externalText(PREFIX + "buildNumberCreated");
+    Property BUILD_NUMBER_LAST_WROTE_TO_FILE =
+            Property.externalText(PREFIX + "buildNumberLastWroteToFile");
+    Property BUILD_NUMBER_NEWEST_WRITTEN =
+            Property.externalText(PREFIX + "buildNumberNewestWritten");
+    Property BUILD_NUMBER_OLDEST_WRITTEN =
+            Property.externalText(PREFIX + "buildNumberOldestWritten");
+    Property CB_EXPECTED_FILE_LENGTH = Property.externalText(PREFIX + "cbExpectedFileLength");
+    Property CB_FREE_SPACE_IN_FREE_CHUNK_LIST =
+            Property.externalText(PREFIX + "cbFreeSpaceInFreeChunkList");
+    Property CB_LEGACY_EXPECTED_FILE_LENGTH =
+            Property.externalText(PREFIX + "cbLegacyExpectedFileLength");
+    Property CB_LEGACY_FREE_SPACE_IN_FREE_CHUNK_LIST =
+            Property.externalText(PREFIX + "cbLegacyFreeSpaceInFreeChunkList");
+    Property CRC_NAME = Property.externalText(PREFIX + "crcName");
+    Property C_TRANSACTIONS_IN_LOG = Property.externalText(PREFIX + "cTransactionsInLog");
+    Property FFV_LAST_CODE_THAT_WROTE_TO_THIS_FILE =
+            Property.externalText(PREFIX + "ffvLastCodeThatWroteToThisFile");
+    Property FFV_NEWEST_CODE_THAT_HAS_WRITTEN_TO_THIS_FILE =
+            Property.externalText(PREFIX + "ffvNewestCodeThatHasWrittenToThisFile");
+    Property FFV_OLDEST_CODE_THAT_HAS_WRITTEN_TO_THIS_FILE =
+            Property.externalText(PREFIX + "ffvOldestCodeThatHasWrittenToThisFile");
+    Property FFV_OLDEST_CODE_THAT_MAY_READ_THIS_FILE =
+            Property.externalText(PREFIX + "ffvOldestCodeThatMayReadThisFile");
+    Property GRF_DEBUG_LOG_FLAGS = Property.externalText(PREFIX + "grfDebugLogFlags");
+    Property N_FILE_VERSION_GENERATION =
+            Property.externalText(PREFIX + "nFileVersionGeneration");
+    Property RGB_PLACEHOLDER = Property.externalText(PREFIX + "rgbPlaceholder");
+
+    Property MOST_RECENT_AUTHORS = Property.externalTextBag(PREFIX + "mostRecentAuthors");
+    Property ORIGINAL_AUTHORS = Property.externalTextBag(PREFIX + "originalAuthors");
+
+    /**
+     * GUID of the section file: guidFile from the classic header, or the first
+     * FileIdentityGuid property found in a newer-format package.
+     */
+    Property SECTION_GUID = Property.externalText(PREFIX + "sectionGuid");
+    /**
+     * GUIDs of jcidPageMetadata (0x30) objects. Classic parsing records only pages referenced
+     * via MetaDataObjectsAboveGraphSpace; FSSHTTPB fallback walks may still include older copies.
+     */
+    Property PAGE_GUIDS = Property.externalTextBag(PREFIX + "pageGuids");
+    /** GUIDs of jcidPageSeriesNode (0x08) objects. */
+    Property PAGE_SERIES_GUIDS = Property.externalTextBag(PREFIX + "pageSeriesGuids");
+    /** GUIDs of jcidPageNode (0x0B) objects; source-object identifiers, not cross-file page keys. */
+    Property PAGE_NODE_GUIDS = Property.externalTextBag(PREFIX + "pageNodeGuids");
+    /** GUIDs of jcidConflictPageMetadata (0x38) objects. */
+    Property CONFLICT_PAGE_GUIDS = Property.externalTextBag(PREFIX + "conflictPageGuids");
+    Property CREATION_TIMESTAMP = Property.externalText(PREFIX + "creationTimestamp");
+    Property LAST_MODIFIED_TIMESTAMP = Property.externalText(PREFIX + "lastModifiedTimestamp");
+}

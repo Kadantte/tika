@@ -16,22 +16,68 @@
  */
 package org.apache.tika.async.cli;
 
+import org.apache.tika.sax.BasicContentHandlerFactory;
+
 class SimpleAsyncConfig {
+
+    enum ExtractBytesMode {
+        NONE,       // no byte extraction
+        SHALLOW,    // -z: depth=1, no throw on max depth
+        RECURSIVE   // -Z: full recursion
+    }
 
     private String inputDir;
     private String outputDir;
     private Integer numClients;
-    private Long timeoutMs;
+    private Long timeoutMillis;
     private String xmx;
     private String fileList;
+    private String tikaConfig;//path to the tikaConfig file to be used in the forked process
+    private ExtractBytesMode extractBytesMode;
+    private final BasicContentHandlerFactory.HANDLER_TYPE handlerType;
+    private final String pluginsDir;
 
-    public SimpleAsyncConfig(String inputDir, String outputDir, Integer numClients, Long timeoutMs, String xmx, String fileList) {
+    // Parse mode options
+    private final boolean concatenate;
+    private final boolean contentOnly;
+
+    // Frictionless Data Package options
+    private final String unpackFormat;  // "REGULAR" or "FRICTIONLESS"
+    private final String unpackMode;    // "ZIPPED" or "DIRECTORY"
+    private final boolean unpackIncludeMetadata;
+
+    // Emitter behavior when an output file already exists: "EXCEPTION", "REPLACE" or "SKIP".
+    // null leaves the emitter/config default (EXCEPTION) in place.
+    private String onExists;
+
+    //TODO -- switch to a builder
+    public SimpleAsyncConfig(String inputDir, String outputDir, Integer numClients, Long timeoutMillis, String xmx, String fileList,
+                             String tikaConfig, BasicContentHandlerFactory.HANDLER_TYPE handlerType,
+                             ExtractBytesMode extractBytesMode, String pluginsDir) {
+        this(inputDir, outputDir, numClients, timeoutMillis, xmx, fileList, tikaConfig, handlerType,
+                extractBytesMode, pluginsDir, false, false, null, null, false);
+    }
+
+    public SimpleAsyncConfig(String inputDir, String outputDir, Integer numClients, Long timeoutMillis, String xmx, String fileList,
+                             String tikaConfig, BasicContentHandlerFactory.HANDLER_TYPE handlerType,
+                             ExtractBytesMode extractBytesMode, String pluginsDir,
+                             boolean concatenate, boolean contentOnly,
+                             String unpackFormat, String unpackMode, boolean unpackIncludeMetadata) {
         this.inputDir = inputDir;
         this.outputDir = outputDir;
         this.numClients = numClients;
-        this.timeoutMs = timeoutMs;
+        this.timeoutMillis = timeoutMillis;
         this.xmx = xmx;
         this.fileList = fileList;
+        this.tikaConfig = tikaConfig;
+        this.handlerType = handlerType;
+        this.extractBytesMode = extractBytesMode;
+        this.pluginsDir = pluginsDir;
+        this.concatenate = concatenate;
+        this.contentOnly = contentOnly;
+        this.unpackFormat = unpackFormat;
+        this.unpackMode = unpackMode;
+        this.unpackIncludeMetadata = unpackIncludeMetadata;
     }
 
     public String getInputDir() {
@@ -46,8 +92,8 @@ class SimpleAsyncConfig {
         return numClients;
     }
 
-    public Long getTimeoutMs() {
-        return timeoutMs;
+    public Long getTimeoutMillis() {
+        return timeoutMillis;
     }
 
     public String getXmx() {
@@ -56,5 +102,71 @@ class SimpleAsyncConfig {
 
     public String getFileList() {
         return fileList;
+    }
+
+    public String getTikaConfig() {
+        return tikaConfig;
+    }
+
+    public ExtractBytesMode getExtractBytesMode() {
+        return extractBytesMode;
+    }
+
+    public BasicContentHandlerFactory.HANDLER_TYPE getHandlerType() {
+        return handlerType;
+    }
+
+    public String getPluginsDir() {
+        return pluginsDir;
+    }
+
+    public boolean isConcatenate() {
+        return concatenate;
+    }
+
+    public boolean isContentOnly() {
+        return contentOnly;
+    }
+
+    public String getUnpackFormat() {
+        return unpackFormat;
+    }
+
+    public String getUnpackMode() {
+        return unpackMode;
+    }
+
+    public boolean isUnpackIncludeMetadata() {
+        return unpackIncludeMetadata;
+    }
+
+    public String getOnExists() {
+        return onExists;
+    }
+
+    public void setOnExists(String onExists) {
+        this.onExists = onExists;
+    }
+
+    @Override
+    public String toString() {
+        return "SimpleAsyncConfig{" +
+                "inputDir='" + inputDir + '\'' +
+                ", outputDir='" + outputDir + '\'' +
+                ", numClients=" + numClients +
+                ", timeoutMillis=" + timeoutMillis +
+                ", xmx='" + xmx + '\'' +
+                ", fileList='" + fileList + '\'' +
+                ", tikaConfig='" + tikaConfig + '\'' +
+                ", extractBytesMode=" + extractBytesMode +
+                ", handlerType=" + handlerType +
+                ", pluginsDir='" + pluginsDir + '\'' +
+                ", concatenate=" + concatenate +
+                ", contentOnly=" + contentOnly +
+                ", unpackFormat='" + unpackFormat + '\'' +
+                ", unpackMode='" + unpackMode + '\'' +
+                ", unpackIncludeMetadata=" + unpackIncludeMetadata +
+                ", onExists='" + onExists + '\'' +
+                '}';
     }
 }

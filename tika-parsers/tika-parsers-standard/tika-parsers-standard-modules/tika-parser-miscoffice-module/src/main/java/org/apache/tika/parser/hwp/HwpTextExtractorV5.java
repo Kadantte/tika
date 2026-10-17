@@ -57,7 +57,6 @@ import org.apache.tika.exception.TikaMemoryLimitException;
 import org.apache.tika.exception.UnsupportedFormatException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
-import org.apache.tika.metadata.OfficeOpenXMLCore;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.sax.XHTMLContentHandler;
 
@@ -168,7 +167,7 @@ public class HwpTextExtractorV5 implements Serializable {
                     metadata.set(TikaCoreProperties.TITLE, (String) value);
                     break;
                 case 3:
-                    metadata.set(OfficeOpenXMLCore.SUBJECT, (String) value);
+                    metadata.set(TikaCoreProperties.SUBJECT, (String) value);
                     break;
                 case 4:
                     metadata.set(TikaCoreProperties.CREATOR, (String) value);
@@ -264,7 +263,7 @@ public class HwpTextExtractorV5 implements Serializable {
                 parse(reader, xhtml);
 
             } else {
-                LOG.warn("Unknown Entry '{}'({})", entry.getName(), entry);
+                LOG.debug("Unknown Entry '{}'({})", entry.getName(), entry);
             }
         }
     }
@@ -309,7 +308,7 @@ public class HwpTextExtractorV5 implements Serializable {
                     IOUtils.closeQuietly(input);
                 }
             } else {
-                LOG.warn("unknown Entry '{}'({})", entry.getName(), entry);
+                LOG.debug("unknown Entry '{}'({})", entry.getName(), entry);
             }
         }
     }

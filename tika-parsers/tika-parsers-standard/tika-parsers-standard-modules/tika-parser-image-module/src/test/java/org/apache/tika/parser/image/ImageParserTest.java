@@ -17,14 +17,16 @@
 package org.apache.tika.parser.image;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-
-import java.io.InputStream;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TIFF;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -37,9 +39,9 @@ public class ImageParserTest extends TikaTest {
     @Test
     public void testBMP() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/bmp");
-        try (InputStream stream = getResourceAsStream("/test-documents/testBMP.bmp")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/bmp");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testBMP.bmp")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
 
         assertEquals("75", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height"));
@@ -52,18 +54,18 @@ public class ImageParserTest extends TikaTest {
         assertEquals("BI_RGB", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "Compression CompressionTypeName"));
         assertEquals("image/bmp", metadata.get("Content-Type"));
 
-        assertEquals("100", metadata.get(Metadata.IMAGE_WIDTH));
-        assertEquals("75", metadata.get(Metadata.IMAGE_LENGTH));
-        assertEquals("8 8 8", metadata.get(Metadata.BITS_PER_SAMPLE));
+        assertEquals("100", metadata.get(TIFF.IMAGE_WIDTH));
+        assertEquals("75", metadata.get(TIFF.IMAGE_LENGTH));
+        assertEquals("8 8 8", metadata.get(TIFF.BITS_PER_SAMPLE));
         assertEquals(1, metadata.getInt(TikaCoreProperties.NUM_IMAGES));
     }
 
     @Test
     public void testGIF() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/gif");
-        try (InputStream stream = getResourceAsStream("/test-documents/testGIF.gif")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/gif");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testGIF.gif")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
 
         assertEquals("75", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height"));
@@ -93,8 +95,8 @@ public class ImageParserTest extends TikaTest {
         assertEquals("0", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "Dimension VerticalPixelOffset"));
         assertEquals("image/gif", metadata.get("Content-Type"));
 
-        assertEquals("100", metadata.get(Metadata.IMAGE_WIDTH));
-        assertEquals("75", metadata.get(Metadata.IMAGE_LENGTH));
+        assertEquals("100", metadata.get(TIFF.IMAGE_WIDTH));
+        assertEquals("75", metadata.get(TIFF.IMAGE_LENGTH));
         assertEquals("Licensed to the Apache Software Foundation (ASF) under one or " +
                         "more contributor license agreements.  See the NOTICE file distributed " +
                         "with this work for additional information regarding copyright ownership.",
@@ -105,9 +107,9 @@ public class ImageParserTest extends TikaTest {
     @Test
     public void testJPEG() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/jpeg");
-        try (InputStream stream = getResourceAsStream("/test-documents/testJPEG.jpg")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/jpeg");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testJPEG.jpg")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
 
         assertEquals("75", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height"));
@@ -145,8 +147,8 @@ public class ImageParserTest extends TikaTest {
         assertEquals("process=0, samplePrecision=8, numLines=75, samplesPerLine=100, " +
                 "numFrameComponents=3", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "markerSequence sof"));
 
-        assertEquals("100", metadata.get(Metadata.IMAGE_WIDTH));
-        assertEquals("75", metadata.get(Metadata.IMAGE_LENGTH));
+        assertEquals("100", metadata.get(TIFF.IMAGE_WIDTH));
+        assertEquals("75", metadata.get(TIFF.IMAGE_LENGTH));
         assertEquals("Licensed to the Apache Software Foundation (ASF) under one or " +
                         "more contributor license agreements.  See the NOTICE file distributed " +
                         "with this work for additional information regarding copyright ownership.",
@@ -157,9 +159,9 @@ public class ImageParserTest extends TikaTest {
     @Test
     public void testPNG() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/png");
-        try (InputStream stream = getResourceAsStream("/test-documents/testPNG.png")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/png");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPNG.png")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
 
         assertEquals("75", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height"));
@@ -199,18 +201,18 @@ public class ImageParserTest extends TikaTest {
                 metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "Document ImageModificationTime"));
         assertEquals("image/png", metadata.get("Content-Type"));
 
-        assertEquals("100", metadata.get(Metadata.IMAGE_WIDTH));
-        assertEquals("75", metadata.get(Metadata.IMAGE_LENGTH));
-        assertEquals("8 8 8", metadata.get(Metadata.BITS_PER_SAMPLE));
+        assertEquals("100", metadata.get(TIFF.IMAGE_WIDTH));
+        assertEquals("75", metadata.get(TIFF.IMAGE_LENGTH));
+        assertEquals("8 8 8", metadata.get(TIFF.BITS_PER_SAMPLE));
         assertEquals(1, metadata.getInt(TikaCoreProperties.NUM_IMAGES));
     }
 
     @Test // TIKA-2232
     public void testJBIG2() throws Exception {
         Metadata metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "image/x-jbig2");
-        try (InputStream stream = getResourceAsStream("/test-documents/testJBIG2.jb2")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/x-jbig2");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testJBIG2.jb2")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
         assertEquals("78", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "height"));
         assertEquals("328", metadata.get(ImageMetadataExtractor.UNKNOWN_IMG_NS + "width"));
@@ -218,24 +220,160 @@ public class ImageParserTest extends TikaTest {
         assertEquals(1, metadata.getInt(TikaCoreProperties.NUM_IMAGES));
     }
 
+
+    /**
+     * A named enricher is invoked by the image parser, which keeps extracting its own
+     * metadata -- the enricher does not displace it (TIKA-4872).
+     */
     @Test
-    public void testMimeTypeToOCRMimeTypeConversion() throws Exception {
-        assertEquals(new MediaType("image", "OCR-png"),
-                AbstractImageParser.convertToOCRMediaType(MediaType.image("png")));
+    public void testExplicitContentEnricher() throws Exception {
+        Parser enricher = new Parser() {
+            @Override
+            public java.util.Set<MediaType> getSupportedTypes(ParseContext context) {
+                return java.util.Collections.singleton(MediaType.image("png"));
+            }
+
+            @Override
+            public void parse(TikaInputStream tis, org.xml.sax.ContentHandler handler,
+                              Metadata metadata, ParseContext context) {
+                metadata.set("derived-by", "test-enricher");
+            }
+        };
+        ImageParser imageParser = new ImageParser();
+        imageParser.setContentEnrichers(
+                new org.apache.tika.parser.enricher.CompositeContentEnricher(
+                        java.util.List.of(enricher)));
+
+        Metadata metadata = new Metadata();
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/png");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPNG.png")) {
+            imageParser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
+        }
+        assertEquals("test-enricher", metadata.get("derived-by"));
+        // the image parser still ran and extracted its own metadata
+        assertEquals("100", metadata.get(TIFF.IMAGE_WIDTH));
+    }
+
+    /** A spacer is not a picture: the image parser records the size, and 1 x 1 gets no engine. */
+    @Test
+    public void testTinyImageGetsNoEnricher(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp)
+            throws Exception {
+        Parser enricher = new Parser() {
+            @Override
+            public java.util.Set<MediaType> getSupportedTypes(ParseContext context) {
+                return java.util.Collections.singleton(MediaType.image("png"));
+            }
+
+            @Override
+            public void parse(TikaInputStream tis, org.xml.sax.ContentHandler handler,
+                              Metadata metadata, ParseContext context) {
+                metadata.set("derived-by", "test-enricher");
+            }
+        };
+        ImageParser imageParser = new ImageParser();
+        imageParser.setContentEnrichers(
+                new org.apache.tika.parser.enricher.CompositeContentEnricher(
+                        java.util.List.of(enricher)));
+        for (int side : new int[] {1, 2}) {
+            java.nio.file.Path png = tmp.resolve(side + ".png");
+            javax.imageio.ImageIO.write(new java.awt.image.BufferedImage(side * 100, side,
+                    java.awt.image.BufferedImage.TYPE_INT_RGB), "png", png.toFile());
+            Metadata metadata = new Metadata();
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/png");
+            try (TikaInputStream tis = TikaInputStream.get(png)) {
+                imageParser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
+            }
+            assertEquals(String.valueOf(side), metadata.get(TIFF.IMAGE_LENGTH));
+            assertEquals(side == 1 ? null : "test-enricher", metadata.get("derived-by"),
+                    side + " pixels tall");
+        }
+    }
+
+    /** The image parser owns jp2/jpx/ppm for enrichment; with no reader it must not fail. */
+    @Test
+    public void testJp2ReachesEnricherWithoutReader() throws Exception {
+        assertTrue(parser.getSupportedTypes(new ParseContext()).contains(MediaType.image("jp2")));
+        Parser enricher = new Parser() {
+            @Override
+            public java.util.Set<MediaType> getSupportedTypes(ParseContext context) {
+                return java.util.Collections.singleton(MediaType.image("jp2"));
+            }
+
+            @Override
+            public void parse(TikaInputStream tis, org.xml.sax.ContentHandler handler,
+                              Metadata metadata, ParseContext context) {
+                metadata.set("derived-by", "test-enricher");
+            }
+        };
+        ImageParser imageParser = new ImageParser();
+        imageParser.setContentEnrichers(
+                new org.apache.tika.parser.enricher.CompositeContentEnricher(
+                        java.util.List.of(enricher)));
+
+        Metadata metadata = new Metadata();
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/jp2");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testJPEG.jp2")) {
+            imageParser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
+        }
+        assertEquals("test-enricher", metadata.get("derived-by"));
+    }
+
+    /**
+     * A parser that re-types the document mid-parse must still fire the enricher chosen
+     * for the DETECTED type it was dispatched on (TIKA-4872).
+     */
+    @Test
+    public void testEnricherSelectedOnDetectedTypeNotRefinedType() throws Exception {
+        Parser enricher = new Parser() {
+            @Override
+            public java.util.Set<MediaType> getSupportedTypes(ParseContext context) {
+                return java.util.Collections.singleton(MediaType.image("png"));
+            }
+
+            @Override
+            public void parse(TikaInputStream tis, org.xml.sax.ContentHandler handler,
+                              Metadata metadata, ParseContext context) {
+                metadata.set("enriched-for", "image/png");
+            }
+        };
+        AbstractImageParser retypingParser = new AbstractImageParser() {
+            @Override
+            public java.util.Set<MediaType> getSupportedTypes(ParseContext context) {
+                return java.util.Collections.singleton(MediaType.image("png"));
+            }
+
+            @Override
+            void extractMetadata(java.io.InputStream is, org.xml.sax.ContentHandler handler,
+                                 Metadata metadata, ParseContext context) {
+                // simulates a parser refining detection mid-parse
+                metadata.set(HttpHeaders.CONTENT_TYPE, "application/illustrator");
+            }
+        };
+        retypingParser.setContentEnrichers(
+                new org.apache.tika.parser.enricher.CompositeContentEnricher(
+                        java.util.List.of(enricher)));
+
+        Metadata metadata = new Metadata();
+        metadata.set(HttpHeaders.CONTENT_TYPE, "image/png");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testPNG.png")) {
+            retypingParser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
+        }
+        assertEquals("image/png", metadata.get("enriched-for"));
+        assertEquals("application/illustrator", metadata.get(HttpHeaders.CONTENT_TYPE));
     }
 
     @Test
     public void testNPEOnEmptyContentType() throws Exception {
         //test no NPE TIKA-3569
         Metadata metadata = new Metadata();
-        try (InputStream stream = getResourceAsStream("/test-documents/testBMP.bmp")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testBMP.bmp")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
 
         metadata = new Metadata();
-        metadata.set(Metadata.CONTENT_TYPE, "unparseablegarbage");
-        try (InputStream stream = getResourceAsStream("/test-documents/testBMP.bmp")) {
-            parser.parse(stream, new DefaultHandler(), metadata, new ParseContext());
+        metadata.set(HttpHeaders.CONTENT_TYPE, "unparseablegarbage");
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/testBMP.bmp")) {
+            parser.parse(tis, new DefaultHandler(), metadata, new ParseContext());
         }
     }
 }

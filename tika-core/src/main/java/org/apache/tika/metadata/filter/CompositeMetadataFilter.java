@@ -16,11 +16,13 @@
  */
 package org.apache.tika.metadata.filter;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
 
 public class CompositeMetadataFilter extends MetadataFilter {
 
@@ -44,14 +46,21 @@ public class CompositeMetadataFilter extends MetadataFilter {
     }
 
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void doFilter(List<Metadata> metadataList, ParseContext parseContext) throws TikaException {
         for (MetadataFilter filter : filters) {
-            filter.filter(metadata);
+            filter.filter(metadataList, parseContext);
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        for (MetadataFilter filter : filters) {
+            filter.close();
         }
     }
 
     @Override
     public String toString() {
-        return "CompositeMetadataFilter{" + "filters=" + filters + '}';
+        return "CompositeMetadataListFilter{" + "filters=" + filters + '}';
     }
 }

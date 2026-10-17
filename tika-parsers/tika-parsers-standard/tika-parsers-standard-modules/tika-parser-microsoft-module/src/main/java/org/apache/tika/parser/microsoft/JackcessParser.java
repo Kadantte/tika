@@ -14,12 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft;
 
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Locale;
 import java.util.Set;
@@ -31,10 +29,11 @@ import com.healthmarketscience.jackcess.util.LinkResolver;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.exception.UnsupportedFormatException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -51,10 +50,13 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * Many, many thanks to LexisNexis®/Health Market Science (HMS), Brian O'Neill,
  * and James Ahlborn for relicensing Jackcess to Apache v2.0!
  */
+@TikaComponent
 public class JackcessParser implements Parser {
 
     public static final String SUMMARY_PROPERTY_PREFIX =
-            "MDB_SUMMARY_PROP" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+            "mdb-summary-prop" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+    public static final KeyPrefix MDB_SUMMARY_PROPERTY =
+            KeyPrefix.file(SUMMARY_PROPERTY_PREFIX, "MS Access summary properties");
     private final static LinkResolver IGNORE_LINK_RESOLVER = new IgnoreLinkResolver();
     private static final long serialVersionUID = -752276948656079347L;
     private static final MediaType MEDIA_TYPE = MediaType.application("x-msaccess");
@@ -63,10 +65,14 @@ public class JackcessParser implements Parser {
     //TODO: figure out how to get this info
     // public static Property LINKED_DATABASES = Property.externalTextBag("LinkedDatabases");
     public static String MDB_PROPERTY_PREFIX =
-            "MDB_PROP" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+            "mdb-prop" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+    public static final KeyPrefix MDB_PROPERTY =
+            KeyPrefix.file(MDB_PROPERTY_PREFIX, "MS Access database properties");
     public static String USER_DEFINED_PROPERTY_PREFIX =
-            "MDB_USER_PROP" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
-    public static Property MDB_PW = Property.externalText("Password");
+            "mdb-user-prop" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+    public static final KeyPrefix MDB_USER_PROPERTY =
+            KeyPrefix.file(USER_DEFINED_PROPERTY_PREFIX, "MS Access user-defined properties");
+    public static Property MDB_PW = Property.externalText("mdb:password");
     private Locale locale = Locale.ROOT;
 
     @Override
@@ -75,11 +81,10 @@ public class JackcessParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        TikaInputStream tis = TikaInputStream.get(stream);
         Database db = null;
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         String password = null;
@@ -102,15 +107,21 @@ public class JackcessParser implements Parser {
             JackcessExtractor ex = new JackcessExtractor(metadata, context, locale);
             ex.parse(db, xhtml);
         } catch (IOException e) {
-            //TIKA-3849
-            if (e.getMessage() != null && e.getMessage().contains("Unrecognized map type: 75")) {
-                throw new UnsupportedFormatException(
-                        "Jackcess doesn't process mdb versions before v97");
+            String message = e.getMessage();
+            if (message != null && (message.startsWith("invalid page number ") ||
+                    message.startsWith("Invalid usage map row "))) {
+                throw new TikaException("Corrupt Access database: " + message, e);
             }
             throw e;
+        } catch (IndexOutOfBoundsException e) {
+            // TIKA-4830. A TikaException, not CorruptedFileException: the latter aborts the
+            // whole container when the database is an embedded file.
+            throw new TikaException("Corrupt Access database: " + e.getMessage(), e);
         } catch (IllegalStateException e) {
-            if (e.getMessage() != null && e.getMessage().contains("Incorrect password")) {
-                throw new EncryptedDocumentException(e);
+            if (e.getMessage() != null) {
+                if (e.getMessage().contains("Incorrect password")) {
+                    throw new EncryptedDocumentException(e);
+                }
             }
             throw e;
         } finally {

@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,20 +18,19 @@ package org.apache.tika.parser.http;
 
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.Collections;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.netpreserve.jwarc.LengthedBody;
 import org.netpreserve.jwarc.MessageBody;
 import org.netpreserve.jwarc.MessageHeaders;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
@@ -42,6 +41,7 @@ import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class HttpParser implements Parser {
 
     private static final MediaType MEDIA_TYPE = MediaType.application("x-httpresponse");
@@ -52,17 +52,17 @@ public class HttpParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         org.netpreserve.jwarc.HttpParser parser = new org.netpreserve.jwarc.HttpParser();
         parser.lenientRequest();
         parser.lenientResponse();
         ByteBuffer buffer = ByteBuffer.allocate(1024);
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
-        try (ReadableByteChannel channel =
-                     Channels.newChannel(CloseShieldInputStream.wrap(stream))) {
+        tis.setCloseShield();
+        try (ReadableByteChannel channel = Channels.newChannel(tis)) {
 
             int len = channel.read(buffer);
             buffer.flip();
@@ -79,12 +79,13 @@ public class HttpParser implements Parser {
             //is there a way to handle non-lengthed bodies?
             if (contentLength > 0) {
                 MessageBody messageBody = LengthedBody.create(channel, buffer, contentLength);
-                Metadata payloadMetadata = new Metadata();
-                try (TikaInputStream tis = TikaInputStream.get(messageBody.stream())) {
-                    parsePayload(tis, xhtml, payloadMetadata, context);
+                Metadata payloadMetadata = Metadata.newInstance(context);
+                try (TikaInputStream inner = TikaInputStream.get(messageBody.stream())) {
+                    parsePayload(inner, xhtml, payloadMetadata, context);
                 }
             }
         } finally {
+            tis.removeCloseShield();
             xhtml.endDocument();
         }
     }
@@ -92,8 +93,8 @@ public class HttpParser implements Parser {
     private void parsePayload(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                               ParseContext context) throws IOException, SAXException {
         EmbeddedDocumentExtractor ex = EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-        if (ex.shouldParseEmbedded(metadata)) {
-            ex.parseEmbedded(tis, handler, metadata, true);
+        if (ex.shouldParseEmbedded(metadata, context)) {
+            ex.parseEmbedded(tis, handler, metadata, context, true);
         }
     }
 

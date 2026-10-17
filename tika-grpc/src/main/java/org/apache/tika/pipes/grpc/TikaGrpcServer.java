@@ -19,8 +19,11 @@ package org.apache.tika.pipes.grpc;
 import static io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 
 import java.io.File;
-import java.io.FileWriter;
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.concurrent.TimeUnit;
 
 import com.beust.jcommander.JCommander;
@@ -35,9 +38,6 @@ import io.grpc.protobuf.services.ProtoReflectionServiceV1;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.TikaConfig;
-import org.apache.tika.config.TikaConfigSerializer;
-
 /**
  * Server that manages startup/shutdown of the GRPC Tika server.
  */
@@ -45,11 +45,18 @@ public class TikaGrpcServer {
     private static final Logger LOGGER = LoggerFactory.getLogger(TikaGrpcServer.class);
     public static final int TIKA_SERVER_GRPC_DEFAULT_PORT = 50052;
     private Server server;
+    private TikaGrpcServerImpl serviceImpl;
     @Parameter(names = {"-p", "--port"}, description = "The grpc server port", help = true)
     private Integer port = TIKA_SERVER_GRPC_DEFAULT_PORT;
 
-    @Parameter(names = {"-c", "--config"}, description = "The grpc server port", help = true)
-    private File tikaConfigXml;
+    @Parameter(names = {"-c", "--config"}, description = "The tika config file", help = true)
+    private File tikaConfig;
+
+    @Parameter(names = {"-l", "--plugins"}, description = "The tika pipes plugins config file", help = true)
+    private File tikaPlugins;
+
+    @Parameter(names = {"--plugin-roots"}, description = "Comma-separated list of plugin root directories (overrides config file)", help = true)
+    private String pluginRoots;
 
     @Parameter(names = {"-s", "--secure"}, description = "Enable credentials required to access this grpc server")
     private boolean secure;
@@ -63,10 +70,10 @@ public class TikaGrpcServer {
     @Parameter(names = {"--private-key-password"}, description = "Private key password, if needed")
     private String privateKeyPassword;
 
-    @Parameter(names = {"--trust-cert-collection"}, description = "The trust certificate collection (root certs). Example: ca.pem See: https://github.com/grpc/grpc-java/tree/b3ffb5078df361d7460786e134db7b5c00939246/examples/example-tls")
+    @Parameter(names = {"--trust-cert-collection"}, description = "The trust certificate collection (root certs). Required, and must be a readable file, when --client-auth-required is set. Example: ca.pem See: https://github.com/grpc/grpc-java/tree/b3ffb5078df361d7460786e134db7b5c00939246/examples/example-tls")
     private File trustCertCollection;
 
-    @Parameter(names = {"--client-auth-required"}, description = "Is Mutual TLS required?")
+    @Parameter(names = {"--client-auth-required"}, description = "Is Mutual TLS required? Implies --secure.")
     private boolean clientAuthRequired;
 
     @Parameter(names = {"-h", "-H", "--help"}, description = "Display help menu")
@@ -75,35 +82,43 @@ public class TikaGrpcServer {
     public void start() throws Exception {
         HealthStatusManager healthStatusManager = new HealthStatusManager();
         ServerCredentials creds;
+        if (clientAuthRequired && !secure) {
+            LOGGER.info("--client-auth-required implies --secure; enabling TLS.");
+            secure = true;
+        }
         if (secure) {
             TlsServerCredentials.Builder channelCredBuilder = TlsServerCredentials.newBuilder();
             channelCredBuilder.keyManager(certChain, privateKey, privateKeyPassword);
-            if (trustCertCollection != null && trustCertCollection.exists()) {
-                channelCredBuilder.trustManager(trustCertCollection);
-                if (clientAuthRequired) {
-                    channelCredBuilder.clientAuth(TlsServerCredentials.ClientAuth.REQUIRE);
+            if (clientAuthRequired) {
+                if (trustCertCollection == null || !trustCertCollection.isFile() || !trustCertCollection.canRead()) {
+                    throw new IllegalArgumentException("--client-auth-required is set but --trust-cert-collection is " +
+                            "missing, not a file, or unreadable; refusing to start");
                 }
+                channelCredBuilder.trustManager(trustCertCollection);
+                channelCredBuilder.clientAuth(TlsServerCredentials.ClientAuth.REQUIRE);
+            } else if (trustCertCollection != null && trustCertCollection.exists()) {
+                channelCredBuilder.trustManager(trustCertCollection);
             }
             creds = channelCredBuilder.build();
         } else {
             creds = InsecureServerCredentials.create();
         }
-        if (tikaConfigXml == null) {
-            // Create a default tika config
-            tikaConfigXml = File.createTempFile("tika-config", ".xml");
-            try (FileWriter fw = new FileWriter(tikaConfigXml, StandardCharsets.UTF_8)) {
-                TikaConfigSerializer.serialize(new TikaConfig(), TikaConfigSerializer.Mode.STATIC_FULL, fw, StandardCharsets.UTF_8);
-            }
+        if (tikaConfig == null) {
+            tikaConfig = extractDefaultConfig();
+            LOGGER.info("No config file specified, using bundled default-tika-config.json");
         }
-        File tikaConfigFile = new File(tikaConfigXml.getAbsolutePath());
+        File tikaConfigFile = new File(tikaConfig.getAbsolutePath());
         healthStatusManager.setStatus(TikaGrpcServer.class.getSimpleName(), ServingStatus.SERVING);
+        serviceImpl = new TikaGrpcServerImpl(tikaConfigFile.getAbsolutePath(), pluginRoots);
         server = Grpc
                 .newServerBuilderForPort(port, creds)
-                .addService(new TikaGrpcServerImpl(tikaConfigFile.getAbsolutePath()))
+                .addService(serviceImpl)
                 .addService(healthStatusManager.getHealthService())
                 .addService(ProtoReflectionServiceV1.newInstance())
                 .build()
                 .start();
+        // port 0 asks the OS to pick one; adopt what it actually bound
+        port = server.getPort();
         LOGGER.info("Server started, listening on " + port);
         Runtime
                 .getRuntime()
@@ -121,10 +136,16 @@ public class TikaGrpcServer {
     }
 
     public void stop() throws InterruptedException {
+        if (serviceImpl != null) {
+            serviceImpl.shutdown();
+        }
         if (server != null) {
             server
                     .shutdown()
                     .awaitTermination(30, TimeUnit.SECONDS);
+        }
+        if (serviceImpl != null) {
+            serviceImpl.postShutdown();
         }
     }
 
@@ -158,8 +179,24 @@ public class TikaGrpcServer {
         server.blockUntilShutdown();
     }
 
-    public TikaGrpcServer setTikaConfigXml(File tikaConfigXml) {
-        this.tikaConfigXml = tikaConfigXml;
+    private static File extractDefaultConfig() {
+        try (InputStream is = TikaGrpcServer.class.getResourceAsStream("/default-tika-config.json")) {
+            if (is == null) {
+                throw new IllegalArgumentException(
+                        "Tika config file is required. Use -c to specify a config file.");
+            }
+            Path tempConfig = Files.createTempFile("tika-config-", ".json");
+            tempConfig.toFile().deleteOnExit();
+            Files.copy(is, tempConfig, StandardCopyOption.REPLACE_EXISTING);
+            return tempConfig.toFile();
+        } catch (IOException e) {
+            throw new IllegalArgumentException(
+                    "Tika config file is required. Use -c to specify a config file.", e);
+        }
+    }
+
+    public TikaGrpcServer setTikaConfig(File tikaConfig) {
+        this.tikaConfig = tikaConfig;
         return this;
     }
 
@@ -171,6 +208,11 @@ public class TikaGrpcServer {
     public TikaGrpcServer setPort(Integer port) {
         this.port = port;
         return this;
+    }
+
+    /** The bound port once {@link #start()} has run; the requested port before that. */
+    public Integer getPort() {
+        return port;
     }
 
     public TikaGrpcServer setSecure(boolean secure) {

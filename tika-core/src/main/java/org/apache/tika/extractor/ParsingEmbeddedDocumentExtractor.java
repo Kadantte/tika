@@ -26,10 +26,13 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
+import org.apache.tika.config.ParseTimeout;
 import org.apache.tika.exception.CorruptedFileException;
+import org.apache.tika.exception.EmbeddedLimitReachedException;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.DelegatingParser;
@@ -38,34 +41,43 @@ import org.apache.tika.parser.ParseRecord;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.EmbeddedContentHandler;
+import org.apache.tika.sax.SAXOutputConfig;
+import org.apache.tika.sax.XHTMLBalancingHandler;
+import org.apache.tika.utils.StringUtils;
 
 /**
  * Helper class for parsers of package archives or other compound document
  * formats that support embedded or attached component documents.
+ * <p>
+ * Stateless: every method takes the {@link ParseContext} of the enclosing parse
+ * as a parameter rather than capturing one at construction, so a single shared
+ * instance ({@link #INSTANCE}) is safe to reuse across parses and threads.
  *
  * @since Apache Tika 0.8
  */
 public class ParsingEmbeddedDocumentExtractor implements EmbeddedDocumentExtractor {
 
+    public static final ParsingEmbeddedDocumentExtractor INSTANCE = new ParsingEmbeddedDocumentExtractor();
+
     private static final File ABSTRACT_PATH = new File("");
 
     private static final Parser DELEGATING_PARSER = new DelegatingParser();
 
-    private boolean writeFileNameToContent = true;
-
-    protected final ParseContext context;
-
-    public ParsingEmbeddedDocumentExtractor(ParseContext context) {
-        this.context = context;
-    }
-
     @Override
-    public boolean shouldParseEmbedded(Metadata metadata) {
+    public boolean shouldParseEmbedded(Metadata metadata, ParseContext context) {
+        // Check ParseRecord for depth/count limits first
+        ParseRecord parseRecord = context.get(ParseRecord.class);
+        if (parseRecord != null && !checkEmbeddedLimits(parseRecord, context)) {
+            return false;
+        }
+
+        // Then check DocumentSelector for content-based filtering
         DocumentSelector selector = context.get(DocumentSelector.class);
         if (selector != null) {
             return selector.select(metadata);
         }
 
+        // Then check FilenameFilter
         FilenameFilter filter = context.get(FilenameFilter.class);
         if (filter != null) {
             String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
@@ -77,10 +89,108 @@ public class ParsingEmbeddedDocumentExtractor implements EmbeddedDocumentExtract
         return true;
     }
 
+    /**
+     * Checks embedded document limits from ParseRecord: the task deadline, then max
+     * count, then max depth.
+     * <p>
+     * If throwing is configured for the limit hit, the corresponding
+     * EmbeddedLimitReachedException is thrown. Otherwise, returns false and sets the
+     * appropriate limit flag on the ParseRecord.
+     * <p>
+     * Note: The deadline and count limits are hard stops (once hit, no more embedded
+     * docs are parsed). The depth limit only affects documents at that depth - sibling
+     * documents at shallower depths will still be parsed.
+     * <p>
+     * Subclasses that override parseEmbedded() should call this method to enforce limits.
+     *
+     * @param parseRecord the parse record to check
+     * @param context     the parse context of the enclosing parse
+     * @return true if the embedded document should be parsed, false if limits are exceeded
+     * @throws EmbeddedLimitReachedException if a limit is exceeded and throwing is configured
+     */
+    protected boolean checkEmbeddedLimits(ParseRecord parseRecord, ParseContext context) {
+        // Deadline is checked first: once the task is out of time, count/depth don't matter.
+        // Unlike a single embedded doc timing out (TikaTimeoutException, recorded, siblings
+        // continued -- see parseEmbedded's catch(TikaException) below), this is a
+        // document-level fact, not an exception path by default.
+        ParseTimeout timeout = context.get(ParseTimeout.class);
+        if (parseRecord.isTaskDeadlineReached()) {
+            // Already recorded by an earlier embedded doc in this task. throwOnDeadline
+            // means every embedded doc from here on must throw, not just the first one to notice.
+            if (parseRecord.isThrowOnDeadline()) {
+                throw new EmbeddedLimitReachedException(EmbeddedLimitReachedException.LimitType.DEADLINE,
+                        timeout == null ? 0 : timeout.getTotalTimeoutMillis());
+            }
+            return false;
+        }
+        if (timeout != null && timeout.remainingMillis() <= 0) {
+            parseRecord.setTaskDeadlineReached(true);
+            if (parseRecord.isThrowOnDeadline()) {
+                throw new EmbeddedLimitReachedException(
+                        EmbeddedLimitReachedException.LimitType.DEADLINE, timeout.getTotalTimeoutMillis());
+            }
+            return false;
+        }
+
+        // Count limit is a hard stop - once we've hit max, no more embedded parsing.
+        // Same reasoning as the deadline branch above: throwOnMaxCount must throw for
+        // every sibling once the limit is hit, not just the one that first noticed.
+        if (parseRecord.isEmbeddedCountLimitReached()) {
+            if (parseRecord.isThrowOnMaxCount()) {
+                throw new EmbeddedLimitReachedException(
+                        EmbeddedLimitReachedException.LimitType.MAX_COUNT, parseRecord.getMaxEmbeddedCount());
+            }
+            return false;
+        }
+        int maxCount = parseRecord.getMaxEmbeddedCount();
+        if (maxCount >= 0 && parseRecord.getEmbeddedCount() >= maxCount) {
+            parseRecord.setEmbeddedCountLimitReached(true);
+            if (parseRecord.isThrowOnMaxCount()) {
+                throw new EmbeddedLimitReachedException(
+                        EmbeddedLimitReachedException.LimitType.MAX_COUNT, maxCount);
+            }
+            return false;
+        }
+
+        // Depth limit only applies to current depth - siblings at shallower levels
+        // can still be parsed. The flag is set for reporting purposes.
+        // The child would be one level below the current document, so with
+        // maxDepth N the children of documents at depth N are not parsed.
+        int maxDepth = parseRecord.getMaxEmbeddedDepth();
+        if (maxDepth >= 0 && parseRecord.getEmbeddedDepth() + 1 > maxDepth) {
+            parseRecord.setEmbeddedDepthLimitReached(true);
+            if (parseRecord.isThrowOnMaxDepth()) {
+                throw new EmbeddedLimitReachedException(
+                        EmbeddedLimitReachedException.LimitType.MAX_DEPTH, maxDepth);
+            }
+            return false;
+        }
+        return true;
+    }
+
     @Override
     public void parseEmbedded(
-            TikaInputStream tis, ContentHandler handler, Metadata metadata, boolean outputHtml)
+            TikaInputStream tis, ContentHandler handler, Metadata metadata, ParseContext context, boolean outputHtml)
             throws SAXException, IOException {
+        // Check and enforce embedded limits even if caller didn't call shouldParseEmbedded()
+        // This guarantees limits are enforced for all callers
+        ParseRecord parseRecord = context.get(ParseRecord.class);
+        if (parseRecord != null && !checkEmbeddedLimits(parseRecord, context)) {
+            return;
+        }
+
+        // Increment embedded count for tracking
+        if (parseRecord != null) {
+            parseRecord.incrementEmbeddedCount();
+        }
+
+        // A parser builds the metadata beside the stream, so a length the stream
+        // knows is often missing from it. hasLength() answers from the source,
+        // without spooling a stream to measure it (TIKA-4873).
+        if (StringUtils.isBlank(metadata.get(HttpHeaders.CONTENT_LENGTH)) && tis.hasLength()) {
+            metadata.set(HttpHeaders.CONTENT_LENGTH, Long.toString(tis.getLength()));
+        }
+
         if (outputHtml) {
             AttributesImpl attributes = new AttributesImpl();
             attributes.addAttribute("", "class", "class", "CDATA", "package-entry");
@@ -88,18 +198,32 @@ public class ParsingEmbeddedDocumentExtractor implements EmbeddedDocumentExtract
         }
 
         String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
-        if (writeFileNameToContent && name != null && name.length() > 0 && outputHtml) {
+        if (isWriteFileNameToContent(context) && name != null && name.length() > 0 && outputHtml) {
             handler.startElement(XHTML, "h1", "h1", new AttributesImpl());
             char[] chars = name.toCharArray();
             handler.characters(chars, 0, chars.length);
             handler.endElement(XHTML, "h1", "h1");
         }
 
+        // Wrap the delegate's handler so we can close anything it left open if
+        // it throws mid-element. Without this, the </div> emitted in finally
+        // could land on top of an open <p>/<table>/etc. from the failed
+        // sub-parse and produce malformed XHTML.
+        XHTMLBalancingHandler balancer =
+                outputHtml ? new XHTMLBalancingHandler(handler) : null;
+        ContentHandler delegateHandler = outputHtml ? balancer : handler;
+
         // Use the delegate parser to parse this entry
+        boolean parsedCleanly = false;
+        if (parseRecord != null) {
+            parseRecord.enterEmbedded();
+        }
         try {
             tis.setCloseShield();
-            DELEGATING_PARSER.parse(tis, new EmbeddedContentHandler(new BodyContentHandler(handler)),
+            DELEGATING_PARSER.parse(tis,
+                    new EmbeddedContentHandler(new BodyContentHandler(delegateHandler)),
                     metadata, context);
+            parsedCleanly = true;
         } catch (EncryptedDocumentException ede) {
             recordException(ede, context);
         } catch (CorruptedFileException e) {
@@ -109,15 +233,25 @@ public class ParsingEmbeddedDocumentExtractor implements EmbeddedDocumentExtract
         } catch (TikaException e) {
             recordException(e, context);
         } finally {
+            if (parseRecord != null) {
+                parseRecord.exitEmbedded();
+            }
             tis.removeCloseShield();
-        }
-
-        if (outputHtml) {
-            handler.endElement(XHTML, "div", "div");
+            if (outputHtml) {
+                // Only an aborted parse can leave elements open; on a clean parse
+                // the balancer stack is empty. Draining only on abort keeps the
+                // package-entry div well-formed when the inner parse throws, while
+                // letting StrictXHTMLValidator still catch genuine imbalances on the
+                // happy path (TIKA-4728).
+                if (!parsedCleanly) {
+                    balancer.drainOpenElements();
+                }
+                handler.endElement(XHTML, "div", "div");
+            }
         }
     }
 
-    void recordException(Exception e, ParseContext context) {
+    protected void recordException(Exception e, ParseContext context) {
         ParseRecord record = context.get(ParseRecord.class);
         if (record == null) {
             return;
@@ -129,11 +263,15 @@ public class ParsingEmbeddedDocumentExtractor implements EmbeddedDocumentExtract
         return DELEGATING_PARSER;
     }
 
-    public void setWriteFileNameToContent(boolean writeFileNameToContent) {
-        this.writeFileNameToContent = writeFileNameToContent;
-    }
-
-    public boolean isWriteFileNameToContent() {
-        return writeFileNameToContent;
+    /**
+     * Returns whether to write file names to content based on {@link SAXOutputConfig}
+     * in the ParseContext. Defaults to {@code true} if no config is present.
+     *
+     * @param context the parse context of the enclosing parse
+     * @return true if file names should be written to content
+     */
+    public boolean isWriteFileNameToContent(ParseContext context) {
+        SAXOutputConfig config = context.get(SAXOutputConfig.class);
+        return config == null || config.isWriteFileNameToContent();
     }
 }

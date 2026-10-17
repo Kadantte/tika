@@ -1,0 +1,442 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Setting Limits
+
+Untrusted documents can be pathological: deeply nested, self-expanding, or
+crafted to run forever. Every limit below is configured in the `parse-context`
+section of the JSON config, loaded into the `ParseContext`, and enforced
+throughout the parse.
+
+== Limits at a glance
+
+[cols="2,2,4"]
+|===
+|`parse-context` key |Class |Bounds
+
+|`embedded-limits`
+|`EmbeddedLimits`
+|Depth and count of embedded documents. Depth 20, count unlimited by default.
+
+|`output-limits`
+|`OutputLimits`
+|Extracted characters, XML nesting, package nesting, zip-bomb ratio.
+
+|`timeout-limits`
+|`TimeoutLimits`
+|Total wall-clock budget per task and the stall detector.
+
+|`unpack-config`
+|`UnpackConfig`
+|Total bytes written by `ParseMode.UNPACK`. Pipes only.
+
+|`standard-metadata-limiter-factory`
+|`StandardMetadataLimiterFactory`
+|Metadata size, per-field size, key size, values per field, field allow/deny lists.
+
+|`exception-reporting`
+|`ExceptionReporting`
+|How much of an exception (stack trace, message, class name) is reported, and its length.
+|===
+
+== Configuring limits
+
+Every limit group is a `parse-context` block. `AllLimitsTest`
+(`tika-serialization/src/test/resources/configs/all-limits-test.json`) exercises all of
+these but `exception-reporting`, which has its own test:
+
+[source,json]
+----
+{
+  "parsers": ["default-parser"],
+  "parse-context": {
+    "embedded-limits": {
+      "maxDepth": 10,
+      "throwOnMaxDepth": false,
+      "maxCount": 1000,
+      "throwOnMaxCount": false
+    },
+    "output-limits": {
+      "writeLimit": 100000,
+      "throwOnWriteLimit": false,
+      "maxXmlDepth": 100,
+      "zipBombThreshold": 1000000,
+      "zipBombRatio": 100
+    },
+    "timeout-limits": {
+      "totalTaskTimeoutMillis": 3600000,
+      "progressTimeoutMillis": 60000
+    },
+    "standard-metadata-limiter-factory": {
+      "maxTotalBytes": 1048576,
+      "maxFieldSize": 102400,
+      "maxKeySize": 1024,
+      "maxValuesPerField": 100
+    },
+    "exception-reporting": {
+      "level": "MESSAGE_REDACTED",
+      "maxLength": 10000
+    }
+  }
+}
+----
+
+`TikaLoader.loadParseContext()` loads them all; each class has a static
+`get(ParseContext)` that returns the configured instance or defaults:
+
+[source,java]
+----
+ParseContext context = TikaLoader.load(configPath).loadParseContext();
+
+EmbeddedLimits embedded = EmbeddedLimits.get(context);
+OutputLimits output = OutputLimits.get(context);
+TimeoutLimits timeouts = TimeoutLimits.get(context);
+----
+
+To set them programmatically, construct and put them on the context — the same
+pattern for every limit class:
+
+[source,java]
+----
+context.set(EmbeddedLimits.class, new EmbeddedLimits(10, true, 500, false));
+context.set(OutputLimits.class, new OutputLimits(50000, true, 50, 5, 500000, 50));
+context.set(TimeoutLimits.class, new TimeoutLimits(7200000, 120000));
+----
+
+Tests: `AllLimitsTest`, `EmbeddedLimitsTest`, `OutputLimitsTest`, `TimeoutLimitsTest` and
+`ExceptionReportingConfigLoadTest` under `tika-serialization/src/test/java/org/apache/tika/config/`;
+`ExceptionReportingParseTest` (tika-core) drives the policy through a real parse.
+
+== Embedded document limits
+
+`EmbeddedLimits` bounds how deep and how many embedded documents are parsed.
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`maxDepth`
+|20
+|Maximum nesting depth. Recursion stops at the limit; siblings at the current
+level still parse.
+
+|`throwOnMaxDepth`
+|false
+|Throw `EmbeddedLimitReachedException` at `maxDepth` instead of continuing and
+setting `tk:exception:embedded-depth-limit-reached=true`.
+
+|`maxCount`
+|-1 (unlimited)
+|Maximum total embedded documents. Processing stops immediately when reached.
+
+|`throwOnMaxCount`
+|false
+|Throw `EmbeddedLimitReachedException` at `maxCount` instead of continuing and
+setting `tk:exception:embedded-resource-limit-reached=true`.
+|===
+
+With `maxDepth=1`, depth-1 siblings all parse and their children do not:
+
+[source]
+----
+container.zip (depth 0)
+├── doc1.docx (depth 1)      PARSED
+│   ├── image1.png (depth 2) NOT PARSED
+│   └── embed.xlsx (depth 2) NOT PARSED
+├── doc2.pdf  (depth 1)      PARSED
+└── doc3.txt  (depth 1)      PARSED
+----
+
+== Output limits
+
+`OutputLimits` bounds extracted text and structural expansion.
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`writeLimit`
+|-1 (unlimited)
+|Maximum characters of text to extract. Extraction stops when reached.
+
+|`throwOnWriteLimit`
+|false
+|Throw `WriteLimitReachedException` at `writeLimit` instead of stopping and setting
+`tk:exception:write-limit-reached=true`.
+
+|`maxXmlDepth`
+|100
+|Maximum XML element nesting depth. Guards against XML bombs.
+
+|`maxPackageEntryDepth`
+|20
+|Deprecated in 4.2, removed in 4.3; use `embedded-limits` `maxDepth`, which
+bounds nesting on every path. Counts nested package entries only when embedded
+content is inlined into its container's XHTML.
+
+|`zipBombThreshold`
+|1,000,000
+|Extracted characters before the zip-bomb ratio check activates.
+
+|`zipBombRatio`
+|100
+|Maximum ratio of extracted characters to input bytes read before flagging a zip bomb.
+|===
+
+== Timeout limits
+
+`TimeoutLimits` applies two independent bounds: one on total wall-clock time,
+one on time since the parser last reported progress.
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`totalTaskTimeoutMillis`
+|3,600,000 (1 hour)
+|Wall-clock budget for the whole task, embedded documents included. Every
+per-parser timeout is clipped to what remains of this budget, however it is
+itself configured.
+
+|`progressTimeoutMillis`
+|120,000 (2 minutes)
+|How long the task may go silent before it counts as hung. Enforced — the task
+actually killed — only when the parse runs in a forked JVM (Pipes, or tika-app
+`--fork`); in-process library use has nothing to kill the parsing thread.
+
+|`throwOnDeadline`
+|false
+|Throw `EmbeddedLimitReachedException` on `totalTaskTimeoutMillis` exhaustion
+instead of skipping the remaining embedded documents and reporting
+`PARTIAL_TIMEOUT`. See
+xref:pipes/timeouts.adoc#_throwondeadline_failing_hard_instead_of_partial[throwOnDeadline]
+for the pipes-mode caveat before enabling it.
+|===
+
+[IMPORTANT]
+====
+`progressTimeoutMillis` is a *stall detector*, not a ceiling on any single
+operation. A per-parser timeout (e.g. `tesseract-ocr-parser.timeoutMillis`) is
+honored up to `min(configured, time remaining in totalTaskTimeoutMillis)`;
+`progressTimeoutMillis` never enters that calculation.
+
+Waits on a bounded external call checkpoint progress periodically, so a
+legitimate 10-minute `readpst` invocation does not need `progressTimeoutMillis`
+raised to 10 minutes. The stall detector fires only on genuine silence: an
+in-JVM hang, or a process so wedged that checkpointing cannot report past it.
+
+Budgets compose recursively — a PDF inside a zip inside an email draws from the
+one `totalTaskTimeoutMillis` budget for the top-level task. For worked
+scenarios and how each outcome is reported, see xref:pipes/timeouts.adoc[Timeouts].
+====
+
+== Embedded byte extraction limits
+
+`ParseMode.UNPACK` writes embedded bytes out; `UnpackConfig.maxUnpackBytes`
+caps the total.
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`maxUnpackBytes`
+|10 GiB
+|Maximum total bytes extracted from all embedded documents per file. `-1` is
+unlimited (not advisable for untrusted input); `0` means zero bytes, not unlimited.
+|===
+
+At the limit, extraction stops for the remaining embedded documents and
+already-extracted bytes are kept. The parse still reports success: the truncation
+shows up only as a WARN in the fork's log, not in the metadata or the result status.
+
+[source,json]
+----
+{
+  "pipes": { "parseMode": "UNPACK" },
+  "parse-context": {
+    "unpack-config": { "maxUnpackBytes": 104857600 }
+  }
+}
+----
+
+See xref:pipes/unpack-config.adoc[Extracting Embedded Bytes] for the rest of
+`UnpackConfig`, and `UnpackModeTest` in
+`tika-pipes/tika-pipes-integration-tests`.
+
+== Metadata limits
+
+Configuring a `MetadataWriteLimiterFactory` in the `ParseContext` makes
+`Metadata.newInstance(parseContext)` return a `Metadata` with limits already
+applied, so every subsequent write is filtered.
+
+[source,java]
+----
+StandardMetadataLimiterFactory factory = new StandardMetadataLimiterFactory();
+factory.setMaxTotalBytes(1024 * 1024);
+factory.setMaxFieldSize(100 * 1024);
+factory.setMaxValuesPerField(100);
+
+ParseContext context = new ParseContext();
+context.set(MetadataWriteLimiterFactory.class, factory);
+Metadata metadata = Metadata.newInstance(context);
+----
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`maxTotalBytes`
+|10 MB
+|Total estimated size of all metadata in UTF-16 bytes. Further metadata is
+dropped and `tk:warn:truncated-metadata` is set.
+
+|`maxFieldSize`
+|100 KB
+|Maximum size of a single field's value(s) in UTF-16 bytes. Longer values are
+truncated.
+
+|`maxKeySize`
+|1024
+|Maximum metadata key length in UTF-16 bytes. Longer keys are truncated.
+
+|`maxValuesPerField`
+|10
+|Maximum values on a multi-valued field. Extra values are dropped.
+
+|`includeFields`
+|empty (all)
+|If non-empty, only these fields are stored, plus the always-included fields below.
+
+|`excludeFields`
+|empty (none)
+|Never stored, unless always-included.
+
+|`includeEmpty`
+|false
+|Whether to store empty or null values.
+|===
+
+=== Always-included fields
+
+`StandardMetadataLimiter.ALWAYS_SET_FIELDS` and `ALWAYS_ADD_FIELDS` bypass
+`includeFields`/`excludeFields` and the total-size budget, because parser
+dispatch and error reporting depend on them. Everything except `tk:content` is
+still truncated at `max(maxFieldSize, 300)`.
+
+Always set: `Content-Type`, `Content-Length`, `Content-Encoding`,
+`Content-Disposition`, `tk:content-type-override`,
+`tk:content-type-parser-override`, `tk:content-type-hint`, `tk:content`,
+`tk:resource-name`, `tk:exception:container-exception`,
+`access-permission:extract-content`,
+`access-permission:extract-for-accessibility`.
+
+Always added (multi-valued): `tk:parsed-by`, `tk:exception:embedded-exception`.
+
+=== Detecting truncation
+
+Any drop or truncation sets `tk:warn:truncated-metadata`:
+
+[source,java]
+----
+if ("true".equals(metadata.get(TikaCoreProperties.TRUNCATED_METADATA))) {
+    log.warn("Metadata was truncated for: " + resourceName);
+}
+----
+
+== Exception reporting
+
+`ExceptionReporting` controls how much detail Tika reports when a parse fails:
+the `tk:exception:container-exception`, `tk:exception:embedded-exception`,
+`tk:exception:warn` and `tk:exception:embedded-stream-exception` metadata
+values. Stack traces and messages can carry file paths, hostnames and fragments
+of the document, and the metadata limiter is no backstop: with no
+`MetadataWriteLimiterFactory` configured these values are unbounded, and with
+one, only `container-exception` and `embedded-exception` are always-included
+(cut at `max(maxFieldSize, 300)` UTF-16 bytes); `warn` and
+`embedded-stream-exception` are ordinary fields, subject to
+`includeFields`/`excludeFields` and dropped past `maxValuesPerField` (see
+<<Always-included fields>>). The limiter's cut appends no marker, so keep
+`maxLength` (characters) under half `maxFieldSize` (UTF-16 bytes) if you want
+the `...[truncated]` marker to survive.
+
+[cols="2,1,3"]
+|===
+|Setting |Default |Description
+
+|`level`
+|`FULL`
+|`FULL`: the complete stack trace. `MESSAGE_REDACTED`: the complete stack
+trace with every exception message removed (class names, frames and the cause
+chain are kept). `REDACTED`: exception class names only, no frames.
+
+|`maxLength`
+|-1 (unlimited)
+|Length at which the formatted exception is cut; a truncated value is
+`maxLength` characters plus the `...[truncated]` marker.
+|===
+
+[source,json]
+----
+"exception-reporting": {
+  "level": "MESSAGE_REDACTED",
+  "maxLength": 10000
+}
+----
+
+The same policy applies to the container and to every embedded document, to
+parser-level warnings (`tk:exception:warn`,
+`tk:exception:embedded-stream-exception`), to every pipes result message
+(fetch/emit/crash inside the worker, and the results the parent fabricates when
+the worker never reports one), and to every tika-server error body built from an
+exception -- `422` and `500`. It is loaded from the config only and is
+rejected in a per-request `parse-context` -- tika-server `/rmeta/config` and
+friends, `/pipes` and `/async` answer `400` with the reason, tika-grpc's
+`parse_context_json` answers `INVALID_ARGUMENT` -- so a caller cannot turn
+redaction back off.
+
+Programmatically, parsers and callers should format exceptions through
+`ExceptionUtils.format(Throwable, ParseContext)`. A parser still calling the
+deprecated two-argument `EmbeddedDocumentUtil.recordException` /
+`recordEmbeddedStreamException` -- including any third-party parser compiled
+against 4.0.0 -- reports `FULL` whatever the policy says. To set a policy in a
+parser test:
+
+[source,java]
+----
+ParseContext context = new ParseContext();
+context.set(ExceptionReporting.class,
+        new ExceptionReporting(ExceptionReporting.Level.MESSAGE_REDACTED, 500));
+----
+
+== Recommendations
+
+. Set limits whenever the content is untrusted.
+. Set `exception-reporting` to `MESSAGE_REDACTED` with a finite `maxLength`
+  when the caller is not the operator.
+. Use `includeFields` to capture only the metadata you need.
+. Check `tk:warn:truncated-metadata` rather than guessing.
+. Combine with process isolation — limits protect against memory blowups,
+  xref:advanced/robustness.adoc[process isolation] protects against crashes.
+. Test with adversarial files; `MockParser` (tika-core test jar) simulates
+  hangs, OOMs, and huge output.
+
+== See also
+
+* xref:advanced/robustness.adoc[Robustness] — process isolation and fault tolerance
+* xref:configuration/index.adoc[Configuration] — general Tika configuration
+* xref:pipes/unpack-config.adoc[Extracting Embedded Bytes] — the rest of `UnpackConfig`
+* xref:pipes/timeouts.adoc[Timeouts] — the full timeout model

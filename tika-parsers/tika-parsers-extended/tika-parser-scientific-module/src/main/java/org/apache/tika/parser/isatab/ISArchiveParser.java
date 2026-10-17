@@ -19,28 +19,35 @@ package org.apache.tika.parser.isatab;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Set;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.FilenameUtils;
 import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class ISArchiveParser implements Parser {
 
     /**
      * Serial version UID
      */
     private static final long serialVersionUID = 3640809327541300229L;
-    private static String studyAssayFileNameField = "Study Assay File Name";
+    // Same isatab: KeyPrefix ISATabUtils writes these fields under -- must stay in sync with
+    // ISATabUtils.addMetadata/mapStudyToMetadata or these reads silently return nothing.
+    private static String studyAssayFileNameField = ISATabUtils.ISATAB.key("Study Assay File Name");
     private final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.application("x-isatab"));
     private String location = null;
@@ -72,27 +79,27 @@ public class ISArchiveParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        TemporaryResources tmp =
-                TikaInputStream.isTikaInputStream(stream) ? null : new TemporaryResources();
+        TemporaryResources tmp = null;
 
-        TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
         try {
             if (this.location == null) {
                 this.location = tis.getFile().getParent() + File.separator;
             }
-            this.studyFileName = tis.getFile().getName();
+            // Use resource name from metadata if available, fall back to file name
+            String resourceName = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
+            this.studyFileName = resourceName != null ? resourceName : tis.getFile().getName();
 
             File locationFile = new File(location);
             String[] investigationList = locationFile.list((dir, name) -> name.matches("i_.+\\.txt"));
 
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
             xhtml.startDocument();
 
             parseInvestigation(investigationList, xhtml, metadata, context);
-            parseStudy(stream, xhtml, metadata, context);
+            parseStudy(tis, xhtml, metadata, context);
             parseAssay(xhtml, metadata, context);
 
             xhtml.endDocument();
@@ -119,24 +126,28 @@ public class ISArchiveParser implements Parser {
         try (InputStream stream = TikaInputStream.get(new File(this.location + investigation).toPath())) {
             ISATabUtils.parseInvestigation(stream, xhtml, metadata, context, this.studyFileName);
         }
-        xhtml.element("h1", "INVESTIGATION " + metadata.get("Investigation Identifier"));
+        xhtml.element("h1",
+                "INVESTIGATION " + metadata.get(ISATabUtils.ISATAB.key("Investigation Identifier")));
     }
 
-    private void parseStudy(InputStream stream, XHTMLContentHandler xhtml, Metadata metadata,
+    private void parseStudy(InputStream tis, XHTMLContentHandler xhtml, Metadata metadata,
                             ParseContext context) throws IOException, SAXException, TikaException {
-        xhtml.element("h2", "STUDY " + metadata.get("Study Identifier"));
+        xhtml.element("h2", "STUDY " + metadata.get(ISATabUtils.ISATAB.key("Study Identifier")));
 
-        ISATabUtils.parseStudy(stream, xhtml, metadata, context);
+        ISATabUtils.parseStudy(tis, xhtml, metadata, context);
     }
 
     private void parseAssay(XHTMLContentHandler xhtml, Metadata metadata, ParseContext context)
             throws IOException, SAXException, TikaException {
+        // location starts with "/C:" on windows, so build the directory Path from a File
+        // rather than Paths.get(). The assay file names come from the investigation file and
+        // are resolved within this directory.
+        Path locationDir = new File(this.location).toPath();
         for (String assayFileName : metadata.getValues(studyAssayFileNameField)) {
             xhtml.startElement("div");
             xhtml.element("h3", "ASSAY " + assayFileName);
-            // location starts with "/C:" on windows, can't use Paths.get()
-            try (InputStream stream = TikaInputStream.get(new File(this.location + assayFileName).toPath()))
-            {
+            Path assayFile = FilenameUtils.resolveWithin(locationDir, assayFileName);
+            try (InputStream stream = TikaInputStream.get(assayFile)) {
                 ISATabUtils.parseAssay(stream, xhtml, metadata, context);
             }
             xhtml.endElement("div");

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.onenote.fsshttpb.streamobj.space;
 
 import java.io.IOException;
@@ -58,6 +57,12 @@ public class ObjectSpaceObjectStreamOfOSIDs {
         int headerCount = this.header.doDeserializeFromByteArray(byteArray, index);
         index += headerCount;
 
+        // each CompactID consumes 4 bytes, so a valid count cannot exceed the remaining
+        // bytes / 4; bounds the allocation on malformed counts
+        if (this.header.count > (byteArray.length - index) / 4L) {
+            throw new IOException("ObjectSpaceObjectStreamOfOSIDs count " + this.header.count +
+                    " exceeds remaining data " + (byteArray.length - index));
+        }
         this.body = new CompactID[(int) this.header.count];
         for (int i = 0; i < this.header.count; i++) {
             CompactID compactID = new CompactID();

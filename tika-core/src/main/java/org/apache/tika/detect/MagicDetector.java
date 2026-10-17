@@ -21,7 +21,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 import java.io.CharArrayWriter;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.util.Arrays;
@@ -29,8 +28,11 @@ import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
+import org.apache.tika.parser.ParseContext;
 
 /**
  * Content type detection based on magic bytes, i.e. type-specific patterns
@@ -39,9 +41,13 @@ import org.apache.tika.mime.MediaType;
  * Because this works on bytes, not characters, by default any string
  * matching is done as ISO_8859_1. To use an explicit different
  * encoding, supply a type other than "string" / "stringignorecase"
+ * <p>
+ * Instances of this class are immutable and safe for use by multiple
+ * concurrent threads.
  *
  * @since Apache Tika 0.3
  */
+@TikaComponent(spi = false)
 public class MagicDetector implements Detector {
 
     /**
@@ -91,6 +97,12 @@ public class MagicDetector implements Detector {
      * starts at this offset.
      */
     private final int offsetRangeEnd;
+    /**
+     * The compiled form of {@link #pattern} when {@link #isRegex} is true,
+     * <code>null</code> otherwise. Compiled once here rather than per match,
+     * as every input to it is fixed at construction time.
+     */
+    private final Pattern compiledPattern;
 
     /**
      * Creates a detector for input documents that have the exact given byte
@@ -137,6 +149,16 @@ public class MagicDetector implements Detector {
     /**
      * Creates a detector for input documents that meet the specified
      * magic match.
+     * <p>
+     * When <code>isRegex</code> is true the pattern is compiled here rather
+     * than on each match, so a malformed pattern is reported by this
+     * constructor instead of by the first call to
+     * {@link #detect(TikaInputStream, Metadata, ParseContext)} or
+     * {@link #matches(byte[])}.
+     *
+     * @throws java.util.regex.PatternSyntaxException if <code>isRegex</code>
+     *         is true and <code>pattern</code> is not a valid regular
+     *         expression
      */
     public MagicDetector(MediaType type, byte[] pattern, byte[] mask, boolean isRegex,
                          boolean isStringIgnoreCase, int offsetRangeBegin, int offsetRangeEnd) {
@@ -178,6 +200,13 @@ public class MagicDetector implements Detector {
             } else {
                 this.pattern[i] = 0;
             }
+        }
+
+        if (this.isRegex) {
+            int flags = this.isStringIgnoreCase ? Pattern.CASE_INSENSITIVE : 0;
+            this.compiledPattern = Pattern.compile(new String(this.pattern, UTF_8), flags);
+        } else {
+            this.compiledPattern = null;
         }
 
         this.offsetRangeBegin = offsetRangeBegin;
@@ -334,24 +363,26 @@ public class MagicDetector implements Detector {
     }
 
     /**
-     * @param input    document input stream, or <code>null</code>
+     * @param tis      document input stream, or <code>null</code>
      * @param metadata ignored
+     * @param parseContext the parse context
      */
-    public MediaType detect(InputStream input, Metadata metadata) throws IOException {
-        if (input == null) {
+    public MediaType detect(TikaInputStream tis, Metadata metadata, ParseContext parseContext)
+            throws IOException {
+        if (tis == null) {
             return MediaType.OCTET_STREAM;
         }
 
-        input.mark(offsetRangeEnd + length);
+        tis.mark(offsetRangeEnd + length);
         try {
             int offset = 0;
 
             // Skip bytes at the beginning, using skip() or read()
             while (offset < offsetRangeBegin) {
-                long n = input.skip(offsetRangeBegin - offset);
+                long n = tis.skip(offsetRangeBegin - offset);
                 if (n > 0) {
                     offset += n;
-                } else if (input.read() != -1) {
+                } else if (tis.read() != -1) {
                     offset += 1;
                 } else {
                     return MediaType.OCTET_STREAM;
@@ -360,69 +391,156 @@ public class MagicDetector implements Detector {
 
             // Fill in the comparison window
             byte[] buffer = new byte[length + (offsetRangeEnd - offsetRangeBegin)];
-            int n = input.read(buffer);
+            int n = tis.read(buffer);
             if (n > 0) {
                 offset += n;
             }
             while (n != -1 && offset < offsetRangeEnd + length) {
                 int bufferOffset = offset - offsetRangeBegin;
-                n = input.read(buffer, bufferOffset, buffer.length - bufferOffset);
+                n = tis.read(buffer, bufferOffset, buffer.length - bufferOffset);
                 // increment offset - in case not all read (see testDetectStreamReadProblems)
                 if (n > 0) {
                     offset += n;
                 }
             }
 
-            if (this.isRegex) {
-                int flags = 0;
-                if (this.isStringIgnoreCase) {
-                    flags = Pattern.CASE_INSENSITIVE;
-                }
+            // For non-regex, verify we have enough data
+            if (!isRegex && offset < offsetRangeBegin + length) {
+                return MediaType.OCTET_STREAM;
+            }
 
-                Pattern p = Pattern.compile(new String(this.pattern, UTF_8), flags);
-
-                ByteBuffer bb = ByteBuffer.wrap(buffer);
-                CharBuffer result = ISO_8859_1.decode(bb);
-                Matcher m = p.matcher(result);
-
-                boolean match = false;
-                // Loop until we've covered the entire offset range
-                for (int i = 0; i <= offsetRangeEnd - offsetRangeBegin; i++) {
-                    m.region(i, length + i);
-                    match = m.lookingAt(); // match regex from start of region
-                    if (match) {
-                        return type;
-                    }
-                }
-            } else {
-                if (offset < offsetRangeBegin + length) {
-                    return MediaType.OCTET_STREAM;
-                }
-                // Loop until we've covered the entire offset range
-                for (int i = 0; i <= offsetRangeEnd - offsetRangeBegin; i++) {
-                    boolean match = true;
-                    int masked;
-                    for (int j = 0; match && j < length; j++) {
-                        masked = (buffer[i + j] & mask[j]);
-                        if (this.isStringIgnoreCase) {
-                            masked = Character.toLowerCase(masked);
-                        }
-                        match = (masked == pattern[j]);
-                    }
-                    if (match) {
-                        return type;
-                    }
-                }
+            // Buffer starts at offsetRangeBegin, so search from 0 to (offsetRangeEnd - offsetRangeBegin)
+            if (matchesBuffer(buffer, 0, offsetRangeEnd - offsetRangeBegin)) {
+                return type;
             }
 
             return MediaType.OCTET_STREAM;
         } finally {
-            input.reset();
+            tis.reset();
         }
     }
 
     public int getLength() {
         return this.patternLength;
+    }
+
+    /**
+     * Checks if the given byte array matches this magic pattern.
+     * This is a more efficient alternative to {@link #detect(TikaInputStream, Metadata, ParseContext)}
+     * when you already have the bytes in memory.
+     *
+     * @param data the byte array to check
+     * @return true if the data matches this magic pattern, false otherwise
+     */
+    public boolean matches(byte[] data) {
+        if (data == null) {
+            return false;
+        }
+
+        // For non-regex, we need at least patternLength bytes starting at offsetRangeBegin.
+        // For regex, we can match with less data since the pattern may be shorter than the buffer.
+        if (!isRegex) {
+            int requiredLength = offsetRangeBegin + length;
+            if (data.length < requiredLength) {
+                return false;
+            }
+            // For non-regex, we need enough data after the start position for the pattern
+            int maxOffset = Math.min(offsetRangeEnd, data.length - length);
+            return matchesBuffer(data, offsetRangeBegin, maxOffset);
+        } else {
+            // For regex, just need data to reach offsetRangeBegin
+            if (data.length <= offsetRangeBegin) {
+                return false;
+            }
+            // For regex, try all positions up to min(offsetRangeEnd, data.length - 1)
+            // The regex pattern can match even at the last byte position
+            int maxOffset = Math.min(offsetRangeEnd, data.length - 1);
+            return matchesBuffer(data, offsetRangeBegin, maxOffset);
+        }
+    }
+
+    // Which raw first bytes can begin a match; encodes mask[0] and the case fold so the
+    // scan loop is a single table load. Built lazily, idempotent under racing builds.
+    private transient volatile boolean[] firstByteMatches;
+
+    private boolean[] buildFirstByteTable() {
+        boolean[] table = new boolean[256];
+        int first = pattern[0];
+        for (int b = 0; b < 256; b++) {
+            int masked = ((byte) b) & mask[0];
+            if (this.isStringIgnoreCase) {
+                masked = Character.toLowerCase(masked);
+            }
+            table[b] = (masked == first);
+        }
+        return table;
+    }
+
+    /**
+     * Core matching logic that checks if the pattern matches anywhere in the buffer
+     * within the specified offset range.
+     *
+     * @param buffer the byte array to search in
+     * @param startOffset the first position in the buffer to start matching (inclusive)
+     * @param endOffset the last position in the buffer to start matching (inclusive)
+     * @return true if a match is found, false otherwise
+     */
+    private boolean matchesBuffer(byte[] buffer, int startOffset, int endOffset) {
+        if (this.isRegex) {
+            int bufferLen = Math.min(buffer.length - startOffset, length + (endOffset - startOffset));
+            if (bufferLen <= 0) {
+                return false;
+            }
+            ByteBuffer bb = ByteBuffer.wrap(buffer, startOffset, bufferLen);
+            CharBuffer result = ISO_8859_1.decode(bb);
+            Matcher m = compiledPattern.matcher(result);
+
+            // Loop until we've covered the entire offset range
+            for (int i = 0; i <= endOffset - startOffset; i++) {
+                // For regex, use available data length, not the fixed 8KB buffer size
+                int regionEnd = Math.min(length + i, result.length());
+                if (i < regionEnd) {
+                    m.region(i, regionEnd);
+                    if (m.lookingAt()) {
+                        return true;
+                    }
+                }
+            }
+        } else {
+            // Range scans (e.g. "\nHeader:" over 0:1024) dominate detection cost:
+            // scan for first-byte candidates, run the full compare only there.
+            if (length == 0) {
+                // degenerate empty pattern: preserves the old loop's outcome
+                return startOffset <= endOffset && startOffset <= buffer.length;
+            }
+            // one array load per scanned position instead of mask + case-fold + compare
+            boolean[] firstMatch = firstByteMatches;
+            if (firstMatch == null) {
+                firstMatch = buildFirstByteTable();
+                firstByteMatches = firstMatch;
+            }
+            for (int i = startOffset; i <= endOffset; i++) {
+                if (i + length > buffer.length) {
+                    break;
+                }
+                if (!firstMatch[buffer[i] & 0xFF]) {
+                    continue;
+                }
+                boolean match = true;
+                for (int j = 1; match && j < length; j++) {
+                    int masked = (buffer[i + j] & mask[j]);
+                    if (this.isStringIgnoreCase) {
+                        masked = Character.toLowerCase(masked);
+                    }
+                    match = (masked == pattern[j]);
+                }
+                if (match) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

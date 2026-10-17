@@ -14,14 +14,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
 import org.apache.tika.Tika;
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.language.translate.Translator;
 import org.apache.tika.language.translate.impl.GoogleTranslator;
 
@@ -70,8 +69,9 @@ public class TranscribeTranslateExample {
      * @param file the name of the file (which needs to be on the Java Classpath) to transcribe.
      * @return transcribed text.
      */
-    public static String amazonTranscribe(Path tikaConfig, Path file) throws Exception {
-        return new Tika(new TikaConfig(tikaConfig)).parseToString(file);
+    public static String amazonTranscribe(Path tikaConfigPath, Path file) throws Exception {
+        TikaLoader tikaLoader = TikaLoader.load(tikaConfigPath);
+        return new Tika(tikaLoader.loadDetectors(), tikaLoader.loadAutoDetectParser()).parseToString(file);
     }
 
     /**

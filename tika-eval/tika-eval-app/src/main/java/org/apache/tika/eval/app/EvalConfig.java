@@ -23,7 +23,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 public class EvalConfig {
 
     private long minExtractLength = 0;
-    private long maxExtractLength = 2_000_000;
+    private long maxExtractLength = 100_000_000;
     private String jdbcString = null;
     private String jdbcDriverClass = null;
     private boolean forceDrop = true;
@@ -84,5 +84,13 @@ public class EvalConfig {
         return "EvalConfig{" + "minExtractLength=" + minExtractLength + ", maxExtractLength=" + maxExtractLength + ", jdbcString='" + jdbcString + '\'' + ", jdbcDriverClass='" +
                 jdbcDriverClass + '\'' + ", forceDrop=" + forceDrop + ", maxFilesToAdd=" + maxFilesToAdd + ", maxTokens=" + maxTokens + ", maxContentLength=" + maxContentLength +
                 ", numThreads=" + numWorkers + ", errorLogFile=" + errorLogFile + '}';
+    }
+
+    public void setNumWorkers(int n) {
+        numWorkers = n;
+    }
+
+    public void setMaxExtractLength(long m) {
+        maxExtractLength = m;
     }
 }

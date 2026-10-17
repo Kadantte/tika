@@ -16,19 +16,29 @@
  */
 package org.apache.tika.parser;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.tika.config.EmbeddedLimits;
+import org.apache.tika.config.TimeoutLimits;
+import org.apache.tika.config.TransientParseState;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 
 /**
  * Use this class to store exceptions, warnings and other information
  * during the parse.  This information is added to the parent's metadata
  * after the parse by the {@link CompositeParser}.
+ * <p>
+ * This class also tracks embedded document processing limits (depth and count)
+ * which can be configured via {@link #setMaxEmbeddedDepth(int)} and
+ * {@link #setMaxEmbeddedCount(int)}.
  */
-public class ParseRecord {
+public class ParseRecord implements TransientParseState {
 
     //hard limits so that specially crafted files
     //don't cause an OOM
@@ -39,6 +49,8 @@ public class ParseRecord {
     private static final int MAX_WARNINGS = 100;
 
     private static final int MAX_METADATA_LIST_SIZE = 100;
+    public static final int MAX_EXTERNAL_REFERENCES = 20;
+    private static final int MAX_EXTERNAL_REFERENCE_LENGTH = 1000;
 
     private int depth = 0;
     private final Set<String> parsers = new LinkedHashSet<>();
@@ -48,15 +60,79 @@ public class ParseRecord {
     private final List<String> warnings = new ArrayList<>();
 
     private final List<Metadata> metadataList = new ArrayList<>();
+    //metadata of the documents being parsed, innermost on top
+    private final Deque<Metadata> documents = new ArrayDeque<>();
+    private boolean externalReferenceInEmbedded = false;
 
     private boolean writeLimitReached = false;
 
-    void beforeParse() {
+    // Embedded document tracking
+    private int embeddedCount = 0;
+    private int embeddedDepth = 0;
+    private int maxEmbeddedDepth = -1;
+    private int maxEmbeddedCount = -1;
+    private boolean throwOnMaxDepth = false;
+    private boolean throwOnMaxCount = false;
+    private boolean embeddedDepthLimitReached = false;
+    private boolean embeddedCountLimitReached = false;
+    private boolean throwOnDeadline = false;
+    private boolean taskDeadlineReached = false;
+
+    /**
+     * Creates a new ParseRecord configured from EmbeddedLimits in the ParseContext.
+     * <p>
+     * If EmbeddedLimits is present in the context, the ParseRecord will be configured
+     * with those limits. Otherwise, default unlimited values are used.
+     *
+     * @param context the ParseContext (may be null)
+     * @return a new ParseRecord configured from the context
+     */
+    public static ParseRecord newInstance(ParseContext context) {
+        ParseRecord record = new ParseRecord();
+        EmbeddedLimits limits = EmbeddedLimits.get(context);
+        record.maxEmbeddedDepth = limits.getMaxDepth();
+        record.maxEmbeddedCount = limits.getMaxCount();
+        record.throwOnMaxDepth = limits.isThrowOnMaxDepth();
+        record.throwOnMaxCount = limits.isThrowOnMaxCount();
+        record.throwOnDeadline = TimeoutLimits.get(context).isThrowOnDeadline();
+        return record;
+    }
+
+    void beforeParse(Metadata metadata) {
         depth++;
+        documents.push(metadata);
     }
 
     void afterParse() {
         depth--;
+        documents.pop();
+    }
+
+    /**
+     * Records an external DTD or entity reference Tika refused, on the metadata of the
+     * document being parsed. No-op outside a {@link CompositeParser} parse.
+     */
+    public void addExternalReference(String reference) {
+        Metadata metadata = documents.peek();
+        if (metadata == null || reference == null) {
+            return;
+        }
+        Integer seen = metadata.getInt(TikaCoreProperties.XML_EXTERNAL_REFERENCE_COUNT);
+        int count = seen == null ? 0 : seen;
+        metadata.set(TikaCoreProperties.XML_EXTERNAL_REFERENCE_COUNT, count + 1);
+        if (count < MAX_EXTERNAL_REFERENCES) {
+            String value = reference.length() > MAX_EXTERNAL_REFERENCE_LENGTH ?
+                    reference.substring(0, MAX_EXTERNAL_REFERENCE_LENGTH) : reference;
+            metadata.add(TikaCoreProperties.XML_EXTERNAL_REFERENCE, value);
+        }
+        //composite delegation pushes the same metadata again; embedded documents bring their own
+        if (metadata != documents.peekLast()) {
+            externalReferenceInEmbedded = true;
+        }
+    }
+
+    public boolean isExternalReferenceInEmbedded() {
+        return externalReferenceInEmbedded;
     }
 
     public int getDepth() {
@@ -67,7 +143,8 @@ public class ParseRecord {
         return parsers.toArray(new String[0]);
     }
 
-    void addParserClass(String parserClass) {
+    /** Records a parser that ran, dispatched or invoked as an enricher. */
+    public void addParserClass(String parserClass) {
         if (parsers.size() < MAX_PARSERS) {
             parsers.add(parserClass);
         }
@@ -110,5 +187,172 @@ public class ParseRecord {
 
     public List<Metadata> getMetadataList() {
         return metadataList;
+    }
+
+    /**
+     * Returns whether throwing is configured when max depth is reached.
+     *
+     * @return true if an exception should be thrown on max depth
+     */
+    public boolean isThrowOnMaxDepth() {
+        return throwOnMaxDepth;
+    }
+
+    /**
+     * Returns whether throwing is configured when max count is reached.
+     *
+     * @return true if an exception should be thrown on max count
+     */
+    public boolean isThrowOnMaxCount() {
+        return throwOnMaxCount;
+    }
+
+    /**
+     * Sets the flag indicating the embedded depth limit was reached.
+     *
+     * @param embeddedDepthLimitReached true if depth limit was reached
+     */
+    public void setEmbeddedDepthLimitReached(boolean embeddedDepthLimitReached) {
+        this.embeddedDepthLimitReached = embeddedDepthLimitReached;
+    }
+
+    /**
+     * Sets the flag indicating the embedded count limit was reached.
+     *
+     * @param embeddedCountLimitReached true if count limit was reached
+     */
+    public void setEmbeddedCountLimitReached(boolean embeddedCountLimitReached) {
+        this.embeddedCountLimitReached = embeddedCountLimitReached;
+    }
+
+    /**
+     * Increments the embedded document count. Should be called when an embedded
+     * document is about to be parsed.
+     */
+    public void incrementEmbeddedCount() {
+        embeddedCount++;
+    }
+
+    /**
+     * Marks the start of an embedded document's parse: the documents parsed
+     * until {@link #exitEmbedded()} are one level deeper than the current one.
+     * Unlike {@link #getDepth()}, which counts the parsers a parse passes
+     * through, this counts embedding levels only.
+     */
+    public void enterEmbedded() {
+        embeddedDepth++;
+    }
+
+    /**
+     * Marks the end of an embedded document's parse.
+     */
+    public void exitEmbedded() {
+        if (embeddedDepth <= 0) {
+            throw new IllegalStateException("exitEmbedded() without a matching enterEmbedded()");
+        }
+        embeddedDepth--;
+    }
+
+    /**
+     * Gets the embedding depth of the document currently being parsed:
+     * 0 for the container, 1 for its embedded documents, and so on.
+     *
+     * @return the embedding depth of the current document
+     */
+    public int getEmbeddedDepth() {
+        return embeddedDepth;
+    }
+
+    /**
+     * Gets the current count of embedded documents processed.
+     *
+     * @return the embedded document count
+     */
+    public int getEmbeddedCount() {
+        return embeddedCount;
+    }
+
+    /**
+     * Sets the maximum depth for parsing embedded documents.
+     * A value of -1 means unlimited (the default).
+     * A value of 0 means no embedded documents will be parsed.
+     * A value of 1 means only first-level embedded documents will be parsed, etc.
+     *
+     * @param maxEmbeddedDepth the maximum embedded depth, or -1 for unlimited
+     */
+    public void setMaxEmbeddedDepth(int maxEmbeddedDepth) {
+        this.maxEmbeddedDepth = maxEmbeddedDepth;
+    }
+
+    /**
+     * Gets the maximum depth for parsing embedded documents.
+     *
+     * @return the maximum embedded depth, or -1 if unlimited
+     */
+    public int getMaxEmbeddedDepth() {
+        return maxEmbeddedDepth;
+    }
+
+    /**
+     * Sets the maximum number of embedded documents to parse.
+     * A value of -1 means unlimited (the default).
+     *
+     * @param maxEmbeddedCount the maximum embedded count, or -1 for unlimited
+     */
+    public void setMaxEmbeddedCount(int maxEmbeddedCount) {
+        this.maxEmbeddedCount = maxEmbeddedCount;
+    }
+
+    /**
+     * Gets the maximum number of embedded documents to parse.
+     *
+     * @return the maximum embedded count, or -1 if unlimited
+     */
+    public int getMaxEmbeddedCount() {
+        return maxEmbeddedCount;
+    }
+
+    /**
+     * Returns whether the embedded depth limit was reached during parsing.
+     *
+     * @return true if the depth limit was reached
+     */
+    public boolean isEmbeddedDepthLimitReached() {
+        return embeddedDepthLimitReached;
+    }
+
+    /**
+     * Returns whether the embedded count limit was reached during parsing.
+     *
+     * @return true if the count limit was reached
+     */
+    public boolean isEmbeddedCountLimitReached() {
+        return embeddedCountLimitReached;
+    }
+
+    /**
+     * Sets whether an exception should be thrown when the task's total timeout is
+     * exhausted, rather than skipping remaining embedded documents cleanly.
+     */
+    public void setThrowOnDeadline(boolean throwOnDeadline) {
+        this.throwOnDeadline = throwOnDeadline;
+    }
+
+    public boolean isThrowOnDeadline() {
+        return throwOnDeadline;
+    }
+
+    /**
+     * Sets the flag indicating the task's total timeout was exhausted -- a document-level
+     * fact (unlike a single embedded document timing out, recorded per-child via
+     * {@link #addException(Exception)}): once set, any not-yet-started embedded document
+     * is skipped rather than attempted.
+     */
+    public void setTaskDeadlineReached(boolean taskDeadlineReached) {
+        this.taskDeadlineReached = taskDeadlineReached;
+    }
+
+    public boolean isTaskDeadlineReached() {
+        return taskDeadlineReached;
     }
 }

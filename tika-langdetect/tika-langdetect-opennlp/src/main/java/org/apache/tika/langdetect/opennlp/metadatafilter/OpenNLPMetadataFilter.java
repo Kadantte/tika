@@ -16,29 +16,36 @@
  */
 package org.apache.tika.langdetect.opennlp.metadatafilter;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.exception.TikaException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.langdetect.opennlp.OpenNLPDetector;
 import org.apache.tika.language.detect.LanguageResult;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.metadata.filter.MetadataFilter;
+import org.apache.tika.metadata.filter.MetadataFilterBase;
 
-public class OpenNLPMetadataFilter extends MetadataFilter {
+@TikaComponent
+public class OpenNLPMetadataFilter extends MetadataFilterBase {
+
+    private static final Logger LOG = LoggerFactory.getLogger(OpenNLPMetadataFilter.class);
 
     private int maxCharsForDetection = 10000;
 
-    @Field
     public void setMaxCharsForDetection(int maxCharsForDetection) {
         this.maxCharsForDetection = maxCharsForDetection;
     }
 
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    public void filter(Metadata metadata) {
         OpenNLPDetector detector = new OpenNLPDetector();
         detector.setMaxLength(maxCharsForDetection);
         String content = metadata.get(TikaCoreProperties.TIKA_CONTENT);
         if (content == null) {
+            // No tk:content to detect from -- e.g. the ignore handler, which /meta pins.
+            // Silence here reads as "no language found" rather than "never ran".
+            LOG.debug("no content to detect language from; filter is a no-op for this document");
             return;
         }
         LanguageResult r = detector.detect(content);

@@ -16,8 +16,9 @@
  */
 package org.apache.tika.metadata.filter;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.utils.StringUtils;
@@ -29,9 +30,39 @@ import org.apache.tika.utils.StringUtils;
  *
  * If you need any other mappings, please open a ticket on our JIRA.
  */
-public class GeoPointMetadataFilter extends MetadataFilter {
+@TikaComponent
+public class GeoPointMetadataFilter extends MetadataFilterBase {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public String geoPointFieldName = "location";
+    }
 
     String geoPointFieldName = "location";
+
+    public GeoPointMetadataFilter() {
+    }
+
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public GeoPointMetadataFilter(Config config) {
+        this.geoPointFieldName = config.geoPointFieldName;
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public GeoPointMetadataFilter(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
 
     /**
      * Set the field for the concatenated LATITUDE,LONGITUDE string.
@@ -39,7 +70,6 @@ public class GeoPointMetadataFilter extends MetadataFilter {
      *
      * @param geoPointFieldName field name to use for the geopoint field
      */
-    @Field
     public void setGeoPointFieldName(String geoPointFieldName) {
         this.geoPointFieldName = geoPointFieldName;
     }
@@ -49,7 +79,7 @@ public class GeoPointMetadataFilter extends MetadataFilter {
     }
 
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void filter(Metadata metadata) {
         String lat = metadata.get(TikaCoreProperties.LATITUDE);
         if (StringUtils.isEmpty(lat)) {
             return;
@@ -58,6 +88,7 @@ public class GeoPointMetadataFilter extends MetadataFilter {
         if (StringUtils.isEmpty(lng)) {
             return;
         }
-        metadata.set(geoPointFieldName, lat + "," + lng);
+        // target field name is operator-configured; may legitimately be a reserved key
+        metadata.setTrusted(geoPointFieldName, lat + "," + lng);
     }
 }

@@ -19,7 +19,6 @@ package org.apache.tika.parser.netcdf;
 //JDK imports
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -31,15 +30,17 @@ import ucar.nc2.Dimension;
 import ucar.nc2.NetcdfFile;
 import ucar.nc2.Variable;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
+import org.apache.tika.parser.climate.ClimateForecast;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 /**
@@ -49,12 +50,19 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * href="http://www.unidata.ucar.edu/software/netcdf-java/">NetCDF for Java</a>
  * API.
  */
+@TikaComponent
 public class NetCDFParser implements Parser {
 
     /**
      * Serial version UID
      */
     private static final long serialVersionUID = -5940938274907708665L;
+
+    public static final KeyPrefix NETCDF =
+            KeyPrefix.file("netcdf:", "NetCDF global attribute names");
+
+    private static final Property FILE_TYPE_DESCRIPTION =
+            Property.externalText("netcdf:file-type-description");
 
     private final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.application("x-netcdf"));
@@ -77,27 +85,23 @@ public class NetCDFParser implements Parser {
      * org.xml.sax.ContentHandler, org.apache.tika.metadata.Metadata,
      * org.apache.tika.parser.ParseContext)
      */
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        TemporaryResources tmp =
-                TikaInputStream.isTikaInputStream(stream) ? null : new TemporaryResources();
-        TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
         try (NetcdfFile ncFile = NetcdfFile.open(tis.getFile().getAbsolutePath())) {
-            metadata.set("File-Type-Description", ncFile.getFileTypeDescription());
+            metadata.set(FILE_TYPE_DESCRIPTION, ncFile.getFileTypeDescription());
             // first parse out the set of global attributes
             for (Attribute attr : ncFile.getGlobalAttributes()) {
-                Property property = resolveMetadataKey(attr.getFullName());
                 if (attr.getDataType().isString()) {
-                    metadata.add(property, attr.getStringValue());
+                    addGlobalAttribute(metadata, attr.getFullName(), attr.getStringValue());
                 } else if (attr.getDataType().isNumeric()) {
-                    int value = attr.getNumericValue().intValue();
-                    metadata.add(property, String.valueOf(value));
+                    addGlobalAttribute(metadata, attr.getFullName(),
+                            String.valueOf(attr.getNumericValue().intValue()));
                 }
             }
 
 
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
             xhtml.startDocument();
             xhtml.newline();
             xhtml.element("h1", "dimensions");
@@ -130,17 +134,24 @@ public class NetCDFParser implements Parser {
             xhtml.endDocument();
         } catch (IOException e) {
             throw new TikaException("NetCDF parse error", e);
-        } finally {
-            if (tmp != null) {
-                tmp.dispose();
-            }
         }
     }
 
-    private Property resolveMetadataKey(String localName) {
-        if ("title".equals(localName)) {
-            return TikaCoreProperties.TITLE;
+    private static void addGlobalAttribute(Metadata metadata, String name, String value) {
+        if ("title".equals(name)) {
+            metadata.add(TikaCoreProperties.TITLE, value);
+            return;
         }
-        return Property.internalText(localName);
+        Property cfProperty = ClimateForecast.byName(name);
+        if (cfProperty != null) {
+            if (cfProperty.isMultiValuePermitted()) {
+                metadata.add(cfProperty, value);
+            } else {
+                // malformed files can repeat attribute names; SIMPLE CF keys take last-wins, not a throw
+                metadata.set(cfProperty, value);
+            }
+        } else {
+            metadata.add(NETCDF, name, value);
+        }
     }
 }

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.ooxml.xps;
 
 import java.io.IOException;
@@ -27,9 +26,7 @@ import java.util.Map;
 
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.input.CloseShieldInputStream;
-import org.apache.poi.ooxml.POIXMLDocument;
-import org.apache.poi.ooxml.extractor.POIXMLTextExtractor;
+import org.apache.poi.openxml4j.opc.OPCPackage;
 import org.apache.poi.openxml4j.opc.PackagePart;
 import org.apache.poi.openxml4j.opc.PackageRelationship;
 import org.apache.poi.openxml4j.opc.PackageRelationshipCollection;
@@ -40,7 +37,9 @@ import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
@@ -55,16 +54,14 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
             "http://schemas.openxps.org/oxps/v1.0/fixedrepresentation";
     private static String XPS_DOCUMENT =
             "http://schemas.microsoft.com/xps/2005/06/fixedrepresentation";
-    private final ParseContext context;
     private final ZipPackage pkg;
     Map<String, Metadata> embeddedImages = new LinkedHashMap<>();
 
-    public XPSExtractorDecorator(ParseContext context, POIXMLTextExtractor extractor)
+    public XPSExtractorDecorator(ParseContext context, OPCPackage opcPackage)
             throws TikaException {
-        super(context, extractor);
-        this.context = context;
-        if (extractor.getPackage() instanceof ZipPackage) {
-            this.pkg = (ZipPackage) extractor.getPackage();
+        super(context, opcPackage);
+        if (opcPackage instanceof ZipPackage) {
+            this.pkg = (ZipPackage) opcPackage;
         } else {
             throw new TikaException("OPCPackage must be a ZipPackage");
         }
@@ -87,12 +84,9 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
         if (zipEntry == null) {
             throw new TikaException("Couldn't find required zip entry: " + zipPath);
         }
-        return TikaInputStream.get(zipEntrySource.getInputStream(zipEntry));
-    }
-
-    @Override
-    public POIXMLDocument getDocument() {
-        return null;
+        ZipArchiveEntry entry = zipEntry;
+        return TikaInputStream.get(() -> zipEntrySource.getInputStream(entry),
+                new TemporaryResources(), null);
     }
 
     @Override
@@ -116,12 +110,13 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
 
         //now handle embedded images
         if (embeddedImages.size() > 0) {
-            EmbeddedDocumentUtil embeddedDocumentUtil = new EmbeddedDocumentUtil(context);
+            EmbeddedDocumentExtractor embeddedDocumentExtractor =
+                    EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
             for (Map.Entry<String, Metadata> embeddedImage : embeddedImages.entrySet()) {
                 String zipPath = embeddedImage.getKey();
                 Metadata metadata = embeddedImage.getValue();
-                if (embeddedDocumentUtil.shouldParseEmbedded(metadata)) {
-                    handleEmbeddedImage(zipPath, metadata, embeddedDocumentUtil, xhtml);
+                if (embeddedDocumentExtractor.shouldParseEmbedded(metadata, context)) {
+                    handleEmbeddedImage(zipPath, metadata, embeddedDocumentExtractor, xhtml);
                 }
             }
         }
@@ -129,19 +124,19 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
     }
 
     private void handleEmbeddedImage(String zipPath, Metadata metadata,
-                                     EmbeddedDocumentUtil embeddedDocumentUtil,
+                                     EmbeddedDocumentExtractor embeddedDocumentExtractor,
                                      XHTMLContentHandler xhtml) throws SAXException, IOException {
         TikaInputStream tis = null;
         try {
             tis = getZipStream(zipPath, pkg);
         } catch (IOException | TikaException e) {
             //store this exception in the parent's metadata
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata, context);
             return;
         }
 
         try {
-            embeddedDocumentUtil.parseEmbedded(tis, xhtml, metadata, true);
+            embeddedDocumentExtractor.parseEmbedded(tis, xhtml, metadata, context, true);
         } finally {
             IOUtils.closeQuietly(tis);
         }
@@ -150,7 +145,7 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
     private void handleDocuments(PackageRelationship packageRelationship, XHTMLContentHandler xhtml)
             throws IOException, SAXException, TikaException {
         try (InputStream stream = pkg.getPart(packageRelationship).getInputStream()) {
-            XMLReaderUtils.parseSAX(CloseShieldInputStream.wrap(stream),
+            XMLReaderUtils.parseSAX(stream,
                     new EmbeddedContentHandler(new FixedDocSeqHandler(xhtml)), context);
         }
     }
@@ -199,7 +194,7 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
             String zipPath = (docRef.startsWith("/") ? docRef.substring(1) : docRef);
             if (pkg instanceof ZipPackage) {
                 try (InputStream stream = getZipStream(zipPath, pkg)) {
-                    XMLReaderUtils.parseSAX(CloseShieldInputStream.wrap(stream),
+                    XMLReaderUtils.parseSAX(stream,
                             new EmbeddedContentHandler(
                                     new PageContentPartHandler(relativeRoot, xhtml)), context);
 
@@ -247,8 +242,8 @@ public class XPSExtractorDecorator extends AbstractOOXMLExtractor {
                         pagePath = pagePath.substring(1);
                     }
                     try (InputStream stream = getZipStream(pagePath, pkg)) {
-                        XMLReaderUtils.parseSAX(CloseShieldInputStream.wrap(stream),
-                                        new XPSPageContentHandler(xhtml, embeddedImages), context);
+                        XMLReaderUtils.parseSAX(stream,
+                                        new XPSPageContentHandler(xhtml, embeddedImages, context), context);
                     } catch (TikaException | IOException e) {
                         throw new SAXException(e);
                     }

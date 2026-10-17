@@ -17,15 +17,12 @@
 package org.apache.tika.parser.wordperfect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-
-import java.io.InputStream;
 
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
-import org.apache.tika.config.TikaConfig;
-import org.apache.tika.metadata.Metadata;
+import org.apache.tika.config.loader.TikaLoader;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.parser.Parser;
 
 /**
@@ -38,8 +35,8 @@ public class WordPerfectTest extends TikaTest {
     @Test
     public void testWordPerfectParser() throws Exception {
         XMLResult r = getXML("testWordPerfect.wpd");
-        assertEquals(WordPerfectParser.WP_6_x.toString(), r.metadata.get(Metadata.CONTENT_TYPE));
-        assertEquals(1, r.metadata.getValues(Metadata.CONTENT_TYPE).length);
+        assertEquals(WordPerfectParser.WP_6_x.toString(), r.metadata.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(1, r.metadata.getValues(HttpHeaders.CONTENT_TYPE).length);
         assertContains("<p>AND FURTHER</p>", r.xml);
         assertContains("test1-2", r.xml);
     }
@@ -48,8 +45,8 @@ public class WordPerfectTest extends TikaTest {
     public void testVersion50() throws Exception {
         //test file "testWordPerfect_5_0.wp" is from govdocs1: 126546.wp
         XMLResult r = getXML("testWordPerfect_5_0.wp");
-        assertEquals(WordPerfectParser.WP_5_0.toString(), r.metadata.get(Metadata.CONTENT_TYPE));
-        assertEquals(1, r.metadata.getValues(Metadata.CONTENT_TYPE).length);
+        assertEquals(WordPerfectParser.WP_5_0.toString(), r.metadata.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(1, r.metadata.getValues(HttpHeaders.CONTENT_TYPE).length);
         assertContains("<p>Surrounded by her family", r.xml);
     }
 
@@ -57,8 +54,8 @@ public class WordPerfectTest extends TikaTest {
     public void testVersion51() throws Exception {
         //testfile "testWordperfect_5_1.wp is from govdocs1: 758750.wp
         XMLResult r = getXML("testWordPerfect_5_1.wp");
-        assertEquals(WordPerfectParser.WP_5_1.toString(), r.metadata.get(Metadata.CONTENT_TYPE));
-        assertEquals(1, r.metadata.getValues(Metadata.CONTENT_TYPE).length);
+        assertEquals(WordPerfectParser.WP_5_1.toString(), r.metadata.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(1, r.metadata.getValues(HttpHeaders.CONTENT_TYPE).length);
         assertContains("<p>STUDY RESULTS: Existing condition", r.xml);
         assertContains("Seattle nonstop flights.</p>", r.xml);
     }
@@ -69,15 +66,11 @@ public class WordPerfectTest extends TikaTest {
         assertContains("this was deleted.", xml);
 
 
-        try (InputStream is = getResourceAsStream(
-                "/org/apache/tika/parser/wordperfect/tika-config.xml")) {
-            assertNotNull(is);
-            TikaConfig tikaConfig = new TikaConfig(is);
+        Parser p = TikaLoader.load(
+                        getConfigPath(WordPerfectTest.class, "tika-config-wordperfect-no-deleted.json"))
+                .loadParsers();
 
-            Parser p = tikaConfig.getParser();
-
-            xml = getXML("testWordPerfect.wpd", p).xml;
-            assertNotContained("this was deleted", xml);
-        }
+        xml = getXML("testWordPerfect.wpd", p).xml;
+        assertNotContained("this was deleted", xml);
     }
 }

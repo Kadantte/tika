@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.standard;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -37,6 +36,7 @@ import org.apache.cxf.jaxrs.client.WebClient;
 import org.apache.cxf.jaxrs.lifecycle.SingletonResourceProvider;
 import org.junit.jupiter.api.Test;
 
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.serialization.JsonMetadataList;
 import org.apache.tika.server.core.CXFTestBase;
@@ -51,13 +51,13 @@ public class RecursiveMetadataFilterTest extends CXFTestBase {
 
     @Override
     protected InputStream getTikaConfigInputStream() {
-        return getClass().getResourceAsStream("/config/TIKA-3137-include.xml");
+        return getClass().getResourceAsStream("/configs/TIKA-3137-include.json");
     }
 
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(RecursiveMetadataResource.class);
-        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource()));
+        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource(tikaResource)));
     }
 
     @Override
@@ -69,8 +69,9 @@ public class RecursiveMetadataFilterTest extends CXFTestBase {
 
     @Test
     public void testBasicFilter() throws Exception {
+        // request xml so the response exceeds the server's gzip threshold (markdown is too short)
         Response response = WebClient
-                .create(endPoint + META_PATH)
+                .create(endPoint + META_PATH + "/xml")
                 .accept("application/json")
                 .acceptEncoding("gzip")
                 .put(ClassLoader.getSystemResourceAsStream(TEST_RECURSIVE_DOC));
@@ -80,17 +81,17 @@ public class RecursiveMetadataFilterTest extends CXFTestBase {
         assertEquals(5, metadataList.size());
 
         Set<String> expectedKeys = new HashSet<>();
-        expectedKeys.add("X-TIKA:content");
+        expectedKeys.add("tk:content");
         expectedKeys.add("extended-properties:Application");
         expectedKeys.add("Content-Type");
         for (Metadata m : metadataList) {
             if (m
-                    .get(Metadata.CONTENT_TYPE)
+                    .get(HttpHeaders.CONTENT_TYPE)
                     .equals("image/emf")) {
                 fail("emf should have been filtered out");
             }
             if (m
-                    .get(Metadata.CONTENT_TYPE)
+                    .get(HttpHeaders.CONTENT_TYPE)
                     .startsWith("text/plain")) {
                 fail("text/plain should have been filtered out");
             }

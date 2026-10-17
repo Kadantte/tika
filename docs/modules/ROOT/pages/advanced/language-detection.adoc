@@ -1,0 +1,255 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Language Detection
+
+Tika includes two language detection implementations:
+
+* **CharSoupLanguageDetector** (`tika-langdetect-charsoup`) — a built-in hash-based
+  detector with zero runtime dependencies beyond `tika-core`. This is the
+  recommended detector for new deployments.
+* **OpenNLPDetector** (`tika-langdetect-opennlp`) — based on Apache OpenNLP's
+  language detection models.
+
+Both implement the `org.apache.tika.language.detect.LanguageDetector` SPI interface
+and are loaded automatically via Tika's service discovery.
+
+== Architecture: CharSoupLanguageDetector
+
+Character n-gram language identification (<<cavnar1994>>) in three stages:
+
+1. **Preprocessing** — truncate, strip URLs/emails, NFC normalize, case fold
+2. **Feature extraction** — n-grams and script features hashed via FNV-1a
+   (<<fnv>>) into a fixed-size bucket vector using the feature hashing trick
+   (<<weinberger2009>>)
+3. **Classification** — a linear multinomial model (<<bishop2006>>) with INT8
+   quantized weights (<<jacob2018>>), scored as raw logits
+
+=== Feature Extraction
+
+`SaltedNgramFeatureExtractor` distinguishes feature types by a one-byte salt
+prefix on the FNV hash chain rather than by sentinel characters, so an n-gram
+always contains N real characters. Word position (BOW / EOW / FULL_WORD / MID)
+is part of the salt.
+
+* **Character bigrams, trigrams, 4-grams** — every contiguous run within a word,
+  each carrying its position salt.
+* **Short complete words (1–4 chars)** — a FULL_WORD salt on the matching n-gram
+  order. This captures the function words ("the", "de", "и") that discriminate
+  many languages, without a separate word-unigram feature.
+* **Word bigrams** — a short anchor word (≤ 3 codepoints) plus the word after it,
+  e.g. "the X", "de X".
+* **CJK/kana unigrams** — individual ideographic and kana codepoints under their
+  own salt. CJK scripts pack far more information per character than alphabetic
+  scripts, and they have no word boundaries to anchor to.
+* **Script blocks** — per-script letter counts and script-transition counts,
+  giving the linear classifier explicit script signal.
+
+N-grams are not script-salted: different scripts occupy different codepoint
+ranges, so their hashes separate naturally. Feature vectors are L2-normalized.
+The shipped model uses 32,768 buckets.
+
+=== Preprocessing Pipeline
+
+Text goes through the following steps (shared between training and inference):
+
+[source]
+----
+raw text
+  → truncate to 100K chars
+  → strip URLs (https?://...) and emails (user@host)
+  → NFC Unicode normalization
+  → skip transparent characters (see below)
+  → case fold via Character.toLowerCase()
+  → extract features
+  → FNV-1a hash each feature into bucket vector
+  → L2 normalize
+----
+
+The 100K truncation is `CharSoupFeatureExtractor.MAX_TEXT_LENGTH`; the rolling
+buffer cap is adjustable with `setMaxLength(int)`. `hasEnoughText()` returns
+true at 10,000 buffered characters, so a streaming caller can stop feeding there.
+
+=== Transparent Character Handling
+
+Certain codepoints are treated as _transparent_ — they are skipped entirely so that
+base letters on either side form a contiguous bigram. This is critical for correct
+Arabic and Hebrew processing:
+
+* **Unicode nonspacing marks (Mn)** — Arabic harakat (fatha, damma, kasra, shadda,
+  sukun, tanwin, superscript alef) and Hebrew niqqud. Without this, diacritics
+  break words into isolated single-letter fragments because `Character.isLetter()`
+  returns `false` for `Mn` codepoints.
+
+* **Arabic Tatweel / Kashida (U+0640)** — a typographic stretching character classified
+  as a letter but carrying no linguistic information. "كتب" and "كـتـب" produce
+  identical bigrams.
+
+* **ZWNJ (U+200C) and ZWJ (U+200D)** — Zero Width Non-Joiner / Joiner, used
+  in Persian, Arabic, Urdu, and Kurdish to control cursive joining. These are not
+  word boundaries; bigrams span across them.
+
+A fast guard (`cp < 0x0300`) short-circuits the check for ASCII and Latin text,
+adding zero overhead to the common case.
+
+== The bundled model
+
+One model covers every text length:
+`org/apache/tika/langdetect/charsoup/langdetect-20260320.bin`, loaded statically
+by `CharSoupLanguageDetector`.
+
+[cols="1,3"]
+|===
+|Languages |204 (see xref:advanced/charsoup-supported-languages.adoc[the full list])
+|Corpus |Wikipedia dumps, supplemented by
+https://huggingface.co/datasets/allenai/MADLAD-400[MADLAD-400] where Wikipedia
+coverage is thin
+|Hash buckets |32,768
+|Feature extractor |`SaltedNgramFeatureExtractor` — trigrams, 4-grams, script
+blocks, word bigrams, L2 normalization
+|Size |6.4 MB on disk. The file is uncompressed and the weight matrix is retained
+as the single INT8 `byte[32768 x 204]` it is stored as, so the retained model is
+about the same size; the ~8.1 MB quoted in the benchmark logs is a measured
+used-heap delta across the load call, which includes transient buffers.
+|===
+
+The model file records the feature flags it was trained with, and the detector
+refuses to load if the extractor's flags disagree — a mismatch would produce
+silently wrong scores rather than an error.
+
+=== Scoring
+
+Inference works on raw logits; no softmax distribution is computed. Confidence is
+the *margin* between the top two logits after confusable groups are collapsed:
+`sigmoid(top − second)`. That is invariant to the number of classes, so the same
+threshold is meaningful for a short snippet and a full document. Per-class
+`rawScore` is `sigmoid(logit_c − best_competitor_logit)`, so the winner is above
+0.5 and everything else below.
+
+=== Tuning
+
+`CharSoupLanguageDetector` is registered as
+`@TikaComponent(name = "charsoup-language-detector")` and implements
+`SelfConfiguring`, so it resolves by friendly name in the `parse-context` JSON
+section — see
+xref:migration-to-4x/serialization-4x.adoc#discovering-friendly-names[Discovering the friendly name for a component].
+It exposes no config record yet; the programmatic knobs are `setMaxLength(int)`
+for the rolling buffer and `setPriors(Map)` for language priors.
+
+== Training the model
+
+Training is reproducible from source. For corpus preparation, training commands,
+and benchmark comparisons, see
+xref:advanced/language-detection-build.adoc[Building the Language Detector].
+
+== Model Format (LDM1)
+
+[source]
+----
+int32   magic 0x4C444D31 ("LDM1")
+int32   version (1, or 2 with feature flags)
+int32   numBuckets
+int32   numClasses
+int32   featureFlags                     (version 2 only)
+
+for each class:
+  uint16  label length
+  N bytes label (UTF-8)
+
+float32[numClasses]              per-class scales
+float32[numClasses]              per-class biases
+int8[numBuckets × numClasses]    weight matrix, bucket-major
+----
+
+The weight matrix is **bucket-major**: all class weights for a bucket are
+contiguous. Inference visits only non-zero buckets, so this is the layout that
+keeps that walk sequential.
+
+== WordTokenizer (tika-eval integration)
+
+The same preprocessing pipeline is exposed as a general-purpose word tokenizer,
+`org.apache.tika.langdetect.charsoup.core.WordTokenizer`, which is what
+`tika-eval` tokenizes with:
+
+* `tokenize(String)` — alphabetic and ideographic tokens only (CJK bigrams)
+* `tokenizeAlphanumeric(String, Consumer)` — also emits digit-only runs as tokens
+
+`tika-eval` needs the alphanumeric variant to distinguish alphabetic token count
+from total token count. The alpha-only variant is a separate code path so the
+language-detection hot path pays nothing for the numeric check.
+
+== References
+
+The language detector draws on several well-established techniques.
+
+[bibliography%unordered]
+- [[[cavnar1994]]] W. B. Cavnar and J. M. Trenkle,
+  "N-Gram-Based Text Categorization,"
+  in _Proceedings of the Third Annual Symposium on Document Analysis and
+  Information Retrieval (SDAIR-94)_, Las Vegas, NV, 1994, pp. 161–175. +
+  The foundational paper establishing character n-gram profiles as an effective
+  and language-independent text classification method. +
+  https://dsspace.uwindsor.ca/bitstream/handle/10680/1765/10-1.1.53.9367.pdf
+
+- [[[weinberger2009]]] K. Weinberger, A. Dasgupta, J. Attenberg, J. Langford,
+  and A. Smola,
+  "Feature Hashing for Large Scale Multitask Learning,"
+  in _Proceedings of the 26th International Conference on Machine Learning
+  (ICML)_, Montreal, Canada, 2009, pp. 1113–1120. +
+  Provides the theoretical justification for hashing features into a fixed-size
+  bucket vector instead of maintaining an explicit vocabulary. +
+  https://arxiv.org/abs/0902.2206
+
+- [[[fnv]]] G. Fowler, L. C. Noll, K.-P. Vo, and D. Eastlake,
+  "The FNV Non-Cryptographic Hash Algorithm,"
+  IETF Internet-Draft, 2012. +
+  The specific hash function used for feature hashing. FNV-1a provides
+  excellent distribution for short inputs (2–4 byte bigrams) with minimal
+  computation. +
+  https://datatracker.ietf.org/doc/html/draft-eastlake-fnv-17
+
+- [[[niu2011]]] F. Niu, B. Recht, C. Ré, and S. J. Wright,
+  "HOGWILD!: A Lock-Free Approach to Parallelizing Stochastic Gradient
+  Descent,"
+  in _Advances in Neural Information Processing Systems (NeurIPS)_, vol. 24,
+  2011, pp. 693–701. +
+  Proves that lock-free asynchronous SGD converges for sparse optimization
+  problems. This is the theoretical basis for the multi-threaded SGD phase. +
+  https://arxiv.org/abs/1106.5730
+
+- [[[loshchilov2019]]] I. Loshchilov and F. Hutter,
+  "Decoupled Weight Decay Regularization,"
+  in _International Conference on Learning Representations (ICLR)_, 2019. +
+  Describes the AdamW optimizer: Adam with decoupled weight decay, used for
+  the initial training phase. +
+  https://arxiv.org/abs/1711.05101
+
+- [[[bishop2006]]] C. M. Bishop,
+  _Pattern Recognition and Machine Learning_,
+  Springer, 2006, ISBN 978-0-387-31073-2, §4.3.4. +
+  Standard reference for multinomial logistic regression (softmax
+  classification), the model used for the final prediction layer.
+
+- [[[jacob2018]]] B. Jacob, S. Kligys, B. Chen, M. Zhu, M. Tang, A. Howard, H. Adam, and D. Kalenichenko,
+  "Quantization and Training of Neural Networks for Efficient
+  Integer-Arithmetic-Only Inference,"
+  in _Proceedings of the IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)_, 2018, pp. 2704–2713. +
+  Establishes the principles of INT8 quantization with per-channel scale factors
+  that we apply to compress the weight matrix from float32 to int8, reducing
+  model size by ~4× with negligible accuracy loss. +
+  https://arxiv.org/abs/1712.05877

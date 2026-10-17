@@ -1,7 +1,6 @@
 .svn
 target
 dependency-reduced-pom.xml
-.editorconfig
 .idea
 .classpath
 .project
@@ -10,19 +9,21 @@ dependency-reduced-pom.xml
 *.ipr
 *.iws
 *.bin
+# Allow the bundled ML model resources
+!**/src/main/resources/**/*.bin
 nbactions.xml
 nb-configuration.xml
 *.DS_Store
 *.tmp-inception
 *.snap
 .*.swp
-tika-deployment/tika-snap-app/parts/
-tika-deployment/tika-snap-app/prime/
-tika-deployment/tika-snap-app/snap/
-tika-deployment/tika-snap-app/stage/
-tika-deployment/tika-snap-app/test/
-tika-deployment/tika-snap-server/parts/
-tika-deployment/tika-snap-server/prime/
-tika-deployment/tika-snap-server/snap/
-tika-deployment/tika-snap-server/stage/
 
+tika-pipes/tika-pipes-plugins/tika-pipes-ignite/ignite
+tika-grpc/ignite
+.flattened-pom.xml
+
+# Python bytecode (e.g. from .skills scripts)
+__pycache__/
+*.pyc
+
+/.local_m2_repo/

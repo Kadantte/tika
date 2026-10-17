@@ -29,6 +29,7 @@ import org.apache.tika.Tika;
 import org.apache.tika.detect.microsoft.POIFSContainerDetector;
 import org.apache.tika.extractor.ContainerExtractor;
 import org.apache.tika.extractor.ParserContainerExtractor;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.microsoft.AbstractPOIContainerExtractionTest;
@@ -262,7 +263,7 @@ public class OOXMLContainerExtractionTest extends AbstractPOIContainerExtraction
         assertEquals("Microsoft_Office_Excel_Worksheet1.xlsx", handler.filenames.get(6));
         assertEquals("Microsoft_Office_Word_Document2.docx", handler.filenames.get(7));
         assertEquals("Microsoft_Office_Word_97_-_2003_Document1.doc", handler.filenames.get(8));
-        assertEquals("/docProps/thumbnail.jpeg", handler.filenames.get(9));
+        assertEquals("thumbnail.jpeg", handler.filenames.get(9));
 
         // But we do know their types
         assertEquals(TYPE_EMF, handler.mediaTypes.get(0));  // Icon of embedded office doc
@@ -312,7 +313,7 @@ public class OOXMLContainerExtractionTest extends AbstractPOIContainerExtraction
             List<Metadata> list = getRecursiveMetadata("testMSChart-govdocs-428996." + suffix);
             boolean found = false;
             for (Metadata m : list) {
-                if (m.get(Metadata.CONTENT_TYPE)
+                if (m.get(HttpHeaders.CONTENT_TYPE)
                         .equals(POIFSContainerDetector.MS_GRAPH_CHART.toString())) {
                     found = true;
                 }

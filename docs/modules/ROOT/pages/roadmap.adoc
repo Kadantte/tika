@@ -1,0 +1,64 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Apache Tika Roadmap
+
+Which Tika line runs on which Java, and how long each is supported.
+
+NOTE: Only 2.x and 3.x have shipped. Everything from 4.x down is a plan, not a commitment, and
+all dates are in Open Source Standard Time which does not always neatly align with traditional
+calendars.
+
+== Version Support
+
+[cols="1,1,1,2,2"]
+|===
+|Version |Java |Jakarta/javax |Released |End of support
+
+|2.x
+|8
+|javax
+|July 2021
+|April 2025 (ended)
+
+|3.x
+|11
+|jakarta
+|October 2024
+|March 2027
+
+|4.x
+|17
+|jakarta
+|not yet released (4.0.0 in progress)
+|TBD
+
+|5.x
+|21
+|jakarta
+|TBD
+|TBD
+
+|6.x
+|25
+|jakarta
+|TBD
+|TBD
+|===
+
+For what changes between 3.x and 4.x, see
+xref:migration-to-4x/index.adoc[Migrating to Tika 4.x].

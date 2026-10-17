@@ -22,11 +22,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.config.ServiceLoader;
 import org.apache.tika.detect.DefaultEncodingDetector;
 import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.mime.MediaTypeRegistry;
+import org.apache.tika.parser.enricher.ContentEnrichers;
 import org.apache.tika.renderer.CompositeRenderer;
 import org.apache.tika.renderer.Renderer;
 import org.apache.tika.utils.ServiceLoaderUtils;
@@ -38,6 +40,7 @@ import org.apache.tika.utils.ServiceLoaderUtils;
  *
  * @since Apache Tika 0.8
  */
+@TikaComponent(spi = false)
 public class DefaultParser extends CompositeParser {
 
     /**
@@ -45,12 +48,16 @@ public class DefaultParser extends CompositeParser {
      */
     private static final long serialVersionUID = 3612324825403757520L;
     private transient final ServiceLoader loader;
+    private final Collection<Class<? extends Parser>> excludedClasses;
 
     public DefaultParser(MediaTypeRegistry registry, ServiceLoader loader,
                          Collection<Class<? extends Parser>> excludeParsers,
                          EncodingDetector encodingDetector, Renderer renderer) {
         super(registry, getDefaultParsers(loader, encodingDetector, renderer, excludeParsers));
         this.loader = loader;
+        this.excludedClasses = excludeParsers != null ?
+                Collections.unmodifiableCollection(new ArrayList<>(excludeParsers)) :
+                Collections.emptySet();
     }
 
     public DefaultParser(MediaTypeRegistry registry, ServiceLoader loader,
@@ -59,6 +66,9 @@ public class DefaultParser extends CompositeParser {
                 getDefaultParsers(loader, new DefaultEncodingDetector(loader),
                         new CompositeRenderer(loader), excludeParsers));
         this.loader = loader;
+        this.excludedClasses = excludeParsers != null ?
+                Collections.unmodifiableCollection(new ArrayList<>(excludeParsers)) :
+                Collections.emptySet();
     }
 
     public DefaultParser(MediaTypeRegistry registry, ServiceLoader loader,
@@ -147,23 +157,20 @@ public class DefaultParser extends CompositeParser {
         }
     }
 
+    /**
+     * SPI parsers then dynamic providers, minus the enrichers: an enricher the classpath
+     * supplied is never dispatched to. Naming it under {@code "parsers"} makes it a parser.
+     */
     @Override
     public Map<MediaType, Parser> getParsers(ParseContext context) {
-        Map<MediaType, Parser> map = super.getParsers(context);
-
+        List<Parser> all = new ArrayList<>(super.getAllComponentParsers());
         if (loader != null) {
-            // Add dynamic parser service (they always override static ones)
-            MediaTypeRegistry registry = getMediaTypeRegistry();
-            List<Parser> parsers = loader.loadDynamicServiceProviders(Parser.class);
-            Collections.reverse(parsers); // best parser last
-            for (Parser parser : parsers) {
-                for (MediaType type : parser.getSupportedTypes(context)) {
-                    map.put(registry.normalize(type), parser);
-                }
-            }
+            List<Parser> dynamic = dynamicParsers();
+            Collections.reverse(dynamic); // best parser last
+            all.addAll(dynamic);
         }
-
-        return map;
+        all.removeIf(ContentEnrichers::isEnricher);
+        return buildParserMap(all, context);
     }
 
     @Override
@@ -171,8 +178,30 @@ public class DefaultParser extends CompositeParser {
         List<Parser> parsers = super.getAllComponentParsers();
         if (loader != null) {
             parsers = new ArrayList<>(parsers);
-            parsers.addAll(loader.loadDynamicServiceProviders(Parser.class));
+            parsers.addAll(dynamicParsers());
         }
         return parsers;
+    }
+
+    //a dynamic DefaultParser already merges every dynamic provider; nesting one (this
+    //parser included) delegates back into itself
+    private List<Parser> dynamicParsers() {
+        List<Parser> dynamic = loader.loadDynamicServiceProviders(Parser.class);
+        dynamic.removeIf(p -> p instanceof DefaultParser && isDynamic((DefaultParser) p));
+        return dynamic;
+    }
+
+    private static boolean isDynamic(DefaultParser parser) {
+        return parser.loader != null && parser.loader.isDynamic();
+    }
+
+    /**
+     * Returns the classes that were explicitly excluded when constructing this parser.
+     * Used for round-trip serialization to preserve exclusion configuration.
+     *
+     * @return unmodifiable collection of excluded parser classes, never null
+     */
+    public Collection<Class<? extends Parser>> getExcludedClasses() {
+        return excludedClasses;
     }
 }

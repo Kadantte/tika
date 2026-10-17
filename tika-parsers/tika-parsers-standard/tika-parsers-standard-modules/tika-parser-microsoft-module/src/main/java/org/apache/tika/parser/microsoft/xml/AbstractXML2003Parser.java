@@ -17,9 +17,7 @@
 package org.apache.tika.parser.microsoft.xml;
 
 import java.io.IOException;
-import java.io.InputStream;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
@@ -27,6 +25,7 @@ import org.xml.sax.helpers.AttributesImpl;
 
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.WriteLimitReachedException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.OfficeOpenXMLCore;
@@ -39,6 +38,7 @@ import org.apache.tika.parser.xml.ElementMetadataHandler;
 import org.apache.tika.sax.EmbeddedContentHandler;
 import org.apache.tika.sax.TaggedContentHandler;
 import org.apache.tika.sax.TeeContentHandler;
+import org.apache.tika.sax.XHTMLBalancingHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.apache.tika.utils.XMLReaderUtils;
 
@@ -82,25 +82,40 @@ public abstract class AbstractXML2003Parser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         setContentType(metadata);
 
-        final XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        final XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
-        TaggedContentHandler tagged = new TaggedContentHandler(xhtml);
+        // Wrap xhtml in a balancing handler so that if the inner SAX parser
+        // aborts mid-element (e.g., on truncated input -- common in crawled
+        // sources clipped to 1MB), we can drain the open elements before
+        // the finally block calls xhtml.endDocument(). Without this drain
+        // the trailing </body></html> mismatches the unclosed <p>/<tr>/etc.
+        // left on the wire, and StrictXHTMLValidator masks the real parse
+        // error with a misleading well-formedness exception.
+        final XHTMLBalancingHandler balancer = new XHTMLBalancingHandler(xhtml);
+        TaggedContentHandler tagged = new TaggedContentHandler(balancer);
+        tis.setCloseShield();
         try {
-            //need to get new SAXParser because
-            //an attachment might require another SAXParser
-            //mid-parse
-            XMLReaderUtils.getSAXParser().parse(CloseShieldInputStream.wrap(stream),
-                    new EmbeddedContentHandler(
-                            getContentHandler(tagged, metadata, context)));
+            XMLReaderUtils.parseSAX(tis,
+                    new EmbeddedContentHandler(getContentHandler(tagged, metadata, context)),
+                    context);
         } catch (SAXException e) {
             WriteLimitReachedException.throwIfWriteLimitReached(e);
+            // Close anything the aborted parse left open, then propagate.
+            balancer.drainOpenElements();
             throw new TikaException("XML parse error", e);
+        } catch (IOException e) {
+            // Truncated streams etc. -- same problem as the SAX path: without
+            // a drain, the finally's xhtml.endDocument() throws on the
+            // unbalanced stack and masks the real IO error.
+            balancer.drainOpenElements();
+            throw e;
         } finally {
+            tis.removeCloseShield();
             xhtml.endDocument();
         }
     }

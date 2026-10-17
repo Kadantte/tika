@@ -17,14 +17,16 @@
 package org.apache.tika.parser.wordperfect;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Set;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -39,6 +41,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  *
  * @author Pascal Essiembre
  */
+@TikaComponent
 public class QuattroProParser implements Parser {
 
     private static final long serialVersionUID = 8941810225917012232L;
@@ -56,18 +59,18 @@ public class QuattroProParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        if (metadata.get(Metadata.CONTENT_TYPE) == null) {
-            metadata.set(Metadata.CONTENT_TYPE, QP_9.toString());
+        if (metadata.get(HttpHeaders.CONTENT_TYPE) == null) {
+            metadata.set(HttpHeaders.CONTENT_TYPE, QP_9.toString());
         }
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         QPWTextExtractor extractor = new QPWTextExtractor();
-        extractor.extract(stream, xhtml, metadata);
+        extractor.extract(tis, xhtml, metadata);
 
         xhtml.endDocument();
     }

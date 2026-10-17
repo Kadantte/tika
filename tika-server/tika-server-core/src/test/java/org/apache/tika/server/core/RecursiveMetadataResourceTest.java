@@ -14,11 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.server.core;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -32,6 +32,7 @@ import org.apache.cxf.jaxrs.client.WebClient;
 import org.apache.cxf.jaxrs.lifecycle.SingletonResourceProvider;
 import org.junit.jupiter.api.Test;
 
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.serialization.JsonMetadataList;
@@ -46,7 +47,7 @@ public class RecursiveMetadataResourceTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(RecursiveMetadataResource.class);
-        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource()));
+        sf.setResourceProvider(RecursiveMetadataResource.class, new SingletonResourceProvider(new RecursiveMetadataResource(tikaResource)));
     }
 
     @Override
@@ -67,74 +68,29 @@ public class RecursiveMetadataResourceTest extends CXFTestBase {
         List<Metadata> metadataList = JsonMetadataList.fromJson(reader);
         Metadata metadata = metadataList.get(0);
         assertEquals("Nikolai Lobachevsky", metadata.get("author"));
-        assertEquals("application/mock+xml", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/mock+xml", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertContains("some content", metadata.get(TikaCoreProperties.TIKA_CONTENT));
         assertContains("null pointer message", metadata.get(TikaCoreProperties.CONTAINER_EXCEPTION));
 
     }
-    /*
+
     @Test
-    public void testWriteLimitInAll() throws Exception {
-        //specify your file directory here
-        Path testDocs = Paths.get("..../tika-parsers/src/test/resources/test-documents");
-        for (File f : testDocs.toFile().listFiles()) {
-            if (f.isDirectory()) {
-                continue;
-            }
-            System.out.println(f.getName());
-            testWriteLimit(f);
-        }
+    public void testDefaultHandlerIsMarkdown() throws Exception {
+        // TIKA-4663: /rmeta with no handler now defaults to markdown (was xml).
+        String defaultContent = rmetaContent("");
+        assertEquals(rmetaContent("/markdown"), defaultContent,
+                "default /rmeta handler should be markdown");
+        assertNotEquals(rmetaContent("/xml"), defaultContent,
+                "default /rmeta handler should no longer be xml");
     }
-    private void testWriteLimit(File f) throws Exception {
-        Response response = WebClient.create(endPoint + META_PATH+"/text").accept(
-                "application/json")
-                .put(f);
-        assertEquals(200, response.getStatus());
+
+    private String rmetaContent(String handlerSuffix) throws Exception {
+        Response response = WebClient
+                .create(endPoint + META_PATH + handlerSuffix)
+                .accept("application/json")
+                .put(ClassLoader.getSystemResourceAsStream(TEST_NULL_POINTER));
         Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
-        List<Metadata> metadataList = JsonMetadataList.fromJson(reader);
-        int totalLen = 0;
-        StringBuilder sb = new StringBuilder();
-        for (Metadata m : metadataList) {
-            String txt = m.get(AbstractRecursiveParserWrapperHandler.TIKA_CONTENT);
-            sb.append(txt);
-            totalLen += (txt == null) ? 0 : txt.length();
-        }
-        String fullText = sb.toString();
-        Random r = new Random();
-        for (int i = 0; i < 20; i++) {
-            int writeLimit = r.nextInt(totalLen+100);
-            response = WebClient.create(endPoint + META_PATH+"/text").accept(
-                    "application/json")
-                    .header("writeLimit", Integer.toString(writeLimit)).put(f);
-            assertEquals(200, response.getStatus());
-            reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
-            List<Metadata> writeLimitMetadataList = JsonMetadataList.fromJson(reader);
-            int len = 0;
-            StringBuilder extracted = new StringBuilder();
-            for (Metadata m : writeLimitMetadataList) {
-                String txt = m.get(AbstractRecursiveParserWrapperHandler.TIKA_CONTENT);
-                len += (txt == null) ? 0 : txt.length();
-                extracted.append(txt);
-            }
-            if (totalLen > len) {
-                boolean wlr = false;
-                for (Metadata m : writeLimitMetadataList) {
-                    if ("true".equals(m.get(AbstractRecursiveParserWrapperHandler.WRITE_LIMIT_REACHED))) {
-                        wlr = true;
-                    }
-                }
-                System.out.println(f.getName() + " actualLen:" + len + " : writeLimit: "
-                        + writeLimit + " : totalLen: "+totalLen);
-                assertTrue(f.getName() + ": writelimit: " + writeLimit + " len: "+len,
-                        len <= writeLimit);
-                assertEquals(f.getName() +" writeLimit: " + writeLimit +
-                                " : fullLen:" + totalLen + " limitedLen: " +len,
-                        true, wlr);
-            } else if (len > totalLen) {
-                fail("len should never be > totalLen "+len + "  : "+ totalLen);
-            }
-        }
+        return JsonMetadataList.fromJson(reader).get(0).get(TikaCoreProperties.TIKA_CONTENT);
     }
-    */
 
 }

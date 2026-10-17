@@ -1,0 +1,173 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.digest;
+
+import java.io.IOException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.tika.io.CacheMemoryBudget;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Property;
+import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.utils.StringUtils;
+
+/**
+ * Digester that uses {@link TikaInputStream#enableRewind()} and {@link TikaInputStream#rewind()}
+ * to read the entire stream for digesting, then rewind for subsequent processing.
+ */
+public class InputStreamDigester implements Digester {
+
+    private static final String DIGEST_KEY_PREFIX =
+            TikaCoreProperties.TIKA_META_PREFIX + "digest" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+
+    private static final Map<String, Property> METADATA_KEY_PROPERTIES = new ConcurrentHashMap<>();
+
+    private final String algorithm;
+    private final Property metadataProperty;
+    private final Encoder encoder;
+
+    /**
+     * @param algorithm   name of the digest algorithm to retrieve from the Provider
+     * @param metadataKey the full metadata key to use when storing the digest
+     *                    (e.g., "tk:digest:MD5" or "tk:digest:SHA-256:BASE32")
+     * @param encoder     encoder to convert the byte array returned from the digester to a
+     *                    string
+     */
+    public InputStreamDigester(String algorithm, String metadataKey, Encoder encoder) {
+        this.algorithm = algorithm;
+        this.metadataProperty =
+                METADATA_KEY_PROPERTIES.computeIfAbsent(metadataKey, InputStreamDigester::mintProperty);
+        this.encoder = encoder;
+    }
+
+    // metadataKey is config-supplied (algorithm/encoding names), not document-derived; the
+    // usual tk:digest:* shape mints via the curated template factory (stays registered, so
+    // Metadata.reconstruct/Property.get resolve it), anything else keeps the public factory.
+    private static Property mintProperty(String metadataKey) {
+        if (metadataKey.startsWith(DIGEST_KEY_PREFIX)) {
+            return TikaCoreProperties.digestProperty(metadataKey.substring(DIGEST_KEY_PREFIX.length()));
+        }
+        return Property.internalText(metadataKey);
+    }
+
+    private static void setContentLength(long length, Metadata metadata) {
+        if (StringUtils.isBlank(metadata.get(HttpHeaders.CONTENT_LENGTH))) {
+            //only add it if it hasn't been populated already
+            metadata.set(HttpHeaders.CONTENT_LENGTH, Long.toString(length));
+        }
+    }
+
+    private MessageDigest newMessageDigest() {
+        try {
+            Provider provider = getProvider();
+            if (provider == null) {
+                return MessageDigest.getInstance(algorithm);
+            } else {
+                return MessageDigest.getInstance(algorithm, provider);
+            }
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalArgumentException(e);
+        }
+    }
+
+    /**
+     * When subclassing this, becare to ensure that your provider is
+     * thread-safe (not likely) or return a new provider with each call.
+     *
+     * @return provider to use to get the MessageDigest from the algorithm name.
+     * Default is to return null.
+     */
+    protected Provider getProvider() {
+        return null;
+    }
+
+    /**
+     * Digests the TikaInputStream and stores the result in metadata.
+     * <p>
+     * Uses {@link TikaInputStream#enableRewind()} to ensure the stream can be
+     * rewound after digesting, then calls {@link TikaInputStream#rewind()} to
+     * reset the stream for subsequent processing.
+     *
+     * @param tis          TikaInputStream to digest
+     * @param metadata     metadata in which to store the digest information
+     * @param parseContext ParseContext, which may carry a {@link CacheMemoryBudget}
+     * @throws IOException on IO problem or IllegalArgumentException if algorithm couldn't be found
+     */
+    @Override
+    public void digest(TikaInputStream tis, Metadata metadata, ParseContext parseContext)
+            throws IOException {
+        // Bridge the shared budget from ParseContext; TikaInputStream never sees ParseContext
+        CacheMemoryBudget budget =
+                (parseContext == null) ? null : parseContext.get(CacheMemoryBudget.class);
+        tis.enableRewind(budget);
+        // The parse re-reads what we are about to read. Where re-opening the source means
+        // inflating an embedded entry again, hold it in memory instead; a no-op for a file.
+        tis.tryRetainInMemory();
+
+        MessageDigest messageDigest = newMessageDigest();
+        byte[] buffer = new byte[8192];
+        long total = 0;
+        int read;
+        while ((read = tis.read(buffer)) != -1) {
+            messageDigest.update(buffer, 0, read);
+            total += read;
+        }
+
+        setContentLength(total, metadata);
+        metadata.set(metadataProperty, encoder.encode(messageDigest.digest()));
+
+        tis.rewind();
+    }
+
+    /** Streams: every write goes straight into the MessageDigest; close sets the values. */
+    @Override
+    public DigestSink digestSink(Metadata metadata, ParseContext parseContext) {
+        MessageDigest messageDigest = newMessageDigest();
+        return new DigestSink() {
+            private long total;
+
+            @Override
+            public void write(int b) throws IOException {
+                ensureOpen();
+                messageDigest.update((byte) b);
+                total++;
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) throws IOException {
+                ensureOpen();
+                messageDigest.update(b, off, len);
+                total += len;
+            }
+
+            @Override
+            protected void finish(boolean publish) {
+                if (publish) {
+                    setContentLength(total, metadata);
+                    metadata.set(metadataProperty, encoder.encode(messageDigest.digest()));
+                }
+            }
+        };
+    }
+}

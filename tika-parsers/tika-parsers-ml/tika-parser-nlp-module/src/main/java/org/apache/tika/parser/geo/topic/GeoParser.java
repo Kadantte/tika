@@ -1,7 +1,7 @@
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright owlocationNameEntitieship.
+ * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
@@ -14,12 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.geo.topic;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.MalformedURLException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.ArrayList;
@@ -35,20 +32,42 @@ import org.slf4j.LoggerFactory;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Property;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.geo.topic.gazetteer.GeoGazetteerClient;
 import org.apache.tika.parser.geo.topic.gazetteer.Location;
 
+/**
+ * Locations here are inferred from the text (NER + gazetteer) and stored under {@code geotopic:}
+ * (TOOL provenance) -- distinct from {@code Geographic}'s {@code geo:lat/long/alt/timestamp}
+ * (W3C Geo Vocabulary; FILE provenance, coordinates the file asserts about itself).
+ */
+@TikaComponent
 public class GeoParser implements Parser {
     private static final long serialVersionUID = -2241391757440215491L;
     private static final Logger LOG = LoggerFactory.getLogger(GeoParser.class);
     private static final MediaType MEDIA_TYPE = MediaType.application("geotopic");
     private static final Set<MediaType> SUPPORTED_TYPES = Collections.singleton(MEDIA_TYPE);
+
+    // Fixed, bounded vocabulary: the best-match location's fields.
+    private static final Property GEOGRAPHIC_NAME = Property.externalText("geotopic:name");
+    private static final Property GEOGRAPHIC_LONGITUDE = Property.externalText("geotopic:longitude");
+    private static final Property GEOGRAPHIC_LATITUDE = Property.externalText("geotopic:latitude");
+    // Alternate-location fields are index-suffixed per alternative (unbounded count), so they
+    // mint per call rather than as fixed constants; "geotopic:alt-" + text("name1") replaces the
+    // pre-existing "Optional_NAME1" key shape (LegacyKeyMigrationFilter bridges the two -- see
+    // its geotopicAlternateLocationRule).
+    private static final KeyPrefix ALTERNATE =
+            KeyPrefix.tool("geotopic:alt-", "GeoParser alternate-location index keys");
 
     private GeoParserConfig defaultConfig = new GeoParserConfig();
     private GeoGazetteerClient gazetteerClient;
@@ -57,6 +76,18 @@ public class GeoParser implements Parser {
     private URL modelUrl;
     private NameFinderME nameFinder;
     private boolean available;
+
+    public GeoParser() {
+        // Default constructor - uses default GeoParserConfig
+    }
+
+    public GeoParser(GeoParserConfig config) {
+        this.defaultConfig = config;
+    }
+
+    public GeoParser(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, GeoParserConfig.class));
+    }
 
     @Override
     public Set<MediaType> getSupportedTypes(ParseContext parseContext) {
@@ -97,7 +128,7 @@ public class GeoParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         /*----------------configure this parser by ParseContext Object---------------------*/
@@ -118,7 +149,7 @@ public class GeoParser implements Parser {
 
         /*----------------get locationNameEntities and best nameEntity for the
         input stream---------------------*/
-        extractor.getAllNameEntitiesfromInput(stream);
+        extractor.getAllNameEntitiesfromInput(tis);
         extractor.getBestNameEntity();
         ArrayList<String> locationNameEntities = extractor.locationNameEntities;
         String bestner = extractor.bestNameEntity;
@@ -134,14 +165,14 @@ public class GeoParser implements Parser {
 
         /* add resolved entities in metadata */
 
-        metadata.add("Geographic_NAME", geotag.location.getName());
-        metadata.add("Geographic_LONGITUDE", geotag.location.getLongitude());
-        metadata.add("Geographic_LATITUDE", geotag.location.getLatitude());
+        metadata.add(GEOGRAPHIC_NAME, geotag.location.getName());
+        metadata.add(GEOGRAPHIC_LONGITUDE, geotag.location.getLongitude());
+        metadata.add(GEOGRAPHIC_LATITUDE, geotag.location.getLatitude());
         for (int i = 0; i < geotag.alternatives.size(); ++i) {
             GeoTag alter = (GeoTag) geotag.alternatives.get(i);
-            metadata.add("Optional_NAME" + (i + 1), alter.location.getName());
-            metadata.add("Optional_LONGITUDE" + (i + 1), alter.location.getLongitude());
-            metadata.add("Optional_LATITUDE" + (i + 1), alter.location.getLatitude());
+            metadata.add(ALTERNATE, "name" + (i + 1), alter.location.getName());
+            metadata.add(ALTERNATE, "longitude" + (i + 1), alter.location.getLongitude());
+            metadata.add(ALTERNATE, "latitude" + (i + 1), alter.location.getLatitude());
         }
     }
 
@@ -156,29 +187,7 @@ public class GeoParser implements Parser {
         return this.available;
     }
 
-    public String getGazetteerRestEndpoint() {
-        return defaultConfig.getGazetteerRestEndpoint();
-    }
-
-    @Field
-    public void setGazetteerRestEndpoint(String gazetteerRestEndpoint) {
-        defaultConfig.setGazetteerRestEndpoint(gazetteerRestEndpoint);
-    }
-
-    public URL getNerModelUrl() {
-        return defaultConfig.getNerModelUrl();
-    }
-
-    /**
-     * @param nerModelUrl url for the NER model
-     * @throws IllegalArgumentException for a malformed URL
-     */
-    @Field
-    public void setNerModelUrl(String nerModelUrl) {
-        try {
-            defaultConfig.setNerModelUrl(new URL(nerModelUrl));
-        } catch (MalformedURLException e) {
-            throw new IllegalArgumentException("malformed url " + nerModelUrl, e);
-        }
+    public GeoParserConfig getDefaultConfig() {
+        return defaultConfig;
     }
 }

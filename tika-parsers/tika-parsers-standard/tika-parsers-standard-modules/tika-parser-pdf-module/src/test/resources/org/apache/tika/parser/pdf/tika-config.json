@@ -1,0 +1,10 @@
+{
+  "parsers": [
+    {
+      "pdf-parser": {
+        "sortByPosition": true,
+        "markedContent": { "strategy": "NONE" }
+      }
+    }
+  ]
+}

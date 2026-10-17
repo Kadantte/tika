@@ -1,4 +1,4 @@
-package org.apache.tika.server.standard;/*
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -14,6 +14,7 @@ package org.apache.tika.server.standard;/*
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.tika.server.standard;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,20 +49,25 @@ public class JsonMaxFieldLengthTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(TikaResource.class);
-        sf.setResourceProvider(TikaResource.class, new SingletonResourceProvider(new TikaResource()));
+        sf.setResourceProvider(TikaResource.class, new SingletonResourceProvider(tikaResource));
     }
 
     @Override
     protected void setUpProviders(JAXRSServerFactoryBean sf) {
         List<Object> providers = new ArrayList<>();
-        providers.add(new TikaServerParseExceptionMapper(false));
+        providers.add(new TikaServerParseExceptionMapper());
         providers.add(new JSONMessageBodyWriter());
         sf.setProviders(providers);
     }
 
     @Override
     protected InputStream getTikaConfigInputStream() {
-        return getClass().getResourceAsStream("/config/tika-config-json.xml");
+        return getClass().getResourceAsStream("/configs/tika-config-json.json");
+    }
+
+    @Override
+    protected InputStream getPipesConfigInputStream() {
+        return getClass().getResourceAsStream("/configs/tika-config-json.json");
     }
 
     @Test
@@ -76,8 +82,7 @@ public class JsonMaxFieldLengthTest extends CXFTestBase {
                 .toString()
                 .getBytes(UTF_8));
         Response response = WebClient
-                .create(endPoint + TIKA_PATH + "/text")
-                .accept("application/json")
+                .create(endPoint + TIKA_PATH + "/json/text")
                 .put(Files.newInputStream(tmp));
         Metadata metadata = JsonMetadata.fromJson(new InputStreamReader(((InputStream) response.getEntity()), StandardCharsets.UTF_8));
         String t = metadata.get(TikaCoreProperties.TIKA_CONTENT);

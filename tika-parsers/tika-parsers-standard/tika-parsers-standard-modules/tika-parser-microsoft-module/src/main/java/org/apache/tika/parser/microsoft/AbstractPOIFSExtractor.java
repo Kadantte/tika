@@ -20,6 +20,8 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
+import java.util.Locale;
 
 import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
 import org.apache.poi.hpsf.ClassID;
@@ -34,13 +36,15 @@ import org.apache.poi.util.IOUtils;
 import org.apache.poi.util.StringUtil;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.detect.zip.DefaultZipContainerDetector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.BoundedInputStream;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -59,7 +63,7 @@ abstract class AbstractPOIFSExtractor {
     protected final Metadata parentMetadata;//metadata of the parent/container document
     protected final OfficeParserConfig officeParserConfig;
     protected final ParseContext context;
-    private final EmbeddedDocumentUtil embeddedDocumentUtil;
+    private final EmbeddedDocumentExtractor embeddedDocumentExtractor;
     private PasswordProvider passwordProvider;
 
     protected AbstractPOIFSExtractor(ParseContext context) {
@@ -67,7 +71,7 @@ abstract class AbstractPOIFSExtractor {
     }
 
     protected AbstractPOIFSExtractor(ParseContext context, Metadata parentMetadata) {
-        embeddedDocumentUtil = new EmbeddedDocumentUtil(context);
+        embeddedDocumentExtractor = EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
 
         this.passwordProvider = context.get(PasswordProvider.class);
         this.officeParserConfig = context.get(OfficeParserConfig.class, new OfficeParserConfig());
@@ -75,13 +79,8 @@ abstract class AbstractPOIFSExtractor {
         this.context = context;
     }
 
-    // Note - these cache, but avoid creating the default TikaConfig if not needed
-    protected TikaConfig getTikaConfig() {
-        return embeddedDocumentUtil.getTikaConfig();
-    }
-
     protected Detector getDetector() {
-        return embeddedDocumentUtil.getDetector();
+        return EmbeddedDocumentUtil.getDetector(context);
     }
 
     /**
@@ -108,7 +107,7 @@ abstract class AbstractPOIFSExtractor {
                                           String mediaType, XHTMLContentHandler xhtml,
                                           boolean outputHtml)
             throws IOException, SAXException, TikaException {
-        handleEmbeddedResource(resource, new Metadata(), filename, relationshipID, storageClassID,
+        handleEmbeddedResource(resource, Metadata.newInstance(context), filename, relationshipID, storageClassID,
                 mediaType, xhtml, outputHtml);
     }
 
@@ -118,7 +117,7 @@ abstract class AbstractPOIFSExtractor {
                                           XHTMLContentHandler xhtml, boolean outputHtml)
             throws IOException, SAXException, TikaException {
 
-        try {
+        try (resource) {
             if (filename != null) {
                 embeddedMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, filename);
             }
@@ -130,14 +129,12 @@ abstract class AbstractPOIFSExtractor {
                         storageClassID.toString());
             }
             if (mediaType != null) {
-                embeddedMetadata.set(Metadata.CONTENT_TYPE, mediaType);
+                embeddedMetadata.set(HttpHeaders.CONTENT_TYPE, mediaType);
             }
 
-            if (embeddedDocumentUtil.shouldParseEmbedded(embeddedMetadata)) {
-                embeddedDocumentUtil.parseEmbedded(resource, xhtml, embeddedMetadata, outputHtml);
+            if (embeddedDocumentExtractor.shouldParseEmbedded(embeddedMetadata, context)) {
+                embeddedDocumentExtractor.parseEmbedded(resource, xhtml, embeddedMetadata, context, outputHtml);
             }
-        } finally {
-            resource.close();
         }
     }
 
@@ -156,7 +153,7 @@ abstract class AbstractPOIFSExtractor {
     protected void handleEmbeddedOfficeDoc(DirectoryEntry dir, String resourceName,
                                            XHTMLContentHandler xhtml, boolean outputHtml)
             throws IOException, SAXException, TikaException {
-        handleEmbeddedOfficeDoc(dir, new Metadata(), resourceName, xhtml, outputHtml);
+        handleEmbeddedOfficeDoc(dir, Metadata.newInstance(context), resourceName, xhtml, outputHtml);
     }
     /**
      * Handle an office document that's embedded at the POIFS level
@@ -173,30 +170,29 @@ abstract class AbstractPOIFSExtractor {
 
         if (ooxml != null) {
             // It's OOXML (has a ZipFile):
-            metadata.set(Metadata.CONTENT_LENGTH,
+            metadata.set(HttpHeaders.CONTENT_LENGTH,
                     Integer.toString(((DocumentEntry)ooxml).getSize()));
-            try (TikaInputStream stream = TikaInputStream
+            try (TikaInputStream tis = TikaInputStream
                     .get(new DocumentInputStream((DocumentEntry) ooxml))) {
 
                 Detector detector = new DefaultZipContainerDetector();
                 MediaType type = null;
                 try {
-                    type = detector.detect(stream, metadata);
+                    type = detector.detect(tis, metadata, context);
                 } catch (SecurityException e) {
                     throw e;
                 } catch (Exception e) {
                     //if there's a stream error while detecting, give up
-                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+                    EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
                     return;
                 }
-                handleEmbeddedResource(stream, metadata,null, dir.getName(), dir.getStorageClsid(),
+                handleEmbeddedResource(tis, metadata,null, dir.getName(), dir.getStorageClsid(),
                         type.toString(), xhtml, outputHtml);
                 return;
             }
         }
 
         // It's regular OLE2:
-
         // What kind of document is it?
         metadata.set(TikaCoreProperties.EMBEDDED_RELATIONSHIP_ID, dir.getName());
         if (dir.getStorageClsid() != null) {
@@ -214,29 +210,43 @@ abstract class AbstractPOIFSExtractor {
             //for Outlook try to use the title first so that we don't wind up with __substg1.0_37...
             //if that doesn't exist, backoff to rName
             //add the suffix
-            metadata.set(Metadata.CONTENT_TYPE, type.getType().toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.getType().toString());
             String name = tryToGetMsgTitle(dir, rName);
             if (! StringUtils.isBlank(name)) {
                 if (StringUtils.isBlank(type.getExtension())) {
                     metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, name);
                 } else {
                     metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
-                            name + '.' + type.getExtension());
+                            appendExtensionIfMissing(name, type.getExtension()));
+                    metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
                 }
             }
             parseEmbedded(dir, xhtml, metadata, outputHtml);
         } else {
-            metadata.set(Metadata.CONTENT_TYPE, type.getType().toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.getType().toString());
             if (! StringUtils.isBlank(rName)) {
                 if (StringUtils.isBlank(type.getExtension())) {
                     metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, rName);
                 } else {
                     metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY,
-                            rName + '.' + type.getExtension());
+                            appendExtensionIfMissing(rName, type.getExtension()));
+                    metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
                 }
             }
             parseEmbedded(dir, xhtml, metadata, outputHtml);
         }
+    }
+
+    private long estimateSize(DirectoryEntry dir) {
+        Iterator<Entry> entries = dir.getEntries();
+        long sz = 0;
+        while (entries.hasNext()) {
+            Entry entry = entries.next();
+            if (entry.isDocumentEntry()) {
+                sz += ((DocumentEntry)entry).getSize();
+            }
+        }
+        return sz;
     }
 
     private void extractOCXName(DirectoryEntry dir, Metadata metadata) {
@@ -268,14 +278,14 @@ abstract class AbstractPOIFSExtractor {
         }
     }
 
-    private void handleCompObj(DirectoryEntry dir, POIFSDocumentType type, String rName,
+    private void handleCompObj(DirectoryEntry parentDir, POIFSDocumentType type, String rName,
                                Metadata metadata, XHTMLContentHandler xhtml, boolean outputHtml)
-            throws IOException, SAXException {
+            throws IOException, SAXException, TikaException {
         //TODO: figure out if the equivalent of OLE 1.0's
         //getCommand() and getFileName() exist for OLE 2.0 to populate
         //TikaCoreProperties.ORIGINAL_RESOURCE_NAME
 
-        String contentsEntryName = getContentsEntryName(dir);
+        String contentsEntryName = getContentsEntryName(parentDir);
         if (contentsEntryName == null) {
             //log or record exception?
             return;
@@ -284,41 +294,43 @@ abstract class AbstractPOIFSExtractor {
         DocumentEntry contentsEntry;
 
         try {
-            contentsEntry = (DocumentEntry) dir.getEntry(contentsEntryName);
+            contentsEntry = (DocumentEntry) parentDir.getEntry(contentsEntryName);
         } catch (FileNotFoundException fnfe) {
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(fnfe, parentMetadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(fnfe, parentMetadata, context);
             return;
         }
 
         int length = contentsEntry.getSize();
-        DocumentInputStream inp = null;
+        //open once now so a broken entry is recorded here, not mid-parse
         try {
-            inp = new DocumentInputStream(contentsEntry);
+            new DocumentInputStream(contentsEntry).close();
         } catch (SecurityException e) {
             throw e;
         } catch (Exception e) {
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
             return;
         }
-        try (TikaInputStream tis = TikaInputStream.get(inp)) {
+        //the entry is in the container already: re-open it on rewind instead of
+        //caching a copy that a digest of a large object would spill to disk
+        try (TikaInputStream tis = TikaInputStream.get(
+                () -> new DocumentInputStream(contentsEntry), new TemporaryResources(), null)) {
             // Try to work out what it is
-            MediaType mediaType = getDetector().detect(tis, metadata);
+            MediaType mediaType = getDetector().detect(tis, metadata, context);
             String extension = type.getExtension();
             try {
                 MimeType mimeType =
-                        embeddedDocumentUtil.getMimeTypes().forName(mediaType.toString());
+                        EmbeddedDocumentUtil.getMimeTypes(context).forName(mediaType.toString());
                 extension = mimeType.getExtension();
             } catch (MimeTypeException mte) {
                 // No details on this type are known
             }
 
             // Record what we can do about it
-            metadata.set(Metadata.CONTENT_TYPE, mediaType.getType());
-            metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, rName + extension);
-            metadata.set(Metadata.CONTENT_LENGTH, Integer.toString(length));
-            parseEmbedded(dir, tis, xhtml, metadata, outputHtml);
-        } finally {
-            inp.close();
+            metadata.set(HttpHeaders.CONTENT_TYPE, mediaType.toString());
+            metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, appendExtensionIfMissing(rName, extension));
+            metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
+            metadata.set(HttpHeaders.CONTENT_LENGTH, Integer.toString(length));
+            parseEmbedded(parentDir, tis, xhtml, metadata, outputHtml);
         }
     }
 
@@ -345,7 +357,7 @@ abstract class AbstractPOIFSExtractor {
 
     private void handleOLENative(DirectoryEntry dir, POIFSDocumentType type, String rName,
                                  Metadata metadata, XHTMLContentHandler xhtml, boolean outputHtml)
-            throws IOException, SAXException {
+            throws IOException, SAXException, TikaException {
         byte[] data = null;
         try {
             // Try to un-wrap the OLE10Native record:
@@ -362,13 +374,16 @@ abstract class AbstractPOIFSExtractor {
                 metadata.add(TikaCoreProperties.ORIGINAL_RESOURCE_NAME, ole.getFileName());
             }
             data = ole.getDataBuffer();
-            metadata.set(Metadata.CONTENT_LENGTH, Integer.toString(data.length));
+            metadata.set(HttpHeaders.CONTENT_LENGTH, Integer.toString(data.length));
         } catch (Ole10NativeException ex) {
             // Not a valid OLE10Native record, skip it
         } catch (SecurityException e) {
             throw e;
         } catch (Exception e) {
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
+            return;
+        }
+        if (data == null) {
             return;
         }
         try (TikaInputStream tis = TikaInputStream.get(data)) {
@@ -376,35 +391,50 @@ abstract class AbstractPOIFSExtractor {
         }
     }
 
-    private void parseEmbedded(DirectoryEntry dir, TikaInputStream tis, XHTMLContentHandler xhtml,
+    private void parseEmbedded(DirectoryEntry parentDir, TikaInputStream tis, XHTMLContentHandler xhtml,
                                Metadata metadata, boolean outputHtml) throws IOException,
-            SAXException {
-        if (!embeddedDocumentUtil.shouldParseEmbedded(metadata)) {
+            SAXException, TikaException {
+        if (!embeddedDocumentExtractor.shouldParseEmbedded(metadata, context)) {
             return;
         }
-        if (dir.getStorageClsid() != null) {
+        if (parentDir.getStorageClsid() != null) {
             metadata.set(Office.EMBEDDED_STORAGE_CLASS_ID,
-                    dir.getStorageClsid().toString());
+                    parentDir.getStorageClsid().toString());
         }
-        embeddedDocumentUtil.parseEmbedded(tis, xhtml, metadata, outputHtml);
+        embeddedDocumentExtractor.parseEmbedded(tis, xhtml, metadata, context, outputHtml);
     }
 
     private void parseEmbedded(DirectoryEntry dir, XHTMLContentHandler xhtml, Metadata metadata,
                                boolean outputHtml)
-            throws IOException, SAXException {
-        if (!embeddedDocumentUtil.shouldParseEmbedded(metadata)) {
+            throws IOException, SAXException, TikaException {
+        if (!embeddedDocumentExtractor.shouldParseEmbedded(metadata, context)) {
             return;
         }
-        try (TikaInputStream tis = TikaInputStream.get(new byte[0])) {
-            tis.setOpenContainer(dir);
+        long sz = estimateSize(dir);
+        try (TikaInputStream tis = TikaInputStream.getFromContainer(dir, sz, metadata)) {
             if (dir.getStorageClsid() != null) {
                 metadata.set(Office.EMBEDDED_STORAGE_CLASS_ID,
                         dir.getStorageClsid().toString());
             }
-            embeddedDocumentUtil.parseEmbedded(tis, xhtml, metadata, outputHtml);
+            embeddedDocumentExtractor.parseEmbedded(tis, xhtml, metadata, context, outputHtml);
         }
     }
 
+
+    /**
+     * Appends {@code ext} to {@code name} only when {@code name} does not already end with it
+     * (case-insensitive). {@code ext} may or may not have a leading dot.
+     */
+    private static String appendExtensionIfMissing(String name, String ext) {
+        if (StringUtils.isBlank(ext)) {
+            return name;
+        }
+        String dotExt = ext.startsWith(".") ? ext : "." + ext;
+        if (name.toLowerCase(Locale.ROOT).endsWith(dotExt.toLowerCase(Locale.ROOT))) {
+            return name;
+        }
+        return name + dotExt;
+    }
 
     public static String tryToGetMsgTitle(DirectoryEntry node, String defaultVal) {
 

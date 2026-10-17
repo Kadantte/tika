@@ -17,10 +17,10 @@
 package org.apache.tika.parser.sas;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.text.Format;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -32,7 +32,9 @@ import com.epam.parso.impl.SasFileReaderImpl;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Database;
 import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.MachineMetadata;
@@ -49,6 +51,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * Processes the SAS7BDAT data columnar database file used by SAS and
  * other similar languages.
  */
+@TikaComponent
 public class SAS7BDATParser implements Parser {
     private static final long serialVersionUID = -2775485539937983150L;
 
@@ -61,14 +64,14 @@ public class SAS7BDATParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        metadata.set(Metadata.CONTENT_TYPE, TYPE_SAS7BDAT.toString());
+        metadata.set(HttpHeaders.CONTENT_TYPE, TYPE_SAS7BDAT.toString());
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
-        SasFileReader sas = new SasFileReaderImpl(stream);
+        SasFileReader sas = new SasFileReaderImpl(tis);
         SasFileProperties props = sas.getSasFileProperties();
 
         // Record the interesting parts of the file's metadata
@@ -139,7 +142,8 @@ public class SAS7BDATParser implements Parser {
         Object[] row = null;
         while ((row = sas.readNext()) != null) {
             xhtml.startElement("tr");
-            for (String val : DataWriterUtil.getRowValues(sas.getColumns(), row, formatMap)) {
+            // parso otherwise formats dates and percents with the JVM default locale
+            for (String val : DataWriterUtil.getRowValues(sas.getColumns(), row, Locale.US, formatMap)) {
                 // Use explicit start/end, rather than element, to 
                 //  ensure that empty cells still get output
                 xhtml.startElement("td");

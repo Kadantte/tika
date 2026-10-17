@@ -18,12 +18,16 @@ package org.apache.tika.parser.netcdf;
 
 import static org.apache.tika.TikaTest.assertContains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import java.io.InputStream;
+import java.text.DecimalFormatSymbols;
+import java.util.Locale;
 
 import org.junit.jupiter.api.Test;
 import org.xml.sax.ContentHandler;
 
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.ClimateForecast;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
@@ -38,22 +42,26 @@ public class NetCDFParserTest {
     @Test
     public void testParseGlobalMetadata() throws Exception {
         Parser parser = new NetCDFParser();
+        // TODO: netcdf-java formats with the default locale, so dimension sizes and a WMO
+        // code-table file name come out in the locale's digits; report upstream
+        assumeTrue(DecimalFormatSymbols.getInstance(Locale.getDefault()).getZeroDigit() == '0',
+                "netcdf-java needs ASCII digits in the default locale");
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = NetCDFParser.class
-                .getResourceAsStream("/test-documents/sresa1b_ncar_ccsm3_0_run1_200001.nc")) {
-            parser.parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = TikaInputStream.get(NetCDFParser.class
+                .getResourceAsStream("/test-documents/sresa1b_ncar_ccsm3_0_run1_200001.nc"))) {
+            parser.parse(tis, handler, metadata, new ParseContext());
         }
 
         assertEquals(metadata.get(TikaCoreProperties.TITLE), "model output prepared for IPCC AR4");
-        assertEquals(metadata.get(Metadata.CONTACT), "ccsm@ucar.edu");
-        assertEquals(metadata.get(Metadata.PROJECT_ID), "IPCC Fourth Assessment");
-        assertEquals(metadata.get(Metadata.CONVENTIONS), "CF-1.0");
-        assertEquals(metadata.get(Metadata.REALIZATION), "1");
-        assertEquals(metadata.get(Metadata.EXPERIMENT_ID),
+        assertEquals(metadata.get(ClimateForecast.CONTACT), "ccsm@ucar.edu");
+        assertEquals(metadata.get(ClimateForecast.PROJECT_ID), "IPCC Fourth Assessment");
+        assertEquals(metadata.get(ClimateForecast.CONVENTIONS), "CF-1.0");
+        assertEquals(metadata.get(ClimateForecast.REALIZATION), "1");
+        assertEquals(metadata.get(ClimateForecast.EXPERIMENT_ID),
                 "720 ppm stabilization experiment (SRESA1B)");
-        assertEquals(metadata.get("File-Type-Description"), "NetCDF-3/CDM");
+        assertEquals(metadata.get("netcdf:file-type-description"), "NetCDF-3/CDM");
 
         String content = handler.toString();
         assertContains("long_name = \"Surface area\"", content);

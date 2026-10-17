@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.HWPFOldDocument;
@@ -60,12 +61,14 @@ import org.xml.sax.helpers.AttributesImpl;
 
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.StringUtils;
 
 public class WordExtractor extends AbstractPOIFSExtractor {
 
@@ -76,6 +79,8 @@ public class WordExtractor extends AbstractPOIFSExtractor {
     private static final String LIST_DELIMITER = " ";
     private static final Map<String, TagAndStyle> fixedParagraphStyles = new HashMap<>();
     private static final TagAndStyle defaultParagraphStyle = new TagAndStyle("p", null);
+    private static final int MAX_STYLE_CLASS_LENGTH = 128;
+    private static final Pattern NON_STYLE_CLASS_CHARS = Pattern.compile("[^\\p{L}\\p{N}_-]");
     private static final Logger LOG = LoggerFactory.getLogger(WordExtractor.class);
 
     static {
@@ -104,10 +109,41 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         return count;
     }
 
-    /**
-     * Given a style name, return what tag should be used, and
-     * what style should be applied to it.
-     */
+    // blank == matches [\r\n\s]+ ( \s == [ \t\n\x0B\f\r] )
+    private static boolean isBlankParagraph(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c != '\r' && c != '\n' && c != ' ' && c != '\t' && c != 0x0B && c != '\f') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String cleanControlCharacters(String text) {
+        char[] chars = null;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            char r;
+            if (c == 30) {
+                r = UNICODECHAR_NONBREAKING_HYPHEN;
+            } else if (c == 31) {
+                r = UNICODECHAR_ZERO_WIDTH_SPACE;
+            } else if (c < 0x20) {
+                r = '\n';
+            } else {
+                r = c;
+            }
+            if (r != c) {
+                if (chars == null) {
+                    chars = text.toCharArray();
+                }
+                chars[i] = r;
+            }
+        }
+        return chars == null ? text : new String(chars);
+    }
+
     public static TagAndStyle buildParagraphTagAndStyle(String styleName, boolean isTable) {
 
         if (styleName == null || styleName.length() < 2) {
@@ -137,12 +173,28 @@ public class WordExtractor extends AbstractPOIFSExtractor {
             // Turn it into a H1 - H6 (H7+ isn't valid!)
             tag = "h" + Math.min(num, 6);
         } else {
-            styleClass = styleName.replace(' ', '_');
-            styleClass =
-                    styleClass.substring(0, 1).toLowerCase(Locale.ROOT) + styleClass.substring(1);
+            styleClass = toStyleClass(styleName);
         }
 
         return new TagAndStyle(tag, styleClass);
+    }
+
+    /**
+     * @return the XHTML class for a style name, e.g. "List Bullet" -&gt; "list_Bullet",
+     * or null for an empty name. Anything but letters, digits, '_' and '-' becomes '_',
+     * so a style name can never yield more than one class token.
+     */
+    public static String toStyleClass(String styleName) {
+        if (styleName == null || styleName.isEmpty()) {
+            return null;
+        }
+        // sanitize last: lowercasing can expand a letter into a disallowed combining mark
+        String styleClass =
+                styleName.substring(0, 1).toLowerCase(Locale.ROOT) + styleName.substring(1);
+        if (styleClass.length() > MAX_STYLE_CLASS_LENGTH) {
+            styleClass = styleClass.substring(0, MAX_STYLE_CLASS_LENGTH);
+        }
+        return NON_STYLE_CLASS_CHARS.matcher(styleClass).replaceAll("_");
     }
 
     protected void parse(POIFSFileSystem filesystem, XHTMLContentHandler xhtml)
@@ -193,21 +245,29 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         if (officeParserConfig.isIncludeShapeBasedContent()) {
             // Do everything else
             for (String paragraph : wordExtractor.getMainTextboxText()) {
-                xhtml.element("p", paragraph);
+                if (!StringUtils.isBlank(paragraph)) {
+                    xhtml.element("p", paragraph);
+                }
             }
         }
 
         for (String paragraph : wordExtractor.getFootnoteText()) {
-            xhtml.element("p", paragraph);
+            if (!StringUtils.isBlank(paragraph)) {
+                xhtml.element("p", paragraph);
+            }
         }
 
         for (String paragraph : wordExtractor.getCommentsText()) {
-            xhtml.element("p", paragraph);
-            hasComments = true;
+            if (!StringUtils.isBlank(paragraph)) {
+                xhtml.element("p", paragraph);
+                hasComments = true;
+            }
         }
 
         for (String paragraph : wordExtractor.getEndnoteText()) {
-            xhtml.element("p", paragraph);
+            if (!StringUtils.isBlank(paragraph)) {
+                xhtml.element("p", paragraph);
+            }
         }
 
         if (officeParserConfig.isIncludeHeadersAndFooters()) {
@@ -344,7 +404,7 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         }
 
         String text = p.text();
-        if (text.replaceAll("[\\r\\n\\s]+", "").isEmpty()) {
+        if (isBlankParagraph(text)) {
             // Skip empty paragraphs
             return 0;
         }
@@ -446,22 +506,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
 
         // Clean up the text
         String text = cr.text();
-        text = text.replace('\r', '\n');
         if (text.endsWith("\u0007")) {
             // Strip the table cell end marker
             text = text.substring(0, text.length() - 1);
         }
-
-        // Copied from POI's org/apache/poi/hwpf/converter/AbstractWordConverter.processCharacters:
-
-        // Non-breaking hyphens are returned as char 30
-        text = text.replace((char) 30, UNICODECHAR_NONBREAKING_HYPHEN);
-
-        // Non-required hyphens to zero-width space
-        text = text.replace((char) 31, UNICODECHAR_ZERO_WIDTH_SPACE);
-
-        // Control characters as line break
-        text = text.replaceAll("[\u0000-\u001f]", "\n");
+        text = cleanControlCharacters(text);
         xhtml.characters(text);
     }
 
@@ -599,7 +648,8 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         // Make up a name for the picture
         // There isn't one in the file, but we need to be able to reference
         //  the picture from the img tag and the embedded resource
-        String filename = "image" + pictureNumber + (extension.length() > 0 ? "." + extension : "");
+        String filename = EmbeddedDocumentUtil.EmbeddedResourcePrefix.IMAGE.getPrefix()
+                + "-" + pictureNumber + (extension.length() > 0 ? "." + extension : "");
 
         // Grab the mime type for the picture
         String mimeType = picture.getMimeType();
@@ -614,8 +664,11 @@ public class WordExtractor extends AbstractPOIFSExtractor {
         // Have we already output this one?
         // (Only expose each individual image once)
         if (!pictures.hasOutput(picture)) {
-            TikaInputStream stream = TikaInputStream.get(picture.getContent());
-            handleEmbeddedResource(stream, filename, null, mimeType, xhtml, false);
+            TikaInputStream tis = TikaInputStream.get(picture.getContent());
+            Metadata picMetadata = Metadata.newInstance(context);
+            picMetadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
+            handleEmbeddedResource(tis, picMetadata, filename, null,
+                    null, mimeType, xhtml, false);
             pictures.recordOutput(picture);
         }
     }

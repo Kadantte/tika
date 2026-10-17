@@ -28,6 +28,7 @@ import org.apache.poi.hpsf.DocumentSummaryInformation;
 import org.apache.poi.hpsf.NoPropertySetStreamException;
 import org.apache.poi.hpsf.PropertySet;
 import org.apache.poi.hpsf.SummaryInformation;
+import org.apache.poi.hpsf.Thumbnail;
 import org.apache.poi.hpsf.UnexpectedPropertySetTypeException;
 import org.apache.poi.poifs.filesystem.DirectoryNode;
 import org.apache.poi.poifs.filesystem.DocumentEntry;
@@ -46,6 +47,7 @@ import org.apache.tika.metadata.PagedText;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.utils.StringUtils;
+import org.apache.tika.utils.TikaDates;
 
 /**
  * Extractor for Common OLE2 (HPSF) metadata
@@ -60,6 +62,8 @@ public class SummaryExtractor {
             DocumentSummaryInformation.DEFAULT_STREAM_NAME.toUpperCase(Locale.US);
 
     private final Metadata metadata;
+
+    private byte[] thumbnailWmf;
 
     public SummaryExtractor(Metadata metadata) {
         this.metadata = metadata;
@@ -131,7 +135,16 @@ public class SummaryExtractor {
         }
     }
 
+    /**
+     * The document thumbnail stored in the SummaryInformation as a WMF, or
+     * null if there is none or it is not a metafile picture.
+     */
+    public byte[] getThumbnailWmf() {
+        return thumbnailWmf;
+    }
+
     private void parse(SummaryInformation summary) {
+        thumbnailWmf = extractThumbnailWmf(summary);
         set(TikaCoreProperties.TITLE, summary.getTitle());
         addMulti(metadata, TikaCoreProperties.CREATOR, summary.getAuthor());
         //make sure these are retrievable specifically
@@ -155,6 +168,25 @@ public class SummaryExtractor {
         set(Office.PAGE_COUNT, summary.getPageCount());
         if (summary.getPageCount() > 0) {
             metadata.set(PagedText.N_PAGES, summary.getPageCount());
+        }
+    }
+
+    /**
+     * PIDSI_THUMBNAIL is a clipboard object; Office stores the thumbnail as
+     * CF_METAFILEPICT, a WMF. Anything else, or a malformed one, yields null.
+     */
+    private static byte[] extractThumbnailWmf(SummaryInformation summary) {
+        byte[] raw = summary.getThumbnail();
+        if (raw == null || raw.length == 0) {
+            return null;
+        }
+        try {
+            byte[] wmf = new Thumbnail(raw).getThumbnailAsWMF();
+            return wmf != null && wmf.length > 0 ? wmf : null;
+        } catch (SecurityException e) {
+            throw e;
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -192,36 +224,25 @@ public class SummaryExtractor {
     private void parse(CustomProperties customProperties) {
         if (customProperties != null) {
             for (String name : customProperties.nameSet()) {
-                // Apply the custom prefix
-                String key = Office.USER_DEFINED_METADATA_NAME_PREFIX + name;
-
-                // Get, convert and save property value
+                // Get, convert and save property value. Custom property names are
+                // document-controlled, so write via the KeyPrefix route
+                // (Property.external* would register+intern one Property per name forever).
                 Object value = customProperties.get(name);
                 if (value instanceof String) {
-                    set(key, (String) value);
+                    metadata.add(Office.USER_DEFINED, name, (String) value);
                 } else if (value instanceof Date) {
-                    Property prop = Property.externalDate(key);
-                    metadata.set(prop, (Date) value);
+                    metadata.add(Office.USER_DEFINED, name, ((Date) value).toInstant());
                 } else if (value instanceof Boolean) {
-                    Property prop = Property.externalBoolean(key);
-                    metadata.set(prop, value.toString());
+                    metadata.add(Office.USER_DEFINED, name, value.toString());
                 } else if (value instanceof Long) {
-                    Property prop = Property.externalInteger(key);
-                    metadata.set(prop, ((Long) value).intValue());
+                    metadata.add(Office.USER_DEFINED, name,
+                            String.valueOf(((Long) value).intValue()));
                 } else if (value instanceof Double) {
-                    Property prop = Property.externalReal(key);
-                    metadata.set(prop, (Double) value);
+                    metadata.add(Office.USER_DEFINED, name, String.valueOf((Double) value));
                 } else if (value instanceof Integer) {
-                    Property prop = Property.externalInteger(key);
-                    metadata.set(prop, (Integer) value);
+                    metadata.add(Office.USER_DEFINED, name, String.valueOf((Integer) value));
                 }
             }
-        }
-    }
-
-    private void set(String name, String value) {
-        if (!StringUtils.isBlank(value)) {
-            metadata.set(name, value);
         }
     }
 
@@ -238,7 +259,8 @@ public class SummaryExtractor {
     }
 
     private void set(Property property, Date value) {
-        if (value != null) {
+        // FILETIMEs are often junk (e.g. year 31135)
+        if (value != null && TikaDates.inYearBounds(value.toInstant())) {
             metadata.set(property, value);
         }
     }
@@ -246,12 +268,6 @@ public class SummaryExtractor {
     private void set(Property property, int value) {
         if (value > 0) {
             metadata.set(property, value);
-        }
-    }
-
-    private void set(String name, long value) {
-        if (value > 0) {
-            metadata.set(name, Long.toString(value));
         }
     }
 

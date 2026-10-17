@@ -20,9 +20,9 @@ import static java.lang.String.valueOf;
 import static java.util.Collections.singleton;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Set;
 
+import com.pff.PSTException;
 import com.pff.PSTFile;
 import com.pff.PSTFolder;
 import com.pff.PSTMessage;
@@ -30,10 +30,12 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.PST;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -45,6 +47,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
 /**
  * Parser for MS Outlook PST email storage files
  */
+@TikaComponent
 public class OutlookPSTParser implements Parser {
 
     public static final MediaType MS_OUTLOOK_PST_MIMETYPE =
@@ -63,23 +66,23 @@ public class OutlookPSTParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
         // Use the delegate parser to parse the contained document
         EmbeddedDocumentExtractor embeddedExtractor =
                 EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
 
-        metadata.set(Metadata.CONTENT_TYPE, MS_OUTLOOK_PST_MIMETYPE.toString());
+        metadata.set(HttpHeaders.CONTENT_TYPE, MS_OUTLOOK_PST_MIMETYPE.toString());
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
-        TikaInputStream in = TikaInputStream.get(stream);
         PSTFile pstFile = null;
         try {
-            pstFile = new PSTFile(in.getFile().getPath());
-            metadata.set(Metadata.CONTENT_LENGTH, valueOf(pstFile.getFileHandle().length()));
+            tis.setCloseShield();
+            pstFile = new PSTFile(tis.getFile());
+            metadata.set(HttpHeaders.CONTENT_LENGTH, valueOf(pstFile.getFileHandle().length()));
             boolean isValid = pstFile.getFileHandle().getFD().valid();
             metadata.set(PST.IS_VALID, isValid);
             if (pstFile.getPSTFileType() == PSTFile.PST_TYPE_2013_UNICODE) {
@@ -87,7 +90,7 @@ public class OutlookPSTParser implements Parser {
                         "OST 2013 support not added yet. It will be when https://github.com/rjohnsondev/java-libpst/issues/60 is fixed.");
             }
             if (isValid) {
-                parseFolder(xhtml, pstFile.getRootFolder(), "/", embeddedExtractor);
+                parseFolder(xhtml, pstFile.getRootFolder(), "/", embeddedExtractor, context);
             }
         } catch (TikaException e) {
             throw e;
@@ -101,23 +104,28 @@ public class OutlookPSTParser implements Parser {
                     //swallow closing exception
                 }
             }
+            tis.removeCloseShield();
         }
 
         xhtml.endDocument();
     }
 
     private void parseFolder(XHTMLContentHandler handler, PSTFolder pstFolder, String folderPath,
-                             EmbeddedDocumentExtractor embeddedExtractor) throws Exception {
+                             EmbeddedDocumentExtractor embeddedExtractor, ParseContext context) throws Exception {
         if (pstFolder.getContentCount() > 0) {
             PSTMessage pstMail = (PSTMessage) pstFolder.getNextChild();
             while (pstMail != null) {
-                Metadata metadata = new Metadata();
+                Metadata metadata = Metadata.newInstance(context);
+                metadata.set(HttpHeaders.CONTENT_TYPE, PSTMailItemParser.PST_MAIL_ITEM_STRING);
                 metadata.set(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE, PSTMailItemParser.PST_MAIL_ITEM_STRING);
-                metadata.set(PST.PST_FOLDER_PATH, folderPath);
-                try (TikaInputStream tis = TikaInputStream.get(new byte[0])) {
-                    tis.setOpenContainer(pstMail);
-                    metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, pstMail.getSubject() + ".msg");
-                    embeddedExtractor.parseEmbedded(tis, handler, metadata, true);
+                String resourceName = pstMail.getSubject() + ".msg";
+                String internalPath = folderPath.endsWith("/") ?
+                        folderPath + resourceName : folderPath + "/" + resourceName;
+                metadata.set(TikaCoreProperties.INTERNAL_PATH, internalPath);
+                metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, resourceName);
+                long length = estimateSize(pstMail);
+                try (TikaInputStream tis = TikaInputStream.getFromContainer(pstMail, length, metadata)) {
+                    embeddedExtractor.parseEmbedded(tis, handler, metadata, context, true);
                 }
                 pstMail = (PSTMessage) pstFolder.getNextChild();
             }
@@ -129,9 +137,33 @@ public class OutlookPSTParser implements Parser {
                 handler.element("h1", pstSubFolder.getDisplayName());
                 String subFolderPath = folderPath.endsWith("/") ? folderPath + pstSubFolder.getDisplayName() :
                         folderPath + "/" + pstFolder.getDisplayName();
-                parseFolder(handler, pstSubFolder, subFolderPath, embeddedExtractor);
+                parseFolder(handler, pstSubFolder, subFolderPath, embeddedExtractor, context);
                 handler.endElement("div");
             }
         }
+    }
+
+    static protected long estimateSize(PSTMessage attachedEmail) {
+        //we do this for a rough estimate of email body size
+        //so that we don't get a zip bomb exception on exceedingly large msgs.
+        long sz = 0;
+        sz += getStringLength(attachedEmail.getBody());
+        try {
+            sz += getStringLength(attachedEmail.getRTFBody());
+        } catch (PSTException | IOException e) {
+            //swallow
+        }
+        sz += getStringLength(attachedEmail.getBodyHTML());
+        sz += getStringLength(attachedEmail.getSubject());
+        //complete heuristic to account for from, to, etc...
+        sz += 100_000;
+        return sz;
+    }
+
+    private static long getStringLength(String s) {
+        if (s == null) {
+            return 0;
+        }
+        return s.length();
     }
 }

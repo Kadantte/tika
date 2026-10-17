@@ -20,12 +20,13 @@ import static org.apache.tika.TikaTest.assertContains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
-import java.io.InputStream;
 import java.util.Arrays;
 
 import org.junit.jupiter.api.Test;
 import org.xml.sax.ContentHandler;
 
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.OfficeOpenXMLCore;
@@ -44,26 +45,26 @@ public class ProjectParserTest {
 
     @Test
     public void testProject2003() throws Exception {
-        try (InputStream input = ProjectParserTest.class
-                .getResourceAsStream("/test-documents/testPROJECT2003.mpp")) {
-            doTestProject(input);
+        try (TikaInputStream tis = TikaInputStream.get(ProjectParserTest.class
+                .getResourceAsStream("/test-documents/testPROJECT2003.mpp"))) {
+            doTestProject(tis);
         }
     }
 
     @Test
     public void testProject2007() throws Exception {
-        try (InputStream input = ProjectParserTest.class
-                .getResourceAsStream("/test-documents/testPROJECT2007.mpp")) {
-            doTestProject(input);
+        try (TikaInputStream tis = TikaInputStream.get(ProjectParserTest.class
+                .getResourceAsStream("/test-documents/testPROJECT2007.mpp"))) {
+            doTestProject(tis);
         }
     }
 
-    private void doTestProject(InputStream input) throws Exception {
+    private void doTestProject(TikaInputStream tis) throws Exception {
         Metadata metadata = new Metadata();
         ContentHandler handler = new BodyContentHandler();
-        new OfficeParser().parse(input, handler, metadata, new ParseContext());
+        new OfficeParser().parse(tis, handler, metadata, new ParseContext());
 
-        assertEquals("application/vnd.ms-project", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.ms-project", metadata.get(HttpHeaders.CONTENT_TYPE));
 
         assertEquals("The quick brown fox jumps over the lazy dog",
                 metadata.get(TikaCoreProperties.TITLE));

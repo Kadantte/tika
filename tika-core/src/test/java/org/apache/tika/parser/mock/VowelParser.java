@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.mock;
 
 
@@ -25,7 +24,6 @@ import org.w3c.dom.NamedNodeMap;
 import org.w3c.dom.Node;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Field;
 import org.apache.tika.sax.XHTMLContentHandler;
 
 /**
@@ -35,7 +33,6 @@ public class VowelParser extends MockParser {
 
     private static final long serialVersionUID = 1L;
 
-    @Field
     private String vowel = "aeiou";
 
     protected void write(Node action, XHTMLContentHandler xhtml) throws SAXException {

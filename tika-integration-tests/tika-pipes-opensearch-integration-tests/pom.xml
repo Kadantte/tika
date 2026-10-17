@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-integration-tests</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
 
@@ -37,13 +37,22 @@
     </dependency>
     <dependency>
       <groupId>${project.groupId}</groupId>
-      <artifactId>tika-emitter-opensearch</artifactId>
+      <artifactId>tika-pipes-file-system</artifactId>
       <version>${project.version}</version>
       <scope>test</scope>
+      <type>zip</type>
+    </dependency>
+    <!-- The zip deps are what force reactor ordering; the zips are consumed by dependency-plugin below. -->
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>tika-pipes-opensearch</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+      <type>zip</type>
     </dependency>
     <dependency>
       <groupId>${project.groupId}</groupId>
-      <artifactId>tika-pipes-reporter-opensearch</artifactId>
+      <artifactId>tika-pipes-opensearch</artifactId>
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
@@ -63,7 +72,7 @@
     </dependency>
     <dependency>
       <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -73,17 +82,49 @@
     <plugin>
       <groupId>org.apache.rat</groupId>
       <artifactId>apache-rat-plugin</artifactId>
-      <version>${rat.version}</version>
       <configuration>
-        <excludes>
-          <exclude>src/test/resources/opensearch/*.json</exclude>
-        </excludes>
+        <inputExcludes>
+          <inputExclude>src/test/resources/opensearch/*.json</inputExclude>
+        </inputExcludes>
     </configuration>
   </plugin>
-</plugins>
+      <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-dependency-plugin</artifactId>
+      <executions>
+      <execution>
+        <id>copy-plugins</id>
+        <phase>process-test-resources</phase>
+        <goals>
+          <goal>copy</goal>
+<!--          <goal>copy</goal>-->
+        </goals>
+        <configuration>
+          <outputDirectory>${project.build.directory}/plugins</outputDirectory>
+          <artifactItems>
+            <artifactItem>
+              <groupId>org.apache.tika</groupId>
+              <artifactId>tika-pipes-file-system</artifactId>
+              <version>${project.version}</version>
+              <type>zip</type>
+              <overWrite>true</overWrite>
+            </artifactItem>
+            <artifactItem>
+              <groupId>org.apache.tika</groupId>
+              <artifactId>tika-pipes-opensearch</artifactId>
+              <version>${project.version}</version>
+              <type>zip</type>
+              <overWrite>true</overWrite>
+            </artifactItem>
+          </artifactItems>
+        </configuration>
+      </execution>
+      </executions>
+      </plugin>
+    </plugins>
     </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

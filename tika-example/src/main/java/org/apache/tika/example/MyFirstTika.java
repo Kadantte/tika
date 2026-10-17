@@ -14,24 +14,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import java.io.File;
-import java.io.InputStream;
 import java.nio.file.Paths;
 
 import org.apache.commons.io.FileUtils;
 import org.xml.sax.ContentHandler;
 
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.config.loader.TikaLoader;
 import org.apache.tika.detect.Detector;
 import org.apache.tika.io.TikaInputStream;
-import org.apache.tika.langdetect.optimaize.OptimaizeLangDetector;
 import org.apache.tika.language.detect.LanguageDetector;
 import org.apache.tika.language.detect.LanguageResult;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -51,10 +49,10 @@ import org.apache.tika.sax.BodyContentHandler;
 public class MyFirstTika {
     public static void main(String[] args) throws Exception {
         String filename = args[0];
-        TikaConfig tikaConfig = TikaConfig.getDefaultConfig();
+        TikaLoader tikaLoader = TikaLoader.loadDefault();
 
         Metadata metadata = new Metadata();
-        String text = parseUsingComponents(filename, tikaConfig, metadata);
+        String text = parseUsingComponents(filename, tikaLoader, metadata);
         System.out.println("Parsed Metadata: ");
         System.out.println(metadata);
         System.out.println("Parsed Text: ");
@@ -63,52 +61,53 @@ public class MyFirstTika {
         System.out.println("-------------------------");
 
         metadata = new Metadata();
-        text = parseUsingAutoDetect(filename, tikaConfig, metadata);
+        text = parseUsingAutoDetect(filename, tikaLoader, metadata);
         System.out.println("Parsed Metadata: ");
         System.out.println(metadata);
         System.out.println("Parsed Text: ");
         System.out.println(text);
     }
 
-    public static String parseUsingAutoDetect(String filename, TikaConfig tikaConfig, Metadata metadata) throws Exception {
+    public static String parseUsingAutoDetect(String filename, TikaLoader tikaLoader, Metadata metadata) throws Exception {
         System.out.println("Handling using AutoDetectParser: [" + filename + "]");
 
-        AutoDetectParser parser = new AutoDetectParser(tikaConfig);
+        Parser parser = tikaLoader.loadAutoDetectParser();
         ContentHandler handler = new BodyContentHandler();
-        TikaInputStream stream = TikaInputStream.get(Paths.get(filename), metadata);
-        parser.parse(stream, handler, metadata, new ParseContext());
+        TikaInputStream tis = TikaInputStream.get(Paths.get(filename), metadata);
+        parser.parse(tis, handler, metadata, new ParseContext());
         return handler.toString();
     }
 
-    public static String parseUsingComponents(String filename, TikaConfig tikaConfig, Metadata metadata) throws Exception {
-        MimeTypes mimeRegistry = tikaConfig.getMimeRepository();
+    public static String parseUsingComponents(String filename, TikaLoader tikaLoader, Metadata metadata) throws Exception {
+        MimeTypes mimeRegistry = tikaLoader.getMimeTypes();
 
         System.out.println("Examining: [" + filename + "]");
 
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, filename);
-        System.out.println("The MIME type (based on filename) is: [" + mimeRegistry.detect(null, metadata) + "]");
+        System.out.println("The MIME type (based on filename) is: [" + mimeRegistry.detect(null, metadata, new ParseContext()) + "]");
 
-        InputStream stream = TikaInputStream.get(Paths.get(filename));
-        System.out.println("The MIME type (based on MAGIC) is: [" + mimeRegistry.detect(stream, metadata) + "]");
+        try (TikaInputStream tis = TikaInputStream.get(Paths.get(filename))) {
+            System.out.println("The MIME type (based on MAGIC) is: [" + mimeRegistry.detect(tis, metadata, new ParseContext()) + "]");
+        }
 
-        stream = TikaInputStream.get(Paths.get(filename));
-        Detector detector = tikaConfig.getDetector();
-        System.out.println("The MIME type (based on the Detector interface) is: [" + detector.detect(stream, metadata) + "]");
+        Detector detector = tikaLoader.loadDetectors();
+        try (TikaInputStream tis = TikaInputStream.get(Paths.get(filename))) {
+            System.out.println("The MIME type (based on the Detector interface) is: [" + detector.detect(tis, metadata, new ParseContext()) + "]");
 
-        LanguageDetector langDetector = new OptimaizeLangDetector().loadModels();
-        LanguageResult lang = langDetector.detect(FileUtils.readFileToString(new File(filename), UTF_8));
+            LanguageDetector langDetector = LanguageDetector.getDefaultLanguageDetector().loadModels();
+            LanguageResult lang = langDetector.detect(FileUtils.readFileToString(new File(filename), UTF_8));
 
-        System.out.println("The language of this content is: [" + lang.getLanguage() + "]");
+            System.out.println("The language of this content is: [" + lang.getLanguage() + "]");
 
-        // Get a non-detecting parser that handles all the types it can
-        Parser parser = tikaConfig.getParser();
-        // Tell it what we think the content is
-        MediaType type = detector.detect(stream, metadata);
-        metadata.set(Metadata.CONTENT_TYPE, type.toString());
-        // Have the file parsed to get the content and metadata
-        ContentHandler handler = new BodyContentHandler();
-        parser.parse(stream, handler, metadata, new ParseContext());
-
-        return handler.toString();
+            // Get a non-detecting parser that handles all the types it can
+            Parser parser = tikaLoader.loadParsers();
+            // Tell it what we think the content is
+            MediaType type = detector.detect(tis, metadata, new ParseContext());
+            metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
+            // Have the file parsed to get the content and metadata
+            ContentHandler handler = new BodyContentHandler();
+            parser.parse(tis, handler, metadata, new ParseContext());
+            return handler.toString();
+        }
     }
 }

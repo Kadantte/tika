@@ -19,7 +19,6 @@ package org.apache.tika.parser.mail;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -50,6 +49,8 @@ import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.FileSystem;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Message;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
@@ -59,13 +60,12 @@ import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.csv.TextAndCSVParser;
 import org.apache.tika.parser.html.JSoupParser;
-import org.apache.tika.parser.mailcommons.MailDateParser;
-import org.apache.tika.parser.mailcommons.MailUtil;
 import org.apache.tika.parser.txt.TXTParser;
 import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.EmbeddedContentHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 import org.apache.tika.utils.StringUtils;
+import org.apache.tika.utils.TikaDates;
 
 /**
  * Bridge between mime4j's content handler and the generic Sax content handler
@@ -111,9 +111,9 @@ class MailContentHandler implements ContentHandler {
         // in order to specify the mime type of the
         // sub part without damaging the main metadata
 
-        Metadata submd = new Metadata();
-        submd.set(Metadata.CONTENT_TYPE, body.getMimeType());
-        submd.set(Metadata.CONTENT_ENCODING, body.getCharset());
+        Metadata submd = Metadata.newInstance(parseContext);
+        submd.set(HttpHeaders.CONTENT_TYPE, body.getMimeType());
+        submd.set(HttpHeaders.CONTENT_ENCODING, body.getCharset());
 
         // TIKA-2455: flag the containing type.
         if (parts.size() > 0) {
@@ -169,10 +169,13 @@ class MailContentHandler implements ContentHandler {
             for (Entry<String, String> param : contentDispositionParameters.entrySet()) {
                 contentDisposition.append("; ").append(param.getKey()).append("=\"")
                         .append(param.getValue()).append('"');
+                // RFC 2183: the attached file's file-system dates, not the document's own
                 if ("creation-date".equalsIgnoreCase(param.getKey())) {
-                    tryToAddDate(param.getValue(), TikaCoreProperties.CREATED, submd);
+                    tryToAddDate(param.getValue(), FileSystem.CREATED, submd);
                 } else if ("modification-date".equalsIgnoreCase(param.getKey())) {
-                    tryToAddDate(param.getValue(), TikaCoreProperties.MODIFIED, submd);
+                    tryToAddDate(param.getValue(), FileSystem.MODIFIED, submd);
+                } else if ("read-date".equalsIgnoreCase(param.getKey())) {
+                    tryToAddDate(param.getValue(), FileSystem.ACCESSED, submd);
                 }
                 //do anything with "size"?
             }
@@ -193,12 +196,12 @@ class MailContentHandler implements ContentHandler {
                 //prefer the content disposition file name over the "name" param in the content-type
                 submd.set(TikaCoreProperties.RESOURCE_NAME_KEY, contentDispositionFileName);
             }
-            submd.set(Metadata.CONTENT_DISPOSITION, contentDisposition.toString());
+            submd.set(HttpHeaders.CONTENT_DISPOSITION, contentDisposition.toString());
         }
     }
 
     private void tryToAddDate(String value, Property property, Metadata metadata) {
-        Date d = MailDateParser.parseDateLenient(value);
+        String d = TikaDates.toMetadataString(value);
         if (d != null) {
             metadata.set(property, d);
         }
@@ -210,7 +213,7 @@ class MailContentHandler implements ContentHandler {
             return false;
         }
 
-        String mediaTypeString = submd.get(Metadata.CONTENT_TYPE);
+        String mediaTypeString = submd.get(HttpHeaders.CONTENT_TYPE);
         if (mediaTypeString != null) {
             if (mediaTypeString.startsWith("text")) {
                 return true;
@@ -220,7 +223,7 @@ class MailContentHandler implements ContentHandler {
         }
 
         try (TikaInputStream tis = TikaInputStream.get(bytes)) {
-            MediaType mediaType = detector.detect(tis, submd);
+            MediaType mediaType = detector.detect(tis, submd, parseContext);
             if (mediaType != null) {
                 //detect only once
                 submd.set(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE, mediaType.toString());
@@ -243,10 +246,10 @@ class MailContentHandler implements ContentHandler {
         }
 
         try {
-            if (extractor.shouldParseEmbedded(metadata)) {
+            if (extractor.shouldParseEmbedded(metadata, parseContext)) {
                 // Wrap the InputStream before passing on, as the James provided
                 //  one misses many features we might want eg mark/reset
-                extractor.parseEmbedded(tis, handler, metadata, false);
+                extractor.parseEmbedded(tis, handler, metadata, parseContext, false);
             }
         } catch (SAXException e) {
             throw new MimeException(e);
@@ -334,7 +337,7 @@ class MailContentHandler implements ContentHandler {
                         String from = getDisplayString(address);
                         MailUtil.setPersonAndEmail(from, Message.MESSAGE_FROM_NAME,
                                 Message.MESSAGE_FROM_EMAIL, metadata);
-                        metadata.add(Metadata.MESSAGE_FROM, from);
+                        metadata.add(Message.MESSAGE_FROM, from);
                         metadata.add(TikaCoreProperties.CREATOR, from);
                     }
                 } else {
@@ -348,7 +351,7 @@ class MailContentHandler implements ContentHandler {
                     if (from.endsWith(">")) {
                         from = from.substring(0, from.length() - 1);
                     }
-                    metadata.add(Metadata.MESSAGE_FROM, from);
+                    metadata.add(Message.MESSAGE_FROM, from);
                     metadata.add(TikaCoreProperties.CREATOR, from);
                 }
             } else if (fieldname.equalsIgnoreCase("Subject")) {
@@ -357,11 +360,11 @@ class MailContentHandler implements ContentHandler {
                 metadata.set(TikaCoreProperties.SUBJECT, txt);
                 metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, txt + ".eml");
             } else if (fieldname.equalsIgnoreCase("To")) {
-                processAddressList(parsedField, "To:", Metadata.MESSAGE_TO);
+                processAddressList(parsedField, "To:", Message.MESSAGE_TO);
             } else if (fieldname.equalsIgnoreCase("CC")) {
-                processAddressList(parsedField, "Cc:", Metadata.MESSAGE_CC);
+                processAddressList(parsedField, "Cc:", Message.MESSAGE_CC);
             } else if (fieldname.equalsIgnoreCase("BCC")) {
-                processAddressList(parsedField, "Bcc:", Metadata.MESSAGE_BCC);
+                processAddressList(parsedField, "Bcc:", Message.MESSAGE_BCC);
             } else if (fieldname.equalsIgnoreCase("Content-Type")) {
                 final MediaType contentType = MediaType.parse(parsedField.getBody());
 
@@ -370,23 +373,12 @@ class MailContentHandler implements ContentHandler {
                     metadata.set(Message.MULTIPART_BOUNDARY,
                             contentType.getParameters().get("boundary"));
                 } else {
-                    metadata.add(Metadata.MESSAGE_RAW_HEADER_PREFIX + parsedField.getName(),
-                            field.getBody());
+                    metadata.add(Message.RAW_HEADER, parsedField.getName(), field.getBody());
                 }
             } else if (fieldname.equalsIgnoreCase("Date")) {
-                String dateBody = parsedField.getBody();
-                Date date = null;
-                try {
-                    date = MailDateParser.parseDateLenient(dateBody);
-                    metadata.set(TikaCoreProperties.CREATED, date);
-                } catch (SecurityException e) {
-                    throw e;
-                } catch (Exception e) {
-                    //swallow
-                }
+                tryToAddDate(parsedField.getBody(), TikaCoreProperties.CREATED, metadata);
             } else {
-                metadata.add(Metadata.MESSAGE_RAW_HEADER_PREFIX + parsedField.getName(),
-                        field.getBody());
+                metadata.add(Message.RAW_HEADER, parsedField.getName(), field.getBody());
             }
         } catch (RuntimeException me) {
             if (strictParsing) {
@@ -395,7 +387,7 @@ class MailContentHandler implements ContentHandler {
         }
     }
 
-    private void processAddressList(ParsedField field, String addressListType, String metadataField)
+    private void processAddressList(ParsedField field, String addressListType, Property metadataField)
             throws MimeException {
         AddressListField toField = (AddressListField) field;
         if (toField.isValidField()) {
@@ -514,7 +506,7 @@ class MailContentHandler implements ContentHandler {
     }
 
     private void handleInlineBodyPart(BodyContents part) throws MimeException, IOException {
-        String contentType = part.metadata.get(Metadata.CONTENT_TYPE);
+        String contentType = part.metadata.get(HttpHeaders.CONTENT_TYPE);
         Parser parser = null;
         boolean inlineText = false;
         if (MediaType.TEXT_HTML.toString().equalsIgnoreCase(contentType)) {
@@ -540,7 +532,7 @@ class MailContentHandler implements ContentHandler {
 
             //parse inline
             try {
-                Metadata inlineMetadata = new Metadata();
+                Metadata inlineMetadata = Metadata.newInstance(parseContext);
                 if (inlineText) {
                     inlineMetadata.set(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE,
                             MediaType.TEXT_PLAIN.toString());
@@ -560,7 +552,7 @@ class MailContentHandler implements ContentHandler {
             return 0;
         }
         if (part instanceof BodyContents) {
-            String contentType = ((BodyContents) part).metadata.get(Metadata.CONTENT_TYPE);
+            String contentType = ((BodyContents) part).metadata.get(HttpHeaders.CONTENT_TYPE);
             if (contentType == null) {
                 return 0;
             } else if (contentType.equalsIgnoreCase(MediaType.TEXT_PLAIN.toString())) {

@@ -17,7 +17,6 @@
 package org.apache.tika.parser.microsoft.chm;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -26,9 +25,11 @@ import java.util.Set;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -38,6 +39,7 @@ import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.EmbeddedContentHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class ChmParser implements Parser {
 
     /**
@@ -55,15 +57,15 @@ public class ChmParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        ChmExtractor chmExtractor = new ChmExtractor(stream);
+        ChmExtractor chmExtractor = new ChmExtractor(tis);
 
         // metadata
-        metadata.set(Metadata.CONTENT_TYPE, "application/vnd.ms-htmlhelp");
+        metadata.set(HttpHeaders.CONTENT_TYPE, "application/vnd.ms-htmlhelp");
 
         // content
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         Parser htmlParser =
@@ -94,7 +96,7 @@ public class ChmParser implements Parser {
 
     private void parsePage(byte[] byteObject, Parser htmlParser, ContentHandler xhtml,
                            ParseContext context) throws TikaException, IOException, SAXException { // throws IOException
-        Metadata metadata = new Metadata();
+        Metadata metadata = Metadata.newInstance(context);
         ContentHandler handler = new EmbeddedContentHandler(new BodyContentHandler(xhtml));// -1
         try (TikaInputStream tis = TikaInputStream.get(byteObject)) {
             htmlParser.parse(tis, handler, metadata, context);

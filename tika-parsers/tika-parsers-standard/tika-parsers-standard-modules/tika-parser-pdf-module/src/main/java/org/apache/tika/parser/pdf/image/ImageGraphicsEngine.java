@@ -57,14 +57,16 @@ import org.xml.sax.helpers.AttributesImpl;
 
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.TikaMemoryLimitException;
-import org.apache.tika.exception.ZeroByteFileException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.BoundedInputStream;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TIFF;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.metadata.TikaPagedText;
+import org.apache.tika.parser.MetadataOnlyParse;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.pdf.PDFParserConfig;
 import org.apache.tika.parser.pdf.PDMetadataExtractor;
@@ -385,9 +387,10 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
     protected void processImage(PDImage pdImage, int imageNumber)
             throws IOException, TikaException, SAXException {
         //this is the metadata for this particular image
-        Metadata metadata = new Metadata();
+        Metadata metadata = Metadata.newInstance(parseContext);
         String suffix = getSuffix(pdImage, metadata);
-        String fileName = "image" + imageNumber + "." + suffix;
+        String fileName = EmbeddedDocumentUtil.EmbeddedResourcePrefix.IMAGE.getPrefix()
+                + "-" + imageNumber + "." + suffix;
 
 
         AttributesImpl attr = new AttributesImpl();
@@ -398,6 +401,7 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
 
 
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, fileName);
+        metadata.set(TikaCoreProperties.RESOURCE_NAME_EXTENSION_INFERRED, true);
         metadata.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
                 TikaCoreProperties.EmbeddedResourceType.INLINE.toString());
         metadata.set(TikaPagedText.PAGE_NUMBER, pageNumber);
@@ -409,7 +413,7 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
             return;
         }
 
-        if (embeddedDocumentExtractor.shouldParseEmbedded(metadata)) {
+        if (embeddedDocumentExtractor.shouldParseEmbedded(metadata, parseContext)) {
             UnsynchronizedByteArrayOutputStream buffer = UnsynchronizedByteArrayOutputStream.builder().get();
             if (pdImage instanceof PDImageXObject) {
                 //extract the metadata contained outside of the image
@@ -420,10 +424,10 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
             try {
                 bufferedImage = writeToBuffer(pdImage, suffix, useDirectJPEG, buffer);
             } catch (MissingImageReaderException e) {
-                EmbeddedDocumentUtil.recordException(e, parentMetadata);
+                EmbeddedDocumentUtil.recordException(e, parentMetadata, parseContext);
                 return;
             } catch (IOException e) {
-                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, metadata);
+                EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, parseContext);
                 return;
             }
             try (TikaInputStream tis = TikaInputStream.get(buffer.toByteArray())) {
@@ -431,8 +435,7 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
                     tis.setOpenContainer(bufferedImage);
                 }
                 embeddedDocumentExtractor
-                        .parseEmbedded(tis, new EmbeddedContentHandler(xhtml), metadata,
-                                false);
+                        .parseEmbedded(tis, new EmbeddedContentHandler(xhtml), metadata, parseContext, false);
             }
         }
 
@@ -444,19 +447,17 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
             PDMetadataExtractor
                     .extract(((PDImageXObject) pdImage).getMetadata(), metadata, parseContext);
         }
-        metadata.set(Metadata.IMAGE_WIDTH, pdImage.getWidth());
-        metadata.set(Metadata.IMAGE_LENGTH, pdImage.getHeight());
+        metadata.set(TIFF.IMAGE_WIDTH, pdImage.getWidth());
+        metadata.set(TIFF.IMAGE_LENGTH, pdImage.getHeight());
         //TODO: what else can we extract from the PDImage without rendering?
-        ZeroByteFileException.IgnoreZeroByteFileException before =
-                parseContext.get(ZeroByteFileException.IgnoreZeroByteFileException.class);
-        try {
-            parseContext.set(ZeroByteFileException.IgnoreZeroByteFileException.class,
-                    ZeroByteFileException.IGNORE_ZERO_BYTE_FILE_EXCEPTION);
-            embeddedDocumentExtractor.parseEmbedded(TikaInputStream.get(new byte[0]),
-                    new EmbeddedContentHandler(xhtml), metadata, false);
+        //Register the image's metadata entry without decoding it (marker skips the parse).
+        try (TikaInputStream tis = TikaInputStream.getPlaceholder()) {
+            parseContext.set(MetadataOnlyParse.class, MetadataOnlyParse.INSTANCE);
+            embeddedDocumentExtractor.parseEmbedded(tis,
+                    new EmbeddedContentHandler(xhtml), metadata, parseContext, false);
         } finally {
-            //replace whatever was there before
-            parseContext.set(ZeroByteFileException.IgnoreZeroByteFileException.class, before);
+            //clear so it can't leak to the next image
+            parseContext.set(MetadataOnlyParse.class, null);
         }
     }
 
@@ -464,20 +465,20 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
         String suffix = pdImage.getSuffix();
 
         if (suffix == null || suffix.equals("png")) {
-            metadata.set(Metadata.CONTENT_TYPE, "image/png");
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/png");
             suffix = "png";
         } else if (suffix.equals("jpg")) {
-            metadata.set(Metadata.CONTENT_TYPE, "image/jpeg");
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/jpeg");
         } else if (suffix.equals("tiff")) {
-            metadata.set(Metadata.CONTENT_TYPE, "image/tiff");
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/tiff");
             suffix = "tif";
         } else if (suffix.equals("jpx")) {
-            metadata.set(Metadata.CONTENT_TYPE, "image/jp2");
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/jp2");
             // use jp2 suffix for file because jpx not known by windows
             suffix = "jp2";
         } else if (suffix.equals("jb2")) {
             //PDFBox resets suffix to png when image's suffix == jb2
-            metadata.set(Metadata.CONTENT_TYPE, "image/x-jbig2");
+            metadata.set(HttpHeaders.CONTENT_TYPE, "image/x-jbig2");
         } else {
             //TODO: determine if we need to add more image types
 //                    throw new RuntimeException("EXTEN:" + extension);
@@ -498,11 +499,7 @@ public class ImageGraphicsEngine extends PDFGraphicsStreamEngine {
                 throw e;
             }
 
-            String msg = e.getMessage();
-            if (msg == null) {
-                msg = "IOException, no message";
-            }
-            parentMetadata.add(TikaCoreProperties.TIKA_META_EXCEPTION_WARNING, msg);
+            EmbeddedDocumentUtil.recordException(e, parentMetadata, parseContext);
             exceptions.add(e);
         } else {
             throw e;

@@ -17,26 +17,22 @@
 package org.apache.tika.parser;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.nio.file.Path;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.detect.DefaultDetector;
 import org.apache.tika.detect.Detector;
+import org.apache.tika.digest.DigestHelper;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.ZeroByteFileException;
-import org.apache.tika.extractor.EmbeddedDocumentExtractor;
-import org.apache.tika.extractor.EmbeddedDocumentExtractorFactory;
-import org.apache.tika.extractor.ParsingEmbeddedDocumentExtractorFactory;
-import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.mime.MediaTypeRegistry;
+import org.apache.tika.parser.hook.ParseHooks;
 import org.apache.tika.sax.SecureContentHandler;
 
 public class AutoDetectParser extends CompositeParser {
@@ -64,12 +60,11 @@ public class AutoDetectParser extends CompositeParser {
      * configuration.
      */
     public AutoDetectParser() {
-        this(TikaConfig.getDefaultConfig());
+        this(new DefaultDetector(), new DefaultParser());
     }
 
     public AutoDetectParser(Detector detector) {
-        this(TikaConfig.getDefaultConfig());
-        setDetector(detector);
+        this(detector, new DefaultParser());
     }
 
     /**
@@ -90,40 +85,25 @@ public class AutoDetectParser extends CompositeParser {
         setAutoDetectParserConfig(AutoDetectParserConfig.DEFAULT);
     }
 
-    public AutoDetectParser(TikaConfig config) {
-        super(config.getMediaTypeRegistry(), getParser(config));
-        setFallback(buildFallbackParser(config));
-        setDetector(config.getDetector());
-        setAutoDetectParserConfig(config.getAutoDetectParserConfig());
-
+    public AutoDetectParser(MediaTypeRegistry mediaTypeRegistry, Parser parser, Detector detector,
+                             AutoDetectParserConfig autoDetectParserConfig) {
+        super(mediaTypeRegistry, parser);
+        setFallback(getFallbackFrom(parser));
+        setDetector(detector);
+        setAutoDetectParserConfig(autoDetectParserConfig);
     }
 
-    private static Parser buildFallbackParser(TikaConfig config) {
-        Parser fallback = null;
-        Parser p = config.getParser();
-        if (p instanceof DefaultParser) {
-            fallback = ((DefaultParser)p).getFallback();
-        } else {
-            fallback = new EmptyParser();
-        }
-
-        if (config.getAutoDetectParserConfig().getDigesterFactory() == null) {
-            return fallback;
-        } else {
-            return new DigestingParser(fallback,
-                    config.getAutoDetectParserConfig().getDigesterFactory().build(),
-                    config.getAutoDetectParserConfig().getDigesterFactory().isSkipContainerDocument());
-        }
-
+    public static Parser build(CompositeParser parser, Detector detector,
+                               AutoDetectParserConfig autoDetectParserConfig) {
+        return new AutoDetectParser(parser.getMediaTypeRegistry(), parser, detector,
+                autoDetectParserConfig);
     }
 
-    private static Parser getParser(TikaConfig config) {
-        if (config.getAutoDetectParserConfig().getDigesterFactory() == null) {
-            return config.getParser();
+    private static Parser getFallbackFrom(Parser defaultParser) {
+        if (defaultParser instanceof DefaultParser) {
+            return ((DefaultParser) defaultParser).getFallback();
         }
-        return new DigestingParser(config.getParser(),
-                config.getAutoDetectParserConfig().getDigesterFactory().build(),
-                config.getAutoDetectParserConfig().getDigesterFactory().isSkipContainerDocument());
+        return new EmptyParser();
     }
 
     /**
@@ -163,53 +143,94 @@ public class AutoDetectParser extends CompositeParser {
         return this.autoDetectParserConfig;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    private ParseHooks parseHooks;
+
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        if (autoDetectParserConfig.getMetadataWriteFilterFactory() != null) {
-            metadata.setMetadataWriteFilter(
-                    autoDetectParserConfig.getMetadataWriteFilterFactory().newInstance());
+        // Compute digests before type detection if configured
+        // DigesterFactory is retrieved from ParseContext (configured via parse-context)
+        DigestHelper.maybeDigest(tis, metadata, context);
+
+        // Signal to detectors that parsing will follow - allows them to prepare
+        // (e.g., salvage corrupted ZIP files for parser reuse)
+        context.set(ParsingIntent.class, ParsingIntent.WILL_PARSE);
+
+        // Automatically detect the MIME type of the document
+        MediaType type = detector.detect(tis, metadata, context);
+        metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
+
+        // Metadata-only pseudo-parse: register the entry, skip the content parse.
+        if (context.get(MetadataOnlyParse.class) != null) {
+            return;
         }
-        TemporaryResources tmp = new TemporaryResources();
-        try {
-            TikaInputStream tis = TikaInputStream.get(stream, tmp, metadata);
-            //figure out if we should spool to disk
-            maybeSpool(tis, autoDetectParserConfig, metadata);
-
-            // Automatically detect the MIME type of the document
-            MediaType type = detector.detect(tis, metadata);
-            //update CONTENT_TYPE as long as it wasn't set by parser override
-            if (metadata.get(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE) == null ||
-                    !metadata.get(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE)
-                            .equals(type.toString())) {
-                metadata.set(Metadata.CONTENT_TYPE, type.toString());
-            }
-            //check for zero-byte inputstream
-            if (tis.getOpenContainer() == null) {
-                if (autoDetectParserConfig.getThrowOnZeroBytes()) {
-                    tis.mark(1);
-                    if (tis.read() == -1) {
-                        throw new ZeroByteFileException("InputStream must have > 0 bytes");
-                    }
-                    tis.reset();
+        //check for zero-byte inputstream
+        if (tis.getOpenContainer() == null) {
+            if (autoDetectParserConfig.getThrowOnZeroBytes()) {
+                tis.mark(1);
+                if (tis.read() == -1) {
+                    throw new ZeroByteFileException("InputStream must have > 0 bytes");
                 }
+                tis.reset();
             }
-            handler = decorateHandler(handler, metadata, context, autoDetectParserConfig);
-            // TIKA-216: Zip bomb prevention
-            SecureContentHandler sch = handler != null ?
-                    createSecureContentHandler(handler, tis, autoDetectParserConfig) : null;
+        }
+        handler = decorateHandler(handler, metadata, context, autoDetectParserConfig);
 
-            initializeEmbeddedDocumentExtractor(metadata, context);
+        SecureContentHandler sch = handler != null ?
+                createSecureContentHandler(handler, tis, context) : null;
+
+        initializeEmbeddedParserAndDetector(context);
+        // every document, top-level or embedded, enters here once: the hooks' seam
+        boolean seeded = parseHooks != null && context.get(ParseHooks.class) == null;
+        if (seeded) {
+            context.set(ParseHooks.class, parseHooks);
+        }
+        ParseHooks hooks = context.get(ParseHooks.class);
+        boolean topLevel = hooks != null && context.get(ParseHooks.Run.class) == null;
+        if (topLevel) {
+            context.set(ParseHooks.Run.class, new ParseHooks.Run());
+        }
+        ParseHooks.Run run = hooks == null ? null : context.get(ParseHooks.Run.class);
+        Metadata parent = run == null ? null : run.enter(metadata);
+        boolean failed = true;
+        try {
+            if (topLevel) {
+                hooks.start(metadata, context);
+            }
+            Path pinned = hooks == null ? null : hooks.pin(type, metadata, tis, context);
             try {
-                // Parse the document
                 super.parse(tis, sch, metadata, context);
             } catch (SAXException e) {
-                // Convert zip bomb exceptions to TikaExceptions
                 sch.throwIfCauseOf(e);
                 throw e;
             }
+            failed = false;
+            if (pinned != null) {
+                hooks.offer(type, metadata, parent, pinned, context);
+            }
         } finally {
-            tmp.dispose();
+            if (run != null) {
+                run.exit();
+            }
+            if (topLevel) {
+                try {
+                    hooks.end(metadata, failed, context);
+                } finally {
+                    context.set(ParseHooks.Run.class, null);
+                    if (seeded) {
+                        context.set(ParseHooks.class, null);
+                    }
+                }
+            }
         }
+    }
+
+    /** Hooks set at config load; seeded into each parse's context. */
+    public void setParseHooks(ParseHooks parseHooks) {
+        this.parseHooks = parseHooks;
+    }
+
+    public ParseHooks getParseHooks() {
+        return parseHooks;
     }
 
     private ContentHandler decorateHandler(ContentHandler handler, Metadata metadata,
@@ -229,85 +250,40 @@ public class AutoDetectParser extends CompositeParser {
         return handler;
     }
 
-    private void maybeSpool(TikaInputStream tis, AutoDetectParserConfig autoDetectParserConfig,
-                            Metadata metadata) throws IOException {
-        if (tis.hasFile()) {
-            return;
-        }
-        if (autoDetectParserConfig.getSpoolToDisk() == null) {
-            return;
-        }
-        //whether or not a content-length has been sent in,
-        //if spoolToDisk == 0, spool it
-        if (autoDetectParserConfig.getSpoolToDisk() == 0) {
-            tis.getPath();
-            metadata.set(HttpHeaders.CONTENT_LENGTH, Long.toString(tis.getLength()));
-            return;
-        }
-        if (metadata.get(Metadata.CONTENT_LENGTH) != null) {
-            long len = -1l;
-            try {
-                len = Long.parseLong(metadata.get(Metadata.CONTENT_LENGTH));
-                if (len > autoDetectParserConfig.getSpoolToDisk()) {
-                    tis.getPath();
-                    metadata.set(HttpHeaders.CONTENT_LENGTH, Long.toString(tis.getLength()));
-                }
-            } catch (NumberFormatException e) {
-                //swallow...maybe log?
-            }
-        }
-    }
-
-    private void initializeEmbeddedDocumentExtractor(Metadata metadata, ParseContext context) {
-        if (context.get(EmbeddedDocumentExtractor.class) != null) {
-            return;
-        }
-        //pass self to handle embedded documents if
-        //the caller hasn't specified one.
+    /**
+     * Ensures embedded-document processing has a Parser and a Detector to fall back on,
+     * regardless of whether an EmbeddedDocumentExtractor is already bound in the context --
+     * every stock extractor (ParsingEmbeddedDocumentExtractor and its subclasses) reads
+     * Parser.class via DelegatingParser, so leaving it unset silently drops embedded content
+     * even when an extractor is present.
+     */
+    private void initializeEmbeddedParserAndDetector(ParseContext context) {
+        // pass in self for embedded documents unless
+        // the caller has specified a parser
         Parser p = context.get(Parser.class);
         if (p == null) {
             context.set(Parser.class, this);
         }
-        EmbeddedDocumentExtractorFactory edxf =
-                autoDetectParserConfig.getEmbeddedDocumentExtractorFactory();
-        if (edxf == null) {
-            edxf = new ParsingEmbeddedDocumentExtractorFactory();
+        // pass in own detector for embedded documents unless
+        // the caller has specified one
+        Detector d = context.get(Detector.class);
+        if (d == null) {
+            context.set(Detector.class, getDetector());
         }
-        EmbeddedDocumentExtractor edx = edxf.newInstance(metadata, context);
-        context.set(EmbeddedDocumentExtractor.class, edx);
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata)
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata)
             throws IOException, SAXException, TikaException {
         ParseContext context = new ParseContext();
         context.set(Parser.class, this);
-        parse(stream, handler, metadata, context);
+        parse(tis, handler, metadata, context);
     }
 
     private SecureContentHandler createSecureContentHandler(ContentHandler handler,
                                                             TikaInputStream tis,
-                                                            AutoDetectParserConfig config) {
-        SecureContentHandler sch = new SecureContentHandler(handler, tis);
-        if (config == null) {
-            return sch;
-        }
-
-        if (config.getOutputThreshold() != null) {
-            sch.setOutputThreshold(config.getOutputThreshold());
-        }
-
-        if (config.getMaximumCompressionRatio() != null) {
-            sch.setMaximumCompressionRatio(config.getMaximumCompressionRatio());
-        }
-
-        if (config.getMaximumDepth() != null) {
-            sch.setMaximumDepth(config.getMaximumDepth());
-        }
-
-        if (config.getMaximumPackageEntryDepth() != null) {
-            sch.setMaximumPackageEntryDepth(config.getMaximumPackageEntryDepth());
-        }
-        return sch;
+                                                            ParseContext context) {
+        // SecureContentHandler reads limits from OutputLimits in ParseContext
+        return SecureContentHandler.newInstance(handler, tis, context);
     }
 
 }

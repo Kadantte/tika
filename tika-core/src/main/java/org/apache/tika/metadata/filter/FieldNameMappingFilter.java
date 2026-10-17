@@ -19,25 +19,59 @@ package org.apache.tika.metadata.filter;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.metadata.Metadata;
 
-public class FieldNameMappingFilter extends MetadataFilter {
+@TikaComponent
+public class FieldNameMappingFilter extends MetadataFilterBase {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public Map<String, String> mappings = new LinkedHashMap<>();
+        public boolean excludeUnmapped = true;
+    }
 
     Map<String, String> mappings = new LinkedHashMap<>();
 
     boolean excludeUnmapped = true;
 
+    public FieldNameMappingFilter() {
+    }
+
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public FieldNameMappingFilter(Config config) {
+        this.mappings = new LinkedHashMap<>(config.mappings);
+        this.excludeUnmapped = config.excludeUnmapped;
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public FieldNameMappingFilter(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
+
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void filter(Metadata metadata) {
         if (excludeUnmapped) {
             for (String n : metadata.names()) {
                 if (mappings.containsKey(n)) {
                     String[] vals = metadata.getValues(n);
                     metadata.remove(n);
                     for (String val : vals) {
-                        metadata.add(mappings.get(n), val);
+                        // target field name is operator-configured; may legitimately be a reserved key
+                        metadata.addTrusted(mappings.get(n), val);
                     }
                 } else {
                     metadata.remove(n);
@@ -49,7 +83,7 @@ public class FieldNameMappingFilter extends MetadataFilter {
                     String[] vals = metadata.getValues(n);
                     metadata.remove(n);
                     for (String val : vals) {
-                        metadata.add(mappings.get(n), val);
+                        metadata.addTrusted(mappings.get(n), val);
                     }
                 }
             }
@@ -64,12 +98,10 @@ public class FieldNameMappingFilter extends MetadataFilter {
      *
      * @param excludeUnmapped
      */
-    @Field
     public void setExcludeUnmapped(boolean excludeUnmapped) {
         this.excludeUnmapped = excludeUnmapped;
     }
 
-    @Field
     public void setMappings(Map<String, String> mappings) {
         for (Map.Entry<String, String> e : mappings.entrySet()) {
             this.mappings.put(e.getKey(), e.getValue());

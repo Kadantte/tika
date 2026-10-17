@@ -1,0 +1,349 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Configuration
+:toc:
+
+Tika 4.x is configured with a JSON file — parsers, detectors, content handlers, server behavior and
+the Tika Pipes pipeline. `//` and `/* */` comments are allowed.
+
+NOTE: Converting a 3.x `tika-config.xml`? See the
+xref:migration-to-4x/index.adoc[Migration Guide], and `tika-app`'s
+xref:using-tika/cli/index.adoc[`--convert-config-xml-to-json`] flag.
+
+== Top-level JSON structure
+
+A `tika-config.json` is a single JSON object whose keys are the sections below. Every section is
+optional; anything you omit uses its defaults.
+
+[source,json]
+----
+{
+  "parsers": [ /* parser declarations */ ],
+  "detectors": [ /* detector declarations */ ],
+  "encoding-detectors": [ /* encoding detector declarations */ ],
+  "metadata-filters": [ /* metadata filter declarations */ ],
+  "renderers": [ /* page renderer declarations */ ],
+  "text-recognizers": [ /* OCR engines etc., selected by name; see below */ ],
+  "translator": { /* translator declaration */ },
+  "content-handler-factory": { /* handler type for emitted content */ },
+  "auto-detect-parser": { /* AutoDetectParser options */ },
+  "parse-context": {
+    "timeout-limits": { /* progress + total task timeouts */ },
+    "exception-reporting": { /* how much exception detail is reported */ },
+    "unpack-config": { /* embedded-byte extraction */ },
+    "pages": { /* rendering, OCR policy and page images for every parser that renders; see below */ }
+    /* other SelfConfiguring components by component name */
+  },
+  "server": { /* tika-server options: allowPipes, allowPerRequestConfig, cors, tlsConfig, ... */ },
+  "grpc": { /* tika-grpc options */ },
+  "pipes": { /* Pipes process management: numClients, parseMode, ... */ },
+  "fetchers": { /* named fetcher instances */ },
+  "emitters": { /* named emitter instances */ },
+  "pipes-iterator": { /* iterator (one per pipeline) */ },
+  "pipes-reporters": { /* per-document status reporters */ },
+  "plugin-roots": "/path/to/plugins",
+  "metadata-list": { /* Jackson read limits for metadata JSON */ },
+  "service-loader": { /* SPI load-failure policy */ },
+  "xml-reader-utils": { /* XML parser pool size */ }
+}
+----
+
+That list is exhaustive: an unrecognized top-level key is fatal at load time, and the error names
+the valid ones.
+
+`parsers`, `detectors`, `encoding-detectors`, `metadata-filters`, `content-handler-factory` and
+`parse-context` are covered under <<_topics,Topics>> below. For `server` see
+xref:using-tika/server/index.adoc[Tika Server]; for `grpc` see
+xref:using-tika/grpc/index.adoc[Tika gRPC]; for `pipes`, `fetchers`, `emitters`,
+`pipes-iterator`, `pipes-reporters` and `plugin-roots` see
+xref:pipes/configuration.adoc[Pipes Configuration].
+
+[#typos]
+=== Where a typo is caught, and where it is not
+
+Unknown keys are rejected almost everywhere: at the top level, inside a component's config body,
+and inside a `FetchEmitTuple`. Four places swallow them silently instead, so a misspelling there
+produces no error and no effect:
+
+* the `metadata-list` body — only `maxStringLength`, `maxNestingDepth` and `maxNumberLength` are
+  read;
+* the body of a self-configuring component under `parse-context` — it is handed to the component
+  untouched;
+* `_mime-include` / `_mime-exclude` when the value is neither a JSON array nor a string — a bare
+  string is read as a one-element list, but any other shape yields an empty filter rather than a
+  failure;
+* a non-textual entry inside `default-parser`'s `exclude` list — the list expects plain strings,
+  so an object or array entry such as `[{"pdf-parser": {}}]` is skipped and the component stays
+  enabled. (An *unregistered name* in that list, and an unknown *key* in that same block, are
+  both fatal.)
+
+If a setting appears to do nothing, check its spelling against one of those four first.
+
+[#component-names]
+== Component names
+
+Everything you configure is referenced by its *component name* — a kebab-case identifier such as
+`pdf-parser`, `file-system-fetcher` or `unpack-config`, derived from the class's simple name unless
+the component declares its own. (`developers/` calls the derived form a *friendly name*; it is the
+same string.) Class names are not accepted in their place: only components registered with
+`@TikaComponent` can be instantiated from JSON, which is what stops a config file from loading
+arbitrary classes. `tika-app --list-parser-names` prints the registered parser names, and an
+unknown name fails at load time listing the ones that are registered.
+
+== The `parsers` list and `default-parser`
+
+A `parsers` list loads *only* the parsers it names — every other parser is dropped. To customize
+one parser while keeping all the others, add a `default-parser` entry:
+
+[source,json]
+----
+{
+  "parsers": [
+    { "pdf-parser": { "sortByPosition": true } },
+    { "default-parser": {} }
+  ]
+}
+----
+
+Configuring a parser automatically excludes its default copy, so there is no duplication. Omit
+`default-parser` only when you want a Tika limited to the parsers you listed.
+
+`detectors` works the same way, with a `default-detector` entry. `encoding-detectors` has a
+`default-encoding-detector`, but it must not be mixed with explicit detector entries — see
+xref:configuration/encoding-detectors.adoc[Encoding Detectors].
+
+[#text-recognizers]
+== The `text-recognizers` list (4.1.0+)
+
+Text recognizers are engines that produce a document's text from its pixels: an OCR engine run
+on an embedded image or a rendered PDF page, a VLM prompted to transcribe. A container parser
+*invokes* them on bytes it has already parsed. Two recipes cover almost every deployment.
+
+NOTE: This list and the `engines` map it names are stable: an entry keeps loading and meaning
+"this engine recognizes text for these types", and if 4.2 changes the spelling the 4.1 form
+loads as an alias for at least one minor release. What may change is when the engine is called
+and where its text lands: 4.2 batches recognition per document, so text may be placed after
+the walk rather than as each image is met. The Java contract behind an engine
+(`TextRecognizer`) is experimental, with batching meant as an opt-in addition an engine that
+takes one image at a time never sees; see
+xref:developers/custom-ocr-engine.adoc[Wiring in Your Own OCR Engine].
+
+*Choose the engine.* Configure it once under `engines` and name it here; every default parser
+stays loaded, and `image-parser` and `pdf-parser` call it:
+
+[source,json]
+----
+{
+  "engines": {
+    "tesseract": { "tesseract-ocr-parser": { "language": "eng" } }
+  },
+  "text-recognizers": [
+    { "engine": "tesseract" }
+  ]
+}
+----
+
+An entry naming an engine takes only `engine`, `_mime-include`, `_mime-exclude`, `_min-width` and
+`_min-height`; the engine's own settings live under `engines`, where an
+xref:configuration/inference.adoc[inference binding] can name the same engine. The 4.0 form,
+the engine inline, still works: `{ "tesseract-ocr-parser": { "language": "eng" } }`, and takes
+the same underscore keys.
+
+`_min-width`/`_min-height` keep an image whose recorded size (`tiff:ImageWidth`,
+`tiff:ImageLength`) falls short in either dimension away from the engine, in pixels; an image of
+unknown size is sent. Whatever the entry says, an image under 2 x 2 (a spacer in an email
+signature) never reaches any engine; the engines' own byte gates (`minFileSizeToOcr`) are
+unchanged.
+
+*Turn OCR off.* An empty list is authoritative:
+
+[source,json]
+----
+{ "text-recognizers": [] }
+----
+
+*Turn it off for one request.* The list stays configured; the request switches it off, in
+every container, and no engine is missed as an error:
+
+[source,json]
+----
+{ "parse-context": { "text-recognizers": { "enabled": false } } }
+----
+
+Engine types: `tesseract-ocr-parser`, `tess4j-parser`, `openai-vlm-parser`, `claude-vlm-parser`,
+`gemini-vlm-parser`. At startup Tika logs one line per engine with the media types it enriches, so
+the effective engine is never a guess.
+
+=== How the list behaves
+
+A recognizer advertises its *real* media types (`image/png`, ...) and does not compete with the
+parser registered for those types: `image-parser` still parses the image and calls the recognizer.
+An entry's `_mime-include`/`_mime-exclude` name real types too (`image/tiff`); the pre-4.1
+`image/ocr-*` spellings are refused at load. *Every* entry matching a media type runs, in the
+order listed. Two recognizers on one type both run and their text is concatenated; a WARN at
+startup names them, since that is almost never intended. The list is authoritative: a media
+type no configured recognizer matches gets no OCR, never a classpath engine you did not name. A named engine that reports no media
+types at startup (missing native binary, unreachable inference server) fails config load rather
+than going silently inert; that check is made against the engine itself, so a `_mime-include`
+list cannot stand in for an unreachable engine. Failures are best-effort: one recognizer failing
+does not stop the others, and every failure is still reported through the parser's normal
+exception handling (timeouts abort the chain immediately).
+
+=== With no list
+
+When the key is absent, the loader resolves one engine per media type from the recognizers among
+the loaded parsers and injects that, so Tesseract on the classpath OCRs images with no
+configuration at all. The rules: an engine configured under `parsers` beats one `default-parser`
+found on the classpath; among those the last registered wins (user-supplied classes register
+after Tika's); an entry's `_mime-include`/`_mime-exclude` applies, and on the `default-parser`
+entry it applies to every engine inside it. When several engines in the winning tier claim a
+type, a WARN at startup names them and the winner; an engine under `parsers` shadows a classpath
+engine (and draws the deprecation WARN below). Name the engine in `text-recognizers` to stop
+depending on any of this. An `AutoDetectParser` built in code without the loader applies the same rules at parse
+time.
+
+=== An engine under `parsers` (deprecated)
+
+Naming an engine under `parsers` is how 4.0 configured Tesseract's options. It is deprecated
+since 4.1.0 and unsupported in 4.2.0, when `parsers` holds parsers only and an engine there
+fails config load. Until then it keeps working, with a WARN at startup that says what the entry
+does today, because it means two things at once: the entry configures the engine, and the engine
+is also a parser for the types no other parser there claims (`"parsers":
+[{"tesseract-ocr-parser": {}}]` alone sends every image straight to OCR; `claude-vlm-parser`
+next to a `default-parser` that excludes `pdf-parser` makes Claude the PDF parser). When every
+type the engine advertises is claimed by another parser it is never dispatched to and acts only
+as the text recognizer, or never runs at all. Configure the engine under `engines`, name it in
+`text-recognizers`, and keep `parsers` for parsers.
+
+=== Replacing extracted text
+
+An engine that produces the document's *text* implements
+`org.apache.tika.parser.enricher.TextRecognizer`. Only such engines count when a caller asks
+whether an engine can stand in for text it already has: the PDF parser's `AUTO` OCR strategy
+replaces a page's extracted text only if the engine recognizes text and actually wrote some, and
+keeps the extracted text otherwise. The bundled OCR engines declare the capability; a VLM parser
+declares it through its `textRecognizer` option (default `true`). An entry that recognizes no
+text (the experimental image-embedding parser, a VLM with `textRecognizer: false`) still runs on
+the images and pages it is offered and never displaces text; startup warns about it, and 4.2
+gives such annotators a list of their own.
+When the PDF parser also emits its page renders as embedded documents, it enriches each render itself and
+the embedded copy is not enriched again (see xref:configuration/parsers/pdf-parser.adoc[PDF Parser]).
+
+=== For engine authors
+
+Recognizers are found by interface, not by media type: implement
+`org.apache.tika.parser.enricher.ContentEnricher` (or `TextRecognizer`, which extends it) and
+advertise the real types you enrich; xref:developers/custom-ocr-engine.adoc[Wiring in Your Own
+OCR Engine] walks through a complete engine. An engine the classpath supplied is never dispatched to:
+`tesseract-ocr-parser` advertising `image/png` does not take PNGs away from `image-parser`, it is
+called by it. The `image/ocr-*` pseudo-types that routed OCR before 4.1 are retired: a third-party
+engine still advertising them is treated as a text recognizer for the real types, with a WARN at
+startup, until 5.0. Nothing else in Tika produces them; a `tk:content-type-parser-override`
+naming one matches no parser and falls to the empty fallback.
+
+[#env]
+== Secrets from the environment
+
+A string value in the startup config may name an environment variable as `${env:NAME}`, alone or
+inside a longer string, and the loader substitutes the variable's value when the config is read:
+
+[source,json]
+----
+{
+  "engines": {
+    "jina": { "openai-embedding-engine": { "baseUrl": "https://api.jina.ai",
+              "apiKey": "${env:JINA_API_KEY}", "model": "jina-embeddings-v5-omni-small" } }
+  },
+  "emitters": {
+    "es": { "es-emitter": { "esUrl": "http://${env:ES_HOST}:9200/tika", "apiKey": "${env:ES_API_KEY}" } }
+  }
+}
+----
+
+Only that exact form is touched: `${NAME}`, `$NAME`, `${sys:...}` and any other text stay literal,
+so a prompt or a pattern that happens to contain `${` is safe. A reference to a variable that is not
+set fails the load with the variable's name and the JSON path, never a value, so a missing secret
+stops the server at startup rather than reaching a service as an empty key. A literal value works as
+before.
+
+The forked parse workers of tika-server and Pipes never read the config file or the environment:
+the parent resolves every reference once and hands each fork the resolved config over its stdin,
+so a value that itself contains `${env:...}` is not expanded a second time. Presets written inline in the config file resolve
+at startup with the rest of it; catalog presets and per-request configuration (`/config`
+endpoints, pipes tuples) never do: a request cannot read the server's environment.
+
+A reference keeps a secret out of tika-config.json, not out of every file: with a persistent
+config store (`configStoreType` `file` or Ignite) the resolved fetcher and emitter configurations
+are written to that store. The default in-memory store writes nothing.
+
+== Windows file paths
+
+JSON treats the backslash as an escape character, so path options (`tesseractPath`,
+`imageMagickPath`, ...) need forward slashes (`C:/Tools/...`) or escaped backslashes
+(`C:\\Tools\\...`). A single backslash is a JSON parse error.
+
+[#tika-extras-dir]
+== Adding extra jars (`tika.extras.dir`)
+
+To add components — extra `EncodingDetector` or `Parser` implementations, or their dependencies —
+without repackaging the application, drop their jars in a directory and point the
+`tika.extras.dir` system property at it:
+
+[source,bash]
+----
+java -Dtika.extras.dir=/path/to/extras -jar tika-app.jar ...
+java -Dtika.extras.dir=/path/to/extras -jar tika-server-standard.jar ...
+----
+
+Every `*.jar` in that directory joins the classpath Tika's service loading scans, so SPI-registered
+components are picked up automatically. The jars are forwarded to the forked JVMs that Pipes and
+tika-server run, too, so they are present where parsing happens.
+
+This is off by default: nothing is loaded unless `tika.extras.dir` is set, and there is no implicit
+default directory. Treat the directory as a trusted code location — anything in it runs with the
+full privileges of the Tika process, so it must not be writable by less-trusted principals, nor (on
+a server) reachable by request handling.
+
+NOTE: In the Docker images, mount a directory to `/tika-extras` instead. PF4J-managed plugins are a
+separate mechanism — see xref:pipes/plugins/index.adoc[Pipes Plugins].
+
+[#_topics]
+== Topics
+
+Parser configuration:
+
+* xref:configuration/pages.adoc[Pages] — rendering, OCR policy and page images, for every parser that renders
+* xref:configuration/parsers/pdf-parser.adoc[PDFParser] — PDF parsing options
+* xref:configuration/parsers/image-parsers.adoc[Image Parsers] — ICC metadata options for JPEG,
+  TIFF, HEIF, BPG and WebP
+* xref:configuration/parsers/tesseract-ocr-parser.adoc[TesseractOCRParser] — OCR for image-based
+  text extraction
+* xref:configuration/parsers/tess4j-parser.adoc[Tess4J OCR Parser] — in-process OCR via tess4j JNA
+  bindings; advanced users only, most should prefer `TesseractOCRParser`
+* xref:configuration/parsers/vlm-parsers.adoc[VLM Parsers] — Claude, Gemini, OpenAI, Ollama, vLLM
+* xref:configuration/parsers/external-parser.adoc[External Parser] — wrap external tools (ffmpeg,
+  exiftool, ...)
+
+Other configuration:
+
+* xref:configuration/metadata-filters.adoc[Metadata Filters] — trim, rename and restrict the
+  metadata that leaves the parse
+* xref:configuration/detectors.adoc[Detectors] — content (MIME) detection, including the opt-in
+  PKCS7/CMS detector
+* xref:configuration/digesters.adoc[Digesters] — cryptographic hashes of documents
+* xref:configuration/encoding-detectors.adoc[Encoding Detectors] — charset detection

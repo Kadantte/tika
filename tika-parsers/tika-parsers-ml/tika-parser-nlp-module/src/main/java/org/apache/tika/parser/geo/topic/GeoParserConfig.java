@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.geo.topic;
 
 import java.io.File;
@@ -27,6 +26,8 @@ import java.util.Properties;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.tika.config.OperatorOnly;
 
 public class GeoParserConfig implements Serializable {
     private static final long serialVersionUID = -3167692634278575818L;
@@ -66,6 +67,7 @@ public class GeoParserConfig implements Serializable {
         setGazetteerRestEndpoint(props.getProperty("gazetter.rest.api", "http://localhost:8765"));
     }
 
+    @OperatorOnly
     public void setNERModelPath(String path) {
         if (path == null) {
             return;
@@ -85,6 +87,7 @@ public class GeoParserConfig implements Serializable {
         return nerModelUrl;
     }
 
+    @OperatorOnly
     public void setNerModelUrl(URL url) {
         this.nerModelUrl = url;
     }
@@ -101,8 +104,8 @@ public class GeoParserConfig implements Serializable {
      *
      * @param gazetteerRestEndpoint
      */
+    @OperatorOnly
     public void setGazetteerRestEndpoint(String gazetteerRestEndpoint) {
         this.gazetteerRestEndpoint = gazetteerRestEndpoint;
     }
-
 }

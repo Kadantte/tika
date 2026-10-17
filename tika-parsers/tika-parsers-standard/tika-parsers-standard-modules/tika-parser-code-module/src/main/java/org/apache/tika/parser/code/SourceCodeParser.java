@@ -21,7 +21,6 @@ import static org.codelibs.jhighlight.renderer.XhtmlRendererFactory.GROOVY;
 import static org.codelibs.jhighlight.renderer.XhtmlRendererFactory.JAVA;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -31,7 +30,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.xml.XMLConstants;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.codelibs.jhighlight.renderer.Renderer;
 import org.codelibs.jhighlight.renderer.XhtmlRendererFactory;
 import org.jsoup.Jsoup;
@@ -46,9 +44,12 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.detect.AutoDetectReader;
 import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -63,6 +64,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * @author Hong-Thai.Nguyen
  * @since 1.6
  */
+@TikaComponent
 public class SourceCodeParser extends AbstractEncodingDetectorParser {
 
     private static final long serialVersionUID = -4543476498190054160L;
@@ -93,18 +95,19 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata, ParseContext context)
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata, ParseContext context)
             throws IOException, SAXException, TikaException {
-        try (AutoDetectReader reader = new AutoDetectReader(CloseShieldInputStream.wrap(stream),
+        tis.setCloseShield();
+        try (AutoDetectReader reader = new AutoDetectReader(tis,
                 metadata, getEncodingDetector(context))) {
             Charset charset = reader.getCharset();
-            String mediaType = metadata.get(Metadata.CONTENT_TYPE);
+            String mediaType = metadata.get(HttpHeaders.CONTENT_TYPE);
             String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
             MediaType type = null;
             if (mediaType != null) {
                 type = MediaType.parse(mediaType);
-                metadata.set(Metadata.CONTENT_TYPE, type.toString());
-                metadata.set(Metadata.CONTENT_ENCODING, charset.name());
+                metadata.set(HttpHeaders.CONTENT_TYPE, type.toString());
+                metadata.set(HttpHeaders.CONTENT_ENCODING, charset.name());
             } else {
                 throw new TikaException("media type must be set in metadata before parse");
             }
@@ -127,7 +130,7 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
             String codeAsHtml = renderer.highlight(name, out.toString(), charset.name(), false);
             Document document = Jsoup.parse(codeAsHtml);
             document.quirksMode(Document.QuirksMode.quirks);
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
             xhtml.startDocument();
             try {
                 NodeTraversor.filter(new TikaNodeFilter(xhtml), document);
@@ -136,6 +139,8 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
             } finally {
                 xhtml.endDocument();
             }
+        } finally {
+            tis.removeCloseShield();
         }
     }
 
@@ -161,6 +166,21 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
     }
 
     private static class TikaNodeFilter implements NodeFilter {
+
+        // JHighlight wraps its highlighted code in a full HTML document. Of
+        // those wrappers:
+        //   - html/body are dropped as elements but their descendants are
+        //     still emitted (that's where the highlighted code lives).
+        //   - head/meta/title/link/style are dropped *with* their subtrees,
+        //     otherwise their text (CSS, the filename, etc.) leaks into the
+        //     outer XHTML as bare character data.
+        // All of these collide with Tika's outer XHTMLContentHandler when
+        // emitted, producing malformed XHTML downstream.
+        private static final Set<String> WRAPPER_TAGS_DROP_ELEMENT =
+                Set.of("html", "body");
+        private static final Set<String> WRAPPER_TAGS_DROP_SUBTREE =
+                Set.of("head", "meta", "title", "link", "style");
+
         boolean ignore = true;
         ContentHandler handler;
 
@@ -175,6 +195,12 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
                 ignore = false;
             }
             if (ignore) {
+                return FilterResult.CONTINUE;
+            }
+            if (WRAPPER_TAGS_DROP_SUBTREE.contains(node.nodeName())) {
+                return FilterResult.SKIP_ENTIRELY;
+            }
+            if (WRAPPER_TAGS_DROP_ELEMENT.contains(node.nodeName())) {
                 return FilterResult.CONTINUE;
             }
             if (node instanceof TextNode) {
@@ -228,6 +254,10 @@ public class SourceCodeParser extends AbstractEncodingDetectorParser {
                 ignore = true;
             }
             if (ignore) {
+                return FilterResult.CONTINUE;
+            }
+            if (WRAPPER_TAGS_DROP_ELEMENT.contains(node.nodeName())
+                    || WRAPPER_TAGS_DROP_SUBTREE.contains(node.nodeName())) {
                 return FilterResult.CONTINUE;
             }
             if (node instanceof TextNode || node instanceof DataNode) {

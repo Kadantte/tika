@@ -13,7 +13,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 package org.apache.tika.parser.scientific.integration;
 
@@ -31,10 +30,8 @@ import org.junit.jupiter.api.Test;
 
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.mime.MediaType;
-import org.apache.tika.parser.CompositeParser;
 import org.apache.tika.parser.DefaultParser;
 import org.apache.tika.parser.Parser;
-import org.apache.tika.parser.external.CompositeExternalParser;
 import org.apache.tika.parser.ocr.TesseractOCRParser;
 
 /**
@@ -59,11 +56,6 @@ public class TestParsers {
         }
 
         int checked = 0;
-        //The initial lists were developed with exiftool installed.  We have since
-        //modified the 2.4.1-* files to act as if no exiftool is installed.
-        //However, on systems with ffmpeg or exiftool installed, we need
-        //to override those file formats
-        CompositeParser externalParser = (CompositeParser) new CompositeExternalParser();
         try (BufferedReader reader =
                      new BufferedReader(new InputStreamReader(
                              getClass().getResourceAsStream(path241),
@@ -74,10 +66,6 @@ public class TestParsers {
                 String mediaType = data[0];
                 String parserClass = data[1];
 
-                Parser external = externalParser.getParsers().get(MediaType.parse(mediaType));
-                if (external != null) {
-                    parserClass = externalParser.getClass().toString();
-                }
                 assertEquals(parserClass, currentDefault.get(mediaType),
                         "for mediaType '" + mediaType + "'");
                 checked++;

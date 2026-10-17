@@ -21,9 +21,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.exception.TikaConfigException;
-import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 
@@ -32,7 +33,16 @@ import org.apache.tika.metadata.TikaCoreProperties;
  * attachment type matches one of the types.  The idea is that you might not want
  * to store/transmit metadata for images or specific file types.
  */
-public class ClearByAttachmentTypeMetadataFilter extends MetadataFilter {
+@TikaComponent
+public class ClearByAttachmentTypeMetadataFilter extends MetadataFilterBase {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public List<String> types = new ArrayList<>();
+    }
+
     private final Set<String> types;
 
     public ClearByAttachmentTypeMetadataFilter() {
@@ -43,8 +53,29 @@ public class ClearByAttachmentTypeMetadataFilter extends MetadataFilter {
         this.types = types;
     }
 
-    @Override
-    public void filter(Metadata metadata) throws TikaException {
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public ClearByAttachmentTypeMetadataFilter(Config config) throws TikaConfigException {
+        this.types = new HashSet<>();
+        // Validate types using existing validation logic
+        setTypes(config.types);
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public ClearByAttachmentTypeMetadataFilter(JsonConfig jsonConfig) throws TikaConfigException {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
+
+
+    protected void filter(Metadata metadata) {
         String type = metadata.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE);
         if (type == null) {
             return;
@@ -63,7 +94,6 @@ public class ClearByAttachmentTypeMetadataFilter extends MetadataFilter {
      * @param types attachment types that should be deleted.
      * @throws TikaConfigException
      */
-    @Field
     public void setTypes(List<String> types) throws TikaConfigException {
         for (String t : types) {
             try {
@@ -87,4 +117,6 @@ public class ClearByAttachmentTypeMetadataFilter extends MetadataFilter {
     public List<String> getTypes() {
         return new ArrayList<>(types);
     }
+
+
 }

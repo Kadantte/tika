@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +17,6 @@
 package org.apache.tika.parser.warc;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -34,11 +33,14 @@ import org.netpreserve.jwarc.WarcResponse;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -52,6 +54,7 @@ import org.apache.tika.utils.StringUtils;
 /**
  * This uses jwarc to parse warc files and arc files
  */
+@TikaComponent
 public class WARCParser implements Parser {
 
     private static final Set<MediaType> SUPPORTED_TYPES = Collections.unmodifiableSet(
@@ -62,6 +65,11 @@ public class WARCParser implements Parser {
 
     public static String WARC_PREFIX = "warc:";
     public static String WARC_HTTP_PREFIX = WARC_PREFIX + "http:";
+
+    public static final KeyPrefix WARC_HEADER =
+            KeyPrefix.file(WARC_PREFIX, "WARC record header names");
+    public static final KeyPrefix WARC_HTTP_HEADER =
+            KeyPrefix.file(WARC_HTTP_PREFIX, "WARC HTTP response header names");
 
     public static String WARC_HTTP_STATUS = WARC_HTTP_PREFIX + "status";
 
@@ -76,19 +84,21 @@ public class WARCParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         EmbeddedDocumentExtractor embeddedDocumentExtractor =
                 EmbeddedDocumentUtil.getEmbeddedDocumentExtractor(context);
-        try (WarcReader warcreader = new WarcReader(stream)) {
+        tis.setCloseShield();
+        try (WarcReader warcreader = new WarcReader(tis)) {
             //TODO: record warnings in metadata: warcreader.onWarning();
             for (WarcRecord record : warcreader) {
                 processRecord(record, xhtml, metadata, context, embeddedDocumentExtractor);
             }
         } finally {
+            tis.removeCloseShield();
             xhtml.endDocument();
         }
     }
@@ -101,12 +111,12 @@ public class WARCParser implements Parser {
             try {
                 processResponse((WarcResponse) record, xhtml, context, embeddedDocumentExtractor);
             } catch (IOException | TikaException e) {
-                EmbeddedDocumentUtil.recordException(e, metadata);
+                EmbeddedDocumentUtil.recordException(e, metadata, context);
             } catch (SAXException e) {
                 if (WriteLimitReachedException.isWriteLimitReached(e)) {
                     throw e;
                 } else {
-                    EmbeddedDocumentUtil.recordException(e, metadata);
+                    EmbeddedDocumentUtil.recordException(e, metadata, context);
                 }
             }
         } else if (WARCINFO.equals(record.type())) {
@@ -130,7 +140,7 @@ public class WARCParser implements Parser {
             //TODO handle missing payload?  Report or ignore?
             return;
         }
-        Metadata metadata = new Metadata();
+        Metadata metadata = Metadata.newInstance(context);
         setNotNull(WARC.WARC_RECORD_CONTENT_TYPE, warcResponse.contentType(), metadata);
         setNotNull(WARC.WARC_PAYLOAD_CONTENT_TYPE, warcResponse.payloadType(), metadata);
         processWarcMetadata(warcResponse, metadata);
@@ -141,13 +151,13 @@ public class WARCParser implements Parser {
         }
         WarcPayload payload = optionalPayload.get();
         metadata.set(WARC.WARC_RECORD_CONTENT_TYPE, payload.type().toString());
-        metadata.set(Metadata.CONTENT_LENGTH, Long.toString(payload.body().size()));
+        metadata.set(HttpHeaders.CONTENT_LENGTH, Long.toString(payload.body().size()));
 
-        if (embeddedDocumentExtractor.shouldParseEmbedded(metadata)) {
-            //TODO check Content-Encoding on the warcResponse.http.headers and wrap the stream.
+        if (embeddedDocumentExtractor.shouldParseEmbedded(metadata, context)) {
+            //TODO check Content-Encoding on the warcResponse.http.headers and wrap the tis.
             //May need to sniff first few bytes to confirm accuracy, e.g. gzip compression ?
             try (TikaInputStream tis = TikaInputStream.get(payload.body().stream())) {
-                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, metadata, true);
+                embeddedDocumentExtractor.parseEmbedded(tis, xhtml, metadata, context, true);
             }
         }
 
@@ -156,19 +166,19 @@ public class WARCParser implements Parser {
     private void processWarcMetadata(WarcResponse warcResponse, Metadata metadata) {
         for (Map.Entry<String, List<String>> e : warcResponse.headers().map().entrySet()) {
             for (String val : e.getValue()) {
-                metadata.add(WARC_PREFIX + e.getKey(), val);
+                metadata.add(WARC_HEADER, e.getKey(), val);
             }
         }
     }
 
     private void processHttpResponseMetadata(HttpResponse http, Metadata metadata) {
-        metadata.set(WARC_HTTP_STATUS, Integer.toString(http.status()));
+        metadata.set(Property.externalText(WARC_HTTP_STATUS), Integer.toString(http.status()));
         if (!StringUtils.isBlank(http.reason())) {
-            metadata.set(WARC_HTTP_STATUS_REASON, http.reason());
+            metadata.set(Property.externalText(WARC_HTTP_STATUS_REASON), http.reason());
         }
         for (Map.Entry<String, List<String>> e : http.headers().map().entrySet()) {
             for (String val : e.getValue()) {
-                metadata.add(WARC_HTTP_PREFIX + e.getKey(), val);
+                metadata.add(WARC_HTTP_HEADER, e.getKey(), val);
             }
         }
     }

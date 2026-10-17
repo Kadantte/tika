@@ -16,17 +16,15 @@
  */
 package org.apache.tika.metadata.filter;
 
-import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
 import org.apache.tika.config.Initializable;
-import org.apache.tika.config.InitializableProblemHandler;
-import org.apache.tika.config.Param;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.exception.TikaConfigException;
-import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.utils.StringUtils;
 
@@ -53,36 +51,80 @@ import org.apache.tika.utils.StringUtils;
  * will overwrite the value in that field. Again, if there are multiple
  * values in that field, those will all be overwritten.
  */
-public class CaptureGroupMetadataFilter extends MetadataFilter implements Initializable {
+@TikaComponent
+public class CaptureGroupMetadataFilter extends MetadataFilterBase implements Initializable {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public String regex;
+        public String sourceField;
+        public String targetField;
+    }
 
     private String regexString;
     private Pattern regex;
     private String sourceField;
     private String targetField;
 
+    public CaptureGroupMetadataFilter() {
+    }
+
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public CaptureGroupMetadataFilter(Config config) throws TikaConfigException {
+        this.regexString = config.regex;
+        this.sourceField = config.sourceField;
+        this.targetField = config.targetField;
+        // Validate and initialize
+        if (StringUtils.isBlank(sourceField)) {
+            throw new TikaConfigException("Must specify a 'sourceField'");
+        }
+        if (StringUtils.isBlank(targetField)) {
+            throw new TikaConfigException("Must specify a 'targetField'");
+        }
+        try {
+            this.regex = Pattern.compile(regexString);
+        } catch (PatternSyntaxException e) {
+            throw new TikaConfigException("Couldn't parse regex", e);
+        }
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public CaptureGroupMetadataFilter(JsonConfig jsonConfig) throws TikaConfigException {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
+
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void filter(Metadata metadata) {
         String val = metadata.get(sourceField);
         if (StringUtils.isBlank(val)) {
             return;
         }
         Matcher m = regex.matcher(val);
         if (m.find()) {
-            metadata.set(targetField, m.group(1));
+            // target field name is operator-configured; may legitimately be a reserved key
+            metadata.setTrusted(targetField, m.group(1));
         }
     }
 
-    @Field
     public void setRegex(String regex) {
         this.regexString = regex;
     }
 
-    @Field
     public void setSourceField(String sourceField) {
         this.sourceField = sourceField;
     }
 
-    @Field
     public void setTargetField(String targetField) {
         this.targetField = targetField;
     }
@@ -100,18 +142,12 @@ public class CaptureGroupMetadataFilter extends MetadataFilter implements Initia
     }
 
     @Override
-    public void initialize(Map<String, Param> params) throws TikaConfigException {
+    public void initialize() throws TikaConfigException {
         try {
             regex = Pattern.compile(regexString);
         } catch (PatternSyntaxException e) {
             throw new TikaConfigException("Couldn't parse regex", e);
         }
-
-    }
-
-    @Override
-    public void checkInitialization(InitializableProblemHandler problemHandler)
-            throws TikaConfigException {
         if (StringUtils.isBlank(sourceField)) {
             throw new TikaConfigException("Must specify a 'sourceField'");
         }

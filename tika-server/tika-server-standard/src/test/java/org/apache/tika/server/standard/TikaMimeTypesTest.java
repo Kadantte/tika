@@ -42,7 +42,7 @@ public class TikaMimeTypesTest extends CXFTestBase {
     @Override
     protected void setUpResources(JAXRSServerFactoryBean sf) {
         sf.setResourceClasses(TikaMimeTypes.class);
-        sf.setResourceProvider(TikaMimeTypes.class, new SingletonResourceProvider(new TikaMimeTypes()));
+        sf.setResourceProvider(TikaMimeTypes.class, new SingletonResourceProvider(new TikaMimeTypes(tikaResource)));
     }
 
     @Override
@@ -83,7 +83,7 @@ public class TikaMimeTypesTest extends CXFTestBase {
 
         Map<String, Object> ogm = json.get("video/x-ogm");
         assertEquals("video/ogg", ogm.get("supertype"));
-        assertEquals("org.gagravarr.tika.OggParser", ogm.get("parser"));
+        assertEquals("org.apache.tika.parser.ogg.OggParser", ogm.get("parser"));
     }
 
 }

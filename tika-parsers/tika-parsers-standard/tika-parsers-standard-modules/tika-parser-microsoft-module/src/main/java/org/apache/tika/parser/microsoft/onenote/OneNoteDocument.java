@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.onenote;
 
 import java.util.ArrayList;
@@ -35,6 +34,9 @@ class OneNoteDocument {
     Map<ExtendedGUID, Pair<Long, ExtendedGUID>> revisionRoleMap = new HashMap<>();
     ExtendedGUID currentRevision = ExtendedGUID.nil();
     FileNodeList root = new FileNodeList();
+    // set when the root file node list could not be fully parsed (e.g. a truncated file);
+    // the header and any structure parsed so far remain usable
+    Exception structureParseException;
 
     public OneNoteDocument() {
 

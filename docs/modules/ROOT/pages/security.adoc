@@ -1,0 +1,141 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Security
+
+This page covers security considerations when using Apache Tika.
+
+== Security Model
+
+The https://tika.apache.org/security-model.html[Apache Tika Security Model] describes the
+trust boundaries and assumptions that govern how Tika processes content. Understanding it
+is essential for deploying Tika securely.
+
+[#in-process-dos]
+=== In-Process Parsing and Denial of Service
+
+If you call `AutoDetectParser` — or any parser — directly, the parse runs on your thread and
+in your heap. Untrusted input can often be crafted to exhaust memory or CPU, or to crash the
+process, and containing that is the caller's responsibility: the project does not view denial
+of service as a security issue when you opt out of the built-in sandboxing and parse files
+directly in your application. Tika's limits (`output-limits.writeLimit`,
+`embedded-limits.maxCount`, the metadata limiter) bound what a parse *produces*, not the work
+it does to produce it. Exception detail (stack traces, messages that may quote paths or document
+text) is reported in full by default; `exception-reporting` in the `parse-context` section
+redacts and bounds it for callers less trusted than the operator
+(xref:advanced/setting-limits.adoc#_exception_reporting[details]).
+
+Concretely: an uncaught `RuntimeException`, `StackOverflowError`, or `OutOfMemoryError` from an
+in-process parse of a malformed or malicious file is a bug — please report it in
+https://issues.apache.org/jira/projects/TIKA[JIRA] — but it is not a security vulnerability.
+We fix such bugs as we find them; we cannot promise they do not exist.
+
+The sandboxing that changes this is process isolation, and it is a mechanism rather than
+advice. xref:pipes/index.adoc[Tika Pipes] — or `PipesForkParser`, if you are embedding Tika
+in a Java application — along with xref:using-tika/server/index.adoc[tika-server] and
+xref:using-tika/grpc/index.adoc[tika-grpc], parse in forked JVMs. A parse that OOMs,
+hangs, or crashes takes down a fork, not your process: the fork is killed and restarted,
+and the caller gets `OOM`, `TIMEOUT`, or `UNSPECIFIED_CRASH` (HTTP `503` from tika-server)
+in place of a lost JVM. Give the forks a heap ceiling (`pipes.forkedJvmArgs`) and a
+timeout (xref:pipes/timeouts.adoc[Timeouts]) so a runaway parse is bounded in both dimensions.
+
+IMPORTANT: The boundary is conditional, not blanket. A document that defeats *Pipes' own*
+limits — escaping the memory, timeout, or process bounds that sandboxing is supposed to
+enforce — is a bug in Tika, and the project does treat that as a security issue. Report it
+privately to mailto:security@apache.org[security@apache.org], not in a public issue.
+
+=== Tika Server and gRPC Trust Model
+
+IMPORTANT: Neither `tika-server` nor `tika-grpc` is a security boundary. They perform no
+authentication or authorization of callers, and parsing untrusted documents is inherently
+risky. Only ever expose them to *trusted callers* on a trusted network — never directly to
+untrusted users or the public internet. Put your own authentication, authorization, and
+network controls (and, for tika-grpc, mutual TLS) in front of them.
+
+The capability flags below are *defense in depth, not security boundaries*: they limit what
+a caller can reach, but they do **not** make it safe to expose the service to untrusted
+callers — that requirement stands regardless of how the flags are set. All default to off.
+
+*tika-server* (see xref:using-tika/server/index.adoc[Using Tika Server]):
+
+* `allowPipes` gates the `/pipes` and `/async` endpoints (process-isolated fetching and parsing
+  through your fetchers/emitters). Selecting either without it causes the server to refuse to start.
+* `allowPerRequestConfig` gates per-request parser configuration — the `/config` endpoints and the
+  multipart `config` part; when off, such requests are rejected with HTTP 403. A caller who
+  reaches it can choose how documents parse, including options that spawn external processes
+  such as OCR, and can defeat memory and timeout limits.
+
+*tika-grpc* is *more exposed by default* than tika-server: it ships with no transport security and
+no per-caller authorization, and its `FetchAndParse` surface is always on. `allowPerRequestConfig`
+and `allowComponentManagement` — the latter lets clients add, modify, and delete fetchers/iterators
+and read back stored configs, which can contain secrets — are off by default. Run it only behind
+network controls and, ideally, mutual TLS. See xref:using-tika/grpc/index.adoc[Tika gRPC].
+
+For the upgrade from the former `enableUnsecureFeatures` flag, which is now split into
+`allowPipes` and `allowPerRequestConfig`, see
+xref:migration-to-4x/migrating-tika-server-4x.adoc#_pipes_and_async_require_allowpipes_per_request_config_requires_allowperrequestconfig[Migrating tika-server to 4.x].
+
+== Known Vulnerabilities
+
+Known CVEs in Apache Tika and their remediation are listed on the
+https://tika.apache.org/security.html[Apache Tika security page].
+
+== External Command Security
+
+Three components can be configured to run external system commands:
+
+* `FileCommandDetector` — uses the system `file` command for MIME type detection
+* `ExternalParser` — executes configured external programs to extract content
+* `ExternalEmbedder` — uses external tools to embed content
+
+CAUTION: External command configuration should only be performed by trusted administrators.
+Never allow untrusted users to configure command paths or arguments.
+
+=== Security Best Practices
+
+* **Restrict configuration access**: only administrators should be able to modify Tika
+  configuration files that specify external commands.
+* **Use absolute paths**: configure external commands with absolute paths to prevent PATH
+  manipulation attacks.
+* **Sandbox execution**: run Tika in a container or sandbox to limit the impact of any
+  command execution vulnerability.
+* **Audit command configuration**: regularly review configured external commands and their
+  arguments.
+
+=== ExternalParser-Specific Risks
+
+* **`checkCommandLine` runs at type-query time**: if configured, the check command executes
+  the first time `getSupportedTypes()` is called, not at parse time — so merely querying
+  which parsers are available triggers process execution.
+* **stderr information leakage**: external programs often write file paths, system
+  usernames, version strings, and internal errors to stderr. `returnStderr` defaults to
+  `false` for that reason; enabling it stores the raw stderr content in the document's
+  metadata, where end users may see it.
+* **Buffer limits**: `maxStdOut` and `maxStdErr` bound how much process output is held in
+  memory. Set them for your deployment so a misbehaving external program cannot exhaust it.
+
+== Credential Handling
+
+Tika stores some credentials as Java String objects, which remain in memory until garbage
+collected. For environments with strict security requirements:
+
+* **Use environment variables** for credentials rather than configuration files where possible.
+* **Use secret managers** — HashiCorp Vault, AWS Secrets Manager, or similar — in production.
+* **Enable encryption**: `HttpClientFactory` can hold credentials AES-encrypted
+  (`credentialsAESEncrypted`), with the key supplied in the `AES_KEY` environment variable.
+* **Minimize credential scope**: use credentials with the minimum necessary privileges and
+  rotate them regularly.

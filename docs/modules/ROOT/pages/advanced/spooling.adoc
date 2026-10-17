@@ -1,0 +1,310 @@
+////
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+////
+= Spooling in Apache Tika
+:toc:
+:toclevels: 3
+:sectnums:
+
+== Background
+
+=== What is Spooling?
+
+Spooling refers to the process of writing an input stream to a temporary file on disk.
+This benefits certain file formats that can be processed more efficiently with random access
+to the underlying bytes during detection or parsing.
+
+=== Why Some Formats Benefit from Random Access
+
+Several file formats are most efficiently processed with random access vs streaming:
+
+* **OLE2 (Microsoft Office legacy formats)**: The POI library benefits from reading the file
+  as a random-access structure to navigate the OLE2 container.
+* **ZIP-based formats**: Container detection benefits from reading the ZIP central directory,
+  which is located at the end of the file. Parsing also benefits from random access.
+* **Binary Property Lists (bplist)**: Apple's binary plist format benefits from random access
+  for efficient parsing.
+* **PDF**: While detection works via magic bytes, parsing benefits from random access for
+  the PDF cross-reference table.
+
+=== Architectural Decision: Decentralized Spooling
+
+==== The Solution: Let Components Self-Spool
+
+The current architecture follows a simple principle: **each component that needs random
+access is responsible for obtaining it**.
+
+A detector or parser is handed a `TikaInputStream`; when it needs random access it asks for
+a seekable view of the content and lets `TikaInputStream` decide whether that view is backed
+by memory or by a file:
+
+[source,java]
+----
+try (SeekableByteChannel channel = tis.getSeekableByteChannel()) {
+    ByteBuffer view = TikaInputStream.inMemoryContent(channel);
+    if (view != null) {
+        readInPlace(view);              // in memory: no copy, no temp file
+    } else {
+        readFromFile(tis.getFile());    // spilled: the file already exists
+    }
+}
+----
+
+Two rules go with that form:
+
+* The `ByteBuffer` aliases the cache's own array and is valid *only while that channel is
+  open*. Keep the channel open for as long as the view is in use. A view that outlives its
+  channel still reads correctly but is no longer counted against the memory budget.
+* `inMemoryContent()` returns `null` whenever the content is not in memory -- file-backed
+  input, or a cache that spilled. That is the normal case for large content, not an error.
+
+`getFile()` remains correct when a consumer genuinely requires a `java.io.File` -- many
+third-party libraries do -- but it always materialises one. Prefer the channel/view form when
+the consumer can accept a buffer or a stream. For a worked example see
+`PDFRandomAccess.open(...)` in `tika-parser-pdf-module`, one factory that makes this choice
+for the PDF parser, its incremental-update scan, and the renderer.
+
+`TikaInputStream` handles the spooling transparently based on how it was initialized:
+
+* **Initialized with `Path`**: The file is used directly for random access. No spooling needed.
+* **Initialized with `byte[]`**: The bytes are kept in memory. Spooling only on demand.
+* **Initialized with `InputStream`**: `getPath()` or `getFile()` spools the stream to a
+  temporary file, which is automatically cleaned up when the stream is closed. Spooling
+  requires position 0 (or a prior `enableRewind()` at position 0); reading first and
+  spooling later throws.
+
+==== Benefits of Decentralized Spooling
+
+1. **Efficiency**: Spooling happens only when actually needed, not preemptively.
+2. **Simplicity**: No central configuration of "which types need spooling."
+3. **Correctness**: Each component knows its own requirements.
+4. **Flexibility**: New formats can be added without modifying central spooling logic.
+
+=== Rewinding and random access
+
+`Parser.parse` and `Detector.detect` take a `TikaInputStream`, so a caller with a
+plain `InputStream` must wrap it. What that wrapper can do depends on what backs it.
+
+`Path`- and `byte[]`-backed streams are inherently rewindable: `rewind()`,
+`mark()`/`reset()`, `getPath()`, and `getFile()` always work, and
+`enableRewind()` is a no-op.
+
+An `InputStream`-backed stream starts in *passthrough* mode — a
+`BufferedInputStream`, so `mark()`/`reset()` work only within the buffer, and
+nothing is retained. Moving out of passthrough mode is only legal at position 0:
+
+[cols="2,2,3"]
+|===
+|Call |At position 0 |After reading
+
+|`enableRewind()`
+|Switches to caching mode: bytes are retained in memory, spilling to a temp file
+past 1 MB. `rewind()`, `mark()`/`reset()`, and random access all work afterwards.
+|`IOException` — "Cannot enable rewind: position is N, must be 0"
+
+|`getPath()` / `getFile()`
+|Implicitly enables rewind, then spills to a temp file and returns its path.
+|`IOException` — "Cannot spill to file: position is N, must be 0"
+
+|`rewind()`
+|No-op.
+|`IOException` — "Cannot seek in passthrough mode. Call `enableRewind()` first."
+|===
+
+So: call `enableRewind()` **before reading a byte** whenever you will need to
+re-read the stream, take a digest, or hand it to something that needs a file.
+Skip it for streaming-only work (HTML, plain text) to avoid the caching cost.
+
+Repeated calls to `getPath()`/`getFile()` return the same temp file — spooling
+happens once — and the temp file is deleted when the stream is closed.
+
+[#passthrough]
+=== Nothing Spools Until Something Asks
+
+A `TikaInputStream` wrapping a plain `InputStream` starts in passthrough mode and stays there.
+Reading through it -- at any size -- writes nothing to disk. Only two things spool:
+
+* `getFile()` / `getPath()`, which materialise a file by definition;
+* `enableRewind()`, which starts caching and spills to disk past 1 MB.
+
+`mark()`/`reset()` in passthrough mode delegate to an in-memory buffer and do not spool, which
+is why the usual detect-then-parse sequence (mark, peek, reset, `getFile()`) still works.
+
+Two consequences worth knowing:
+
+* `enableRewind()` must be called at position 0, and `getPath()` throws if the stream has already
+  been read past position 0. Decide up front whether a code path needs to rewind.
+* `mark(readlimit)` grows a heap buffer up to `readlimit`. A large mark is a memory cost, not a
+  disk one.
+
+This is what lets pipes hand small documents to a forked worker without touching disk; see
+xref:pipes/fetchers.adoc#inline-bytes[Inline Bytes].
+
+== User Guide
+
+=== Default Behavior
+
+By default, Tika handles spooling automatically. You don't need to configure anything
+for most use cases. When a detector or parser benefits from random access to a file, it will
+spool the input stream to a temporary file if necessary.
+
+=== SpoolingStrategy for Fine-Grained Control
+
+For advanced use cases, you can use `SpoolingStrategy` to control spooling behavior.
+
+NOTE: No detector or parser shipped with Tika consults `SpoolingStrategy` — it is an
+extension point for your own components.
+
+This is useful when you want to:
+
+* Restrict which file types are allowed to spool (e.g., for performance reasons)
+* Customize spooling behavior based on metadata or stream properties
+
+==== Programmatic Configuration
+
+[source,java]
+----
+import org.apache.tika.io.SpoolingStrategy;
+import org.apache.tika.parser.ParseContext;
+
+// Create a custom spooling strategy
+SpoolingStrategy strategy = new SpoolingStrategy();
+strategy.setSpoolTypes(Set.of(
+    MediaType.application("zip"),
+    MediaType.application("pdf")
+));
+
+// Add to parse context
+ParseContext context = new ParseContext();
+context.set(SpoolingStrategy.class, strategy);
+
+// Parse with the custom context
+try (TikaInputStream tis = TikaInputStream.get(path)) {
+    parser.parse(tis, handler, metadata, context);
+}
+----
+
+==== SpoolingStrategy Methods
+
+[source,java]
+----
+// Check if spooling should occur for a given type
+boolean shouldSpool(TikaInputStream tis, Metadata metadata, MediaType mediaType)
+
+// Configure which types should be spooled
+void setSpoolTypes(Set<MediaType> types)
+
+// Set the media type registry for specialization checking
+void setMediaTypeRegistry(MediaTypeRegistry registry)
+----
+
+==== How Type Matching Works
+
+The `shouldSpool()` method returns `true` if:
+
+1. The stream doesn't already have a backing file (`tis.hasFile()` is false), AND
+2. The media type matches one of the configured spool types
+
+Type matching considers:
+
+* Exact matches (e.g., `application/zip`)
+* Base type matches (e.g., `application/zip` matches `application/zip; charset=utf-8`)
+* Specializations (e.g., `application/vnd.oasis.opendocument.text` is a specialization of `application/zip`)
+
+==== Default Spool Types
+
+The default spool types are:
+
+* `application/zip` - ZIP archives and ZIP-based formats (OOXML, ODF, EPUB, etc.)
+* `application/x-tika-msoffice` - OLE2 Microsoft Office formats
+* `application/x-bplist` - Apple binary property lists
+* `application/pdf` - PDF documents
+
+=== JSON Configuration
+
+SpoolingStrategy can be configured via JSON in your `tika-config.json` file.
+Place the configuration in the `parse-context` section:
+
+[source,json]
+----
+{
+  "parse-context": {
+    "spooling-strategy": {
+      "spoolTypes": [
+        "application/zip",
+        "application/x-tika-msoffice",
+        "application/pdf"
+      ]
+    }
+  }
+}
+----
+
+Load the configuration using `TikaLoader`:
+
+[source,java]
+----
+TikaLoader loader = TikaLoader.load(Path.of("tika-config.json"));
+ParseContext context = loader.loadParseContext();
+// SpoolingStrategy is automatically loaded into the ParseContext
+----
+
+=== Best Practices
+
+1. **Let Tika handle it**: For most applications, the default behavior is optimal.
+   Don't configure spooling unless you have a specific need.
+
+2. **Use TikaInputStream with Path or byte[]**: When you have a file, pass the `Path`
+   directly to `TikaInputStream.get(Path)` rather than wrapping a `FileInputStream`.
+   Similarly, pass `byte[]` directly rather than wrapping a `ByteArrayInputStream`.
+   This allows TikaInputStream to use efficient backing strategies that avoid unnecessary
+   copying or spooling:
++
+[source,java]
+----
+// Good: TikaInputStream knows it has a file, can use random access directly
+TikaInputStream tis = TikaInputStream.get(path);
+
+// Bad: TikaInputStream sees an opaque stream, may spool unnecessarily
+TikaInputStream tis = TikaInputStream.get(new FileInputStream(file));
+
+// Good: TikaInputStream knows it has bytes in memory
+TikaInputStream tis = TikaInputStream.get(bytes);
+
+// Bad: TikaInputStream sees an opaque stream
+TikaInputStream tis = TikaInputStream.get(new ByteArrayInputStream(bytes));
+----
+
+3. **Close streams properly**: Use try-with-resources to ensure temporary files
+   are cleaned up:
++
+[source,java]
+----
+try (TikaInputStream tis = TikaInputStream.get(inputStream)) {
+    parser.parse(tis, handler, metadata, context);
+}
+----
+
+4. **Consider memory vs. disk tradeoffs**: For very large files, spooling to disk
+   may be needed. For small files processed in bulk, keeping data in memory may be
+   faster. There is no setting for this: the backing strategy is not configurable and
+   its implementations are package-private. You choose it entirely by which
+   `TikaInputStream.get(...)` overload you call — `get(Path)`/`get(File)` is file-backed,
+   `get(byte[])` is memory-backed, and `get(InputStream)` starts in passthrough mode and
+   only begins caching (in memory, spilling past 1 MB) once something calls
+   `enableRewind()` or asks for a `Path`/`File`.

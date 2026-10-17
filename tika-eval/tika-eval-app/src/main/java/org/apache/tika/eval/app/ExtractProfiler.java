@@ -31,10 +31,11 @@ import org.apache.tika.eval.app.db.TableInfo;
 import org.apache.tika.eval.app.io.ExtractReader;
 import org.apache.tika.eval.app.io.ExtractReaderException;
 import org.apache.tika.eval.app.io.IDBWriter;
+import org.apache.tika.eval.app.io.PipesReport;
 import org.apache.tika.eval.core.util.ContentTags;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.pipes.fetcher.FetchKey;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
 
 public class ExtractProfiler extends ProfilerBase {
 
@@ -47,19 +48,29 @@ public class ExtractProfiler extends ProfilerBase {
                     new ColInfo(Cols.SORT_STACK_TRACE, Types.VARCHAR, 8192), new ColInfo(Cols.PARSE_EXCEPTION_ID, Types.INTEGER));
     public static TableInfo CONTAINER_TABLE =
             new TableInfo("containers", new ColInfo(Cols.CONTAINER_ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.FILE_PATH, Types.VARCHAR, FILE_PATH_MAX_LEN),
-                    new ColInfo(Cols.LENGTH, Types.BIGINT), new ColInfo(Cols.EXTRACT_FILE_LENGTH, Types.BIGINT));
+                    new ColInfo(Cols.LENGTH, Types.BIGINT), new ColInfo(Cols.EXTRACT_FILE_LENGTH, Types.BIGINT),
+                    new ColInfo(Cols.PIPES_STATUS, Types.VARCHAR, PIPES_STATUS_MAX_LEN), new ColInfo(Cols.PIPES_MESSAGE, Types.VARCHAR, PIPES_MESSAGE_MAX_LEN));
     public static TableInfo PROFILE_TABLE = new TableInfo("profiles", new ColInfo(Cols.ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.CONTAINER_ID, Types.INTEGER),
             new ColInfo(Cols.FILE_NAME, Types.VARCHAR, 256), new ColInfo(Cols.MD5, Types.CHAR, 32), new ColInfo(Cols.LENGTH, Types.BIGINT),
             new ColInfo(Cols.IS_EMBEDDED, Types.BOOLEAN), new ColInfo(Cols.EMBEDDED_DEPTH, Types.INTEGER), new ColInfo(Cols.EMBEDDED_FILE_PATH, Types.VARCHAR, 1024),
             new ColInfo(Cols.ATTACHMENT_TYPE, Types.VARCHAR, 32), new ColInfo(Cols.FILE_EXTENSION, Types.VARCHAR, 12), new ColInfo(Cols.MIME_ID, Types.INTEGER),
             new ColInfo(Cols.ELAPSED_TIME_MILLIS, Types.INTEGER), new ColInfo(Cols.NUM_ATTACHMENTS, Types.INTEGER), new ColInfo(Cols.NUM_METADATA_VALUES, Types.INTEGER),
             new ColInfo(Cols.NUM_PAGES, Types.INTEGER), new ColInfo(Cols.NUM_OCR_PAGES, Types.INTEGER), new ColInfo(Cols.HAS_CONTENT, Types.BOOLEAN));
+    /** Charset detection per file (one row only when detection ran): final pick,
+     * winning detector, declared charset from metadata (tk:content-type-hint). */
+    public static TableInfo ENCODINGS_TABLE = new TableInfo("encodings",
+            new ColInfo(Cols.ID, Types.INTEGER, "PRIMARY KEY"),
+            new ColInfo(Cols.DETECTED_ENCODING, Types.VARCHAR, 64),
+            new ColInfo(Cols.ENCODING_DETECTOR, Types.VARCHAR, 64),
+            new ColInfo(Cols.DECLARED_METADATA, Types.VARCHAR, 128));
     public static TableInfo EMBEDDED_FILE_PATH_TABLE =
             new TableInfo("emb_file_names", new ColInfo(Cols.ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.EMBEDDED_FILE_PATH, Types.VARCHAR, 1024));
     public static TableInfo CONTENTS_TABLE = new TableInfo("contents", new ColInfo(Cols.ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.CONTENT_LENGTH, Types.INTEGER),
+            new ColInfo(Cols.NUM_REPLACEMENT, Types.INTEGER), new ColInfo(Cols.NUM_NON_ASCII, Types.INTEGER),
             new ColInfo(Cols.NUM_UNIQUE_TOKENS, Types.INTEGER), new ColInfo(Cols.NUM_TOKENS, Types.INTEGER), new ColInfo(Cols.COMMON_TOKENS_LANG, Types.VARCHAR, 12),
             new ColInfo(Cols.NUM_UNIQUE_COMMON_TOKENS, Types.INTEGER), new ColInfo(Cols.NUM_COMMON_TOKENS, Types.INTEGER),
             new ColInfo(Cols.NUM_UNIQUE_ALPHABETIC_TOKENS, Types.INTEGER), new ColInfo(Cols.NUM_ALPHABETIC_TOKENS, Types.INTEGER), new ColInfo(Cols.OOV, Types.DOUBLE),
+            new ColInfo(Cols.LANGUAGENESS, Types.DOUBLE),
             new ColInfo(Cols.TOP_N_TOKENS, Types.VARCHAR, 1024), new ColInfo(Cols.LANG_ID_1, Types.VARCHAR, 12), new ColInfo(Cols.LANG_ID_PROB_1, Types.FLOAT),
             new ColInfo(Cols.LANG_ID_2, Types.VARCHAR, 12), new ColInfo(Cols.LANG_ID_PROB_2, Types.FLOAT), new ColInfo(Cols.UNICODE_CHAR_BLOCKS, Types.VARCHAR, 1024),
             new ColInfo(Cols.TOKEN_ENTROPY_RATE, Types.FLOAT), new ColInfo(Cols.TOKEN_LENGTH_SUM, Types.INTEGER), new ColInfo(Cols.TOKEN_LENGTH_MEAN, Types.FLOAT),
@@ -76,13 +87,14 @@ public class ExtractProfiler extends ProfilerBase {
     private final Path inputDir;
     private final Path extracts;
     private final ExtractReader extractReader;
+    private final PipesReport pipesReport;
 
-
-    ExtractProfiler(Path inputDir, Path extracts, ExtractReader extractReader, IDBWriter dbWriter) {
+    ExtractProfiler(Path inputDir, Path extracts, ExtractReader extractReader, IDBWriter dbWriter, PipesReport pipesReport) {
         super(dbWriter);
         this.inputDir = inputDir;
         this.extracts = extracts;
         this.extractReader = extractReader;
+        this.pipesReport = pipesReport;
     }
 
 
@@ -119,6 +131,7 @@ public class ExtractProfiler extends ProfilerBase {
         if (fps.getExtractFileLength() > 0) {
             contOutput.put(Cols.EXTRACT_FILE_LENGTH, (fps.getExtractFile() == null) ? "" : Long.toString(fps.getExtractFileLength()));
         }
+        putPipesResult(contOutput, pipesReport, fps, Cols.PIPES_STATUS, Cols.PIPES_MESSAGE);
         try {
             writer.writeRow(CONTAINER_TABLE, contOutput);
         } catch (IOException e) {
@@ -145,6 +158,7 @@ public class ExtractProfiler extends ProfilerBase {
             String fileId = (i == 0) ? containerIdString : Integer.toString(ID.incrementAndGet());
             writeTagData(fileId, contentTags, TAGS_TABLE);
             writeProfileData(fps, i, contentTags, m, fileId, containerIdString, numAttachments, PROFILE_TABLE);
+            writeEncodingData(fileId, m, ENCODINGS_TABLE);
             writeEmbeddedPathData(i, fileId, m, EMBEDDED_FILE_PATH_TABLE);
             writeExceptionData(fileId, m, EXCEPTION_TABLE);
             try {

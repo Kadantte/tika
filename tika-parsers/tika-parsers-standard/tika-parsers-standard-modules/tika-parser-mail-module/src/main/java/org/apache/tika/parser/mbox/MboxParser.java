@@ -16,14 +16,10 @@
  */
 package org.apache.tika.parser.mbox;
 
-import static org.apache.tika.parser.mailcommons.MailDateParser.parseDateLenient;
-
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.Collections;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Locale;
@@ -37,23 +33,31 @@ import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
+import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Message;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
-import org.apache.tika.parser.mailcommons.MailUtil;
+import org.apache.tika.parser.mail.MailUtil;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.StringUtils;
+import org.apache.tika.utils.TikaDates;
 
 /**
  * Mbox (mailbox) parser. This version extracts each mail from Mbox and uses the
  * DelegatingParser to process each mail.
  */
+@TikaComponent
 public class MboxParser implements Parser {
 
     public static final String MBOX_MIME_TYPE = "application/mbox";
@@ -68,8 +72,10 @@ public class MboxParser implements Parser {
     private static final Pattern EMAIL_HEADER_PATTERN = Pattern.compile("([^ ]+):[ \t]*(.*)");
     private static final Pattern EMAIL_ADDRESS_PATTERN = Pattern.compile("<(.*@.*)>");
 
-    private static final String EMAIL_HEADER_METADATA_PREFIX = "MboxParser-";
-    private static final String EMAIL_FROMLINE_METADATA = EMAIL_HEADER_METADATA_PREFIX + "from";
+    private static final String EMAIL_HEADER_METADATA_PREFIX =
+            "mbox" + TikaCoreProperties.NAMESPACE_PREFIX_DELIMITER;
+    private static final KeyPrefix EMAIL_HEADER =
+            KeyPrefix.file(EMAIL_HEADER_METADATA_PREFIX, "mbox email header names");
     private final Map<Integer, Metadata> trackingMetadata = new HashMap<>();
     private boolean tracking = false;
 
@@ -80,7 +86,7 @@ public class MboxParser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, TikaException, SAXException {
 
         EmbeddedDocumentExtractor extractor =
@@ -88,39 +94,45 @@ public class MboxParser implements Parser {
 
         String charsetName = "windows-1252";
 
-        metadata.set(Metadata.CONTENT_TYPE, MBOX_MIME_TYPE);
-        metadata.set(Metadata.CONTENT_ENCODING, charsetName);
+        metadata.set(HttpHeaders.CONTENT_TYPE, MBOX_MIME_TYPE);
+        metadata.set(HttpHeaders.CONTENT_ENCODING, charsetName);
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
-        InputStreamReader isr = new InputStreamReader(stream, charsetName);
+        InputStreamReader isr = new InputStreamReader(tis, charsetName);
         try (BufferedReader reader = new BufferedReader(isr)) {
             String curLine = reader.readLine();
             int mailItem = 0;
+            boolean inHeader = true;
             do {
                 if (curLine.startsWith(MBOX_RECORD_DIVIDER)) {
-                    Metadata mailMetadata = new Metadata();
+                    Metadata mailMetadata = Metadata.newInstance(context);
                     Queue<String> multiline = new LinkedList<>();
-                    mailMetadata.add(EMAIL_FROMLINE_METADATA,
+                    mailMetadata.add(EMAIL_HEADER, "from",
                             curLine.substring(MBOX_RECORD_DIVIDER.length()));
-                    mailMetadata.set(Metadata.CONTENT_TYPE, "message/rfc822");
+                    mailMetadata.set(HttpHeaders.CONTENT_TYPE, "message/rfc822");
                     mailMetadata
                             .set(TikaCoreProperties.CONTENT_TYPE_PARSER_OVERRIDE, "message/rfc822");
                     curLine = reader.readLine();
                     if (curLine == null) {
                         break;
                     }
+
                     UnsynchronizedByteArrayOutputStream message = UnsynchronizedByteArrayOutputStream.builder().setBufferSize(100000).get();
                     do {
-                        if (curLine.startsWith(" ") || curLine.startsWith("\t")) {
-                            String latestLine = multiline.poll();
-                            latestLine += " " + curLine.trim();
-                            multiline.add(latestLine);
-                        } else {
-                            multiline.add(curLine);
+                        if (inHeader && StringUtils.isBlank(curLine)) {
+                            inHeader = false;
                         }
-
+                        if (inHeader) {
+                            if (curLine.startsWith(" ") || curLine.startsWith("\t")) {
+                                String latestLine = multiline.poll();
+                                latestLine += " " + curLine.trim();
+                                multiline.add(latestLine);
+                            } else {
+                                multiline.add(curLine);
+                            }
+                        }
                         message.write(curLine.getBytes(charsetName));
                         message.write(0x0A);
                         curLine = reader.readLine();
@@ -131,11 +143,13 @@ public class MboxParser implements Parser {
                         saveHeaderInMetadata(mailMetadata, item);
                     }
 
-                    TikaInputStream msgStream = TikaInputStream.get(message.toInputStream());
-                    message = null;
-
-                    if (extractor.shouldParseEmbedded(mailMetadata)) {
-                        extractor.parseEmbedded(msgStream, xhtml, mailMetadata, true);
+                    //re-opened over the buffer on rewind rather than cached: the
+                    //message is in memory already, a digest must not copy it again
+                    try (TikaInputStream msgStream = TikaInputStream.get(message::toInputStream,
+                            new TemporaryResources(), null)) {
+                        if (extractor.shouldParseEmbedded(mailMetadata, context)) {
+                            extractor.parseEmbedded(msgStream, xhtml, mailMetadata, context, true);
+                        }
                     }
 
                     if (tracking) {
@@ -180,30 +194,24 @@ public class MboxParser implements Parser {
                 headerTag.equalsIgnoreCase("Bcc")) {
             Matcher address = EMAIL_ADDRESS_PATTERN.matcher(headerContent);
             if (address.find()) {
-                metadata.add(Metadata.MESSAGE_RECIPIENT_ADDRESS, address.group(1));
+                metadata.add(Message.MESSAGE_RECIPIENT_ADDRESS, address.group(1));
             } else if (headerContent.indexOf('@') > -1) {
-                metadata.add(Metadata.MESSAGE_RECIPIENT_ADDRESS, headerContent);
+                metadata.add(Message.MESSAGE_RECIPIENT_ADDRESS, headerContent);
             }
 
-            String property = Metadata.MESSAGE_TO;
+            Property property = Message.MESSAGE_TO;
             if (headerTag.equalsIgnoreCase("Cc")) {
-                property = Metadata.MESSAGE_CC;
+                property = Message.MESSAGE_CC;
             } else if (headerTag.equalsIgnoreCase("Bcc")) {
-                property = Metadata.MESSAGE_BCC;
+                property = Message.MESSAGE_BCC;
             }
             metadata.add(property, headerContent);
         } else if (headerTag.equalsIgnoreCase("Subject")) {
             metadata.add(TikaCoreProperties.SUBJECT, headerContent);
         } else if (headerTag.equalsIgnoreCase("Date")) {
-            try {
-                Date date = parseDateLenient(headerContent);
-                if (date != null) {
-                    metadata.set(TikaCoreProperties.CREATED, date);
-                }
-            } catch (SecurityException e) {
-                throw e;
-            } catch (Exception e) {
-                // ignoring date because format was not understood
+            String date = TikaDates.toMetadataString(headerContent);
+            if (date != null) {
+                metadata.set(TikaCoreProperties.CREATED, date);
             }
         } else if (headerTag.equalsIgnoreCase("Message-Id")) {
             metadata.set(TikaCoreProperties.IDENTIFIER, headerContent);
@@ -213,10 +221,11 @@ public class MboxParser implements Parser {
             // TODO - key off content-type in headers to
             // set mapping to use for content and convert if necessary.
 
-            metadata.add(Metadata.CONTENT_TYPE, headerContent);
+            metadata.set(HttpHeaders.CONTENT_TYPE, headerContent);
             metadata.set(TikaCoreProperties.FORMAT, headerContent);
         } else {
-            metadata.add(EMAIL_HEADER_METADATA_PREFIX + headerTag, headerContent);
+            //append-only: header lines of the same type can legitimately repeat (e.g. Received)
+            metadata.add(EMAIL_HEADER, headerTag, headerContent);
         }
     }
 }

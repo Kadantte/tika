@@ -1,0 +1,206 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= OpenSearch Plugin
+:toc:
+:toclevels: 3
+
+The OpenSearch plugin (`tika-pipes-opensearch`) provides an emitter (writes parsed docs to an OpenSearch index) and a reporter (writes per-document processing status to OpenSearch).
+
+[cols="2,1,3"]
+|===
+|Interface |Component name |Class
+
+|Emitter
+|`opensearch-emitter`
+|`OpenSearchEmitter`
+
+|Reporter
+|`opensearch-pipes-reporter`
+|`OpenSearchPipesReporter`
+|===
+
+[#http-client-config]
+== Shared HTTP Client Settings
+
+Both the emitter and the reporter take a nested `httpClientConfig` block. The block is
+*required* on both — omitting it fails at startup with a `NullPointerException`, not a
+config error.
+
+The emitter and the reporter read the same three fields — `userName`, `password` and
+`verifySsl`. The remaining fields are accepted by the JSON parser but not applied to the HTTP
+client by either component, so setting them has no effect:
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`userName` / `password`
+|_none_
+|Basic-auth credentials. Omit both for an anonymous client. `${env:OPENSEARCH_PASSWORD}` reads
+the password from the environment (xref:configuration/index.adoc#env[Secrets from the environment]).
+
+|`verifySsl`
+|`true`
+|Verify server certificates and hostnames against the JVM trust store.
+
+|`authScheme`
+|`basic` (fixed)
+|*Not read.* The client always uses basic auth; setting this to `ntlm` changes nothing.
+
+|`connectionTimeoutMillis`
+|`120000` (fixed)
+|*Not read.* The connect timeout is the HTTP client's own default of 120000 ms.
+
+|`socketTimeoutMillis`
+|`120000` (fixed)
+|*Not read.* The socket read timeout is the HTTP client's own default of 120000 ms.
+
+|`proxyHost` / `proxyPort`
+|_none_
+|*Not read.* Neither component configures an outbound proxy.
+|===
+
+NOTE: The Elasticsearch plugin applies all of these; only the OpenSearch plugin is limited to
+the three above. If you need a proxy or non-default timeouts against OpenSearch, set them at the
+JVM level.
+
+Both components verify TLS certificates and hostnames by default, so an `https://`
+`openSearchUrl` is encrypted *and* authenticated. If the cluster uses a private CA, add it to
+the JVM truststore. To disable verification — self-signed certificates are the usual reason —
+set `verifySsl` on `httpClientConfig` for the emitter and the reporter separately:
+
+[source,json]
+----
+"httpClientConfig": { "verifySsl": false }
+----
+
+[WARNING]
+====
+With `verifySsl: false` the client accepts any certificate from any host and skips the
+hostname check, so anything on the network path can read and alter what is indexed. It logs a
+WARN saying so at startup. Prefer trusting the CA.
+====
+
+[#opensearch-emitter]
+== OpenSearch Emitter (`opensearch-emitter`)
+
+Writes parsed documents to an OpenSearch index.
+
+[source,json]
+----
+include::example$pipes-opensearch-emitter.json[]
+----
+
+=== Configuration
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`openSearchUrl`
+|_required_
+|Full URL of the target OpenSearch index, e.g., `https://opensearch.example.com:9200/tika-docs`.
+
+|`idField`
+|_required_
+|Validated non-blank, but not otherwise read: the `_id` is the emit key (attachments get the emit key plus a random suffix).
+
+|`attachmentStrategy`
+|_none_
+|How attached/embedded documents are indexed. `SEPARATE_DOCUMENTS` — each attachment becomes its own top-level document; `PARENT_CHILD` — attachments are nested under the parent in a parent/child relation. There is no default: leave it unset and embedded documents get neither the `parent` field nor the parent/child relation, so set it explicitly.
+
+|`updateStrategy`
+|`UPSERT`
+|How existing documents are handled. `OVERWRITE` — replaces an existing document at `_id`; `UPSERT` — merges into an existing document. Absent behaves as `UPSERT`.
+
+|`commitWithin`
+|_unused_
+|Accepted by the config parser but never read. Control refresh visibility on the OpenSearch side instead.
+
+|`chunkStrategy`
+|`INLINE`
+|Where `tk:chunks` goes. `INLINE` — inside the document, as a JSON array; `DOCUMENTS` — one document per unit (`_id` is the document's id plus `-chunk-N`): chunks sharing a `correlator` merge into one, with `file_id`, `container_id`, `correlator`, the locators as flat fields (`start_ms`/`end_ms`, `page`, `start_offset`/`end_offset`, `embedded_id_path`) and every vector decoded to a float array under `v.<producer>`; the document itself is written without `tk:chunks`. Needs `attachmentStrategy: SEPARATE_DOCUMENTS`; re-indexing does not delete an earlier run's surplus chunk documents. See xref:migration-to-4x/chunk-strategies.adoc[Chunk strategies].
+
+|`embeddedFileFieldName`
+|_none_
+|Name of the field used to hold embedded-file content (used by `PARENT_CHILD`).
+
+|`httpClientConfig`
+|_required_
+|See <<http-client-config>>.
+|===
+
+[#opensearch-reporter]
+== OpenSearch Reporter (`opensearch-pipes-reporter`)
+
+Writes per-document processing status records to an OpenSearch index. Useful for building dashboards over pipeline activity.
+
+[source,json]
+----
+include::example$pipes-opensearch-reporter.json[]
+----
+
+`pipes-reporters` accepts multiple reporters keyed by component name — see xref:pipes/reporters.adoc[Pipes Reporters] for how multiple reporters compose.
+
+=== Configuration
+
+[cols="1,1,3"]
+|===
+|Field |Default |Description
+
+|`openSearchUrl`
+|_required_
+|Full URL of the status index, e.g., `https://opensearch.example.com:9200/tika-status`.
+
+|`includes`
+|_none_
+|Set of `RESULT_STATUS` names to include (e.g., `PARSE_SUCCESS`, `PARSE_SUCCESS_WITH_EXCEPTION`). Names are resolved with `RESULT_STATUS.valueOf`, so an unrecognised name fails at startup. If unset, all are reported.
+
+|`excludes`
+|_none_
+|Set of `RESULT_STATUS` names to skip. Mutually exclusive with `includes`; setting both is a config error.
+
+|`keyPrefix`
+|_none_
+|Prefix prepended to status field names in the emitted documents.
+
+|`includeRouting`
+|`false`
+|If `true`, include OpenSearch routing info in each status record.
+
+|`httpClientConfig`
+|_required_
+|See <<http-client-config>>.
+|===
+
+[#opensearch-pipeline]
+== Complete Pipeline Example
+
+A filesystem iterator/fetcher feeding the OpenSearch emitter and reporter — the usual shape for ingesting a directory into an OpenSearch index.
+
+[source,json]
+----
+include::example$pipes-opensearch-pipeline.json[]
+----
+
+[#notes]
+== Notes
+
+* The OpenSearch plugin's HTTP client is REST-based; it does not depend on the OpenSearch transport client.
+* For Elasticsearch deployments, use the parallel xref:pipes/plugins/elasticsearch.adoc[Elasticsearch plugin] instead — the field names differ (`esUrl` vs. `openSearchUrl`) and ES adds API-key auth.
+* Don't check real credentials into source control — the `password` values in the examples above are placeholders.

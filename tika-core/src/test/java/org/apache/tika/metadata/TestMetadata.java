@@ -18,8 +18,10 @@ package org.apache.tika.metadata;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -27,7 +29,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
-import java.util.Properties;
+import java.util.Map;
 import java.util.Random;
 import java.util.TimeZone;
 import java.util.concurrent.Callable;
@@ -39,6 +41,7 @@ import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.metadata.writelimiter.MetadataWriteLimiter;
 import org.apache.tika.utils.DateUtils;
 
 //Junit imports
@@ -118,36 +121,6 @@ public class TestMetadata extends TikaTest {
         assertEquals(2, values.length);
         assertEquals("new value 1", values[0]);
         assertEquals("new value 2", values[1]);
-    }
-
-    /**
-     * Test for <code>setAll(Properties)</code> method.
-     */
-    @Test
-    public void testSetProperties() {
-        String[] values = null;
-        Metadata meta = new Metadata();
-        Properties props = new Properties();
-
-        meta.setAll(props);
-        assertEquals(0, meta.size());
-
-        props.setProperty("name-one", "value1.1");
-        meta.setAll(props);
-        assertEquals(1, meta.size());
-        values = meta.getValues("name-one");
-        assertEquals(1, values.length);
-        assertEquals("value1.1", values[0]);
-
-        props.setProperty("name-two", "value2.1");
-        meta.setAll(props);
-        assertEquals(2, meta.size());
-        values = meta.getValues("name-one");
-        assertEquals(1, values.length);
-        assertEquals("value1.1", values[0]);
-        values = meta.getValues("name-two");
-        assertEquals(1, values.length);
-        assertEquals("value2.1", values[0]);
     }
 
     /**
@@ -256,12 +229,12 @@ public class TestMetadata extends TikaTest {
         Metadata meta = new Metadata();
 
         // Isn't initially set, will get null back
-        assertEquals(null, meta.get(Metadata.IMAGE_WIDTH));
-        assertEquals(null, meta.getInt(Metadata.IMAGE_WIDTH));
+        assertEquals(null, meta.get(TIFF.IMAGE_WIDTH));
+        assertEquals(null, meta.getInt(TIFF.IMAGE_WIDTH));
 
         // Can only set as a single valued int
         try {
-            meta.set(Metadata.BITS_PER_SAMPLE, 1);
+            meta.set(TIFF.BITS_PER_SAMPLE, 1);
             fail("Shouldn't be able to set a multi valued property as an int");
         } catch (PropertyTypeException e) {
             //swallow
@@ -274,19 +247,19 @@ public class TestMetadata extends TikaTest {
         }
 
         // Can set it and retrieve it
-        meta.set(Metadata.IMAGE_WIDTH, 22);
-        assertEquals("22", meta.get(Metadata.IMAGE_WIDTH));
-        assertEquals(22, meta.getInt(Metadata.IMAGE_WIDTH).intValue());
+        meta.set(TIFF.IMAGE_WIDTH, 22);
+        assertEquals("22", meta.get(TIFF.IMAGE_WIDTH));
+        assertEquals(22, meta.getInt(TIFF.IMAGE_WIDTH).intValue());
 
         // If you save a non int value, you get null
-        meta.set(Metadata.IMAGE_WIDTH, "INVALID");
-        assertEquals("INVALID", meta.get(Metadata.IMAGE_WIDTH));
-        assertEquals(null, meta.getInt(Metadata.IMAGE_WIDTH));
+        meta.set(TIFF.IMAGE_WIDTH, "INVALID");
+        assertEquals("INVALID", meta.get(TIFF.IMAGE_WIDTH));
+        assertEquals(null, meta.getInt(TIFF.IMAGE_WIDTH));
 
         // If you try to retrieve a non simple int value, you get null
-        meta.set(Metadata.IMAGE_WIDTH, 22);
-        assertEquals(22, meta.getInt(Metadata.IMAGE_WIDTH).intValue());
-        assertEquals(null, meta.getInt(Metadata.BITS_PER_SAMPLE));
+        meta.set(TIFF.IMAGE_WIDTH, 22);
+        assertEquals(22, meta.getInt(TIFF.IMAGE_WIDTH).intValue());
+        assertEquals(null, meta.getInt(TIFF.BITS_PER_SAMPLE));
         assertEquals(null, meta.getInt(TikaCoreProperties.CREATED));
     }
 
@@ -305,13 +278,13 @@ public class TestMetadata extends TikaTest {
 
         // Can only set as a single valued date
         try {
-            meta.set(Metadata.BITS_PER_SAMPLE, new Date(1000));
+            meta.set(TIFF.BITS_PER_SAMPLE, new Date(1000));
             fail("Shouldn't be able to set a multi valued property as a date");
         } catch (PropertyTypeException e) {
             //swallow
         }
         try {
-            meta.set(Metadata.IMAGE_WIDTH, new Date(1000));
+            meta.set(TIFF.IMAGE_WIDTH, new Date(1000));
             fail("Shouldn't be able to set an int property as an date");
         } catch (PropertyTypeException e) {
             //swallow
@@ -330,7 +303,7 @@ public class TestMetadata extends TikaTest {
         // If you try to retrieve a non simple date value, you get null
         meta.set(TikaCoreProperties.CREATED, new Date(1000));
         assertEquals(1000, meta.getDate(TikaCoreProperties.CREATED).getTime());
-        assertEquals(null, meta.getInt(Metadata.BITS_PER_SAMPLE));
+        assertEquals(null, meta.getInt(TIFF.BITS_PER_SAMPLE));
         assertEquals(null, meta.getInt(TikaCoreProperties.CREATED));
 
         // Our format doesn't include milliseconds
@@ -490,6 +463,121 @@ public class TestMetadata extends TikaTest {
         Metadata m = new Metadata();
         m.add("key", "value1");
         assertEquals("key=value1", m.toString());
+    }
+
+    /**
+     * Two Metadata instances that differ only in a value under the same key
+     * must not be equal, so value-distinct metadata are never collapsed.
+     */
+    @Test
+    public void testValueDistinctMetadataNotEqual() {
+        Metadata m1 = new Metadata();
+        m1.add("k1", "v1");
+        Metadata m2 = new Metadata();
+        m2.add("k1", "v2");
+        assertNotEquals(m1, m2);
+    }
+
+    /**
+     * Writing to reserved keys must throw an exception.
+     */
+    @Test
+    public void testReservedKeyBlockedOnUntrustedMetadata() {
+        String reservedKey = TikaCoreProperties.TIKA_META_PREFIX + "reserved";
+        Metadata m = new Metadata();
+        assertThrows(IllegalArgumentException.class, () -> m.add(reservedKey, "value"));
+    }
+
+    /**
+     * Reserved keys are accepted when addTrusted() is used.
+     */
+    @Test
+    public void testReservedKeyAllowedOnTrustedMetadata() {
+        String reservedKey = TikaCoreProperties.TIKA_META_PREFIX + "reserved";
+        Metadata m = new Metadata();
+        m.addTrusted(reservedKey, "value");
+        assertEquals("value", m.get(reservedKey));
+    }
+
+    /**
+     * A write limiter that drops everything must prevent {@code set} from
+     * persisting a value, so persistence stays under the limiter's control.
+     */
+    @Test
+    public void testWriteLimiterBlocksSet() {
+        Metadata m = new Metadata(blockingLimiter());
+        m.set("key", "value");
+        assertNull(m.get("key"));
+    }
+
+    /**
+     * {@code set(String, String)} must delegate to the limiter with the exact
+     * field and value it was given.
+     */
+    @Test
+    public void testWriteLimiterInvokedOnSet() {
+        RecordingLimiter limiter = new RecordingLimiter();
+        Metadata m = new Metadata(limiter);
+        m.set("key", "value");
+        assertTrue(limiter.setCalled);
+        assertEquals("key", limiter.lastSetField);
+        assertEquals("value", limiter.lastSetValue);
+    }
+
+    /**
+     * The {@code set(Property, String)} overload must delegate to the limiter
+     * using the property's name and the given value.
+     */
+    @Test
+    public void testWriteLimiterInvokedOnSetProperty() {
+        RecordingLimiter limiter = new RecordingLimiter();
+        Metadata m = new Metadata(limiter);
+        m.set(TikaCoreProperties.TITLE, "title");
+        assertTrue(limiter.setCalled);
+        assertEquals(TikaCoreProperties.TITLE.getName(), limiter.lastSetField);
+        assertEquals("title", limiter.lastSetValue);
+    }
+
+    /**
+     * A write limiter that ignores every field, so nothing is persisted.
+     */
+    private static MetadataWriteLimiter blockingLimiter() {
+        return new MetadataWriteLimiter() {
+            @Override
+            public void add(String field, String value, Map<String, String[]> data) {
+            }
+
+            @Override
+            public void set(String field, String value, Map<String, String[]> data) {
+            }
+        };
+    }
+
+    /**
+     * A spy limiter that records the field and value it was invoked with on
+     * {@code set} and writes the value through to the backing map.
+     */
+    private static final class RecordingLimiter implements MetadataWriteLimiter {
+        private boolean setCalled;
+        private String lastSetField;
+        private String lastSetValue;
+
+        @Override
+        public void add(String field, String value, Map<String, String[]> data) {
+            if (value != null) {
+                data.put(field, new String[]{value});
+            }
+        }
+
+        @Override
+        public void set(String field, String value, Map<String, String[]> data) {
+            setCalled = true;
+            lastSetField = field;
+            lastSetValue = value;
+            if (value != null) {
+                data.put(field, new String[]{value});
+            }
+        }
     }
 
     private static class MetadataDateAdder implements Callable<Integer> {

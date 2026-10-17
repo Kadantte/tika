@@ -1,0 +1,1075 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.core;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import org.apache.tika.config.TimeoutLimits;
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.metadata.HttpHeaders;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.mock.MockEnricher;
+import org.apache.tika.parser.mock.MockTask;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.ParseMode;
+import org.apache.tika.pipes.api.PipesResult;
+import org.apache.tika.pipes.api.emitter.EmitKey;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
+import org.apache.tika.pipes.core.protocol.PipesMessage;
+import org.apache.tika.sax.BasicContentHandlerFactory;
+import org.apache.tika.sax.ContentHandlerFactory;
+
+
+public class PipesClientTest {
+    static final String fetcherName = "fsf";
+    static final String emitterName = "fse";
+    static final String testDoc = "testOverlappingText.pdf";
+    static final String embeddedDoc = "mock-embedded.xml";
+    static final String checkpointedSleepDoc = "mock-checkpointed-sleep-6s.xml";
+    static final String parseExceptionDoc = "mock-parse-exception.xml";
+
+    @TempDir
+    static Path sharedDir;
+
+    // basic config, for tests that neither kill the fork nor change its config
+    private static PipesClient sharedClient;
+
+    @BeforeAll
+    public static void startSharedClient() throws Exception {
+        PluginsTestHelper.copyTestFilesToTmpInput(sharedDir, testDoc, embeddedDoc);
+        Path inputDir = sharedDir.resolve("input");
+        Files.writeString(inputDir.resolve(checkpointedSleepDoc), "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+                "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test</metadata>" +
+                "<write element=\"p\">main_content</write>" +
+                "<checkpointedSleep millis=\"6000\" intervalMillis=\"500\"/>" +
+                "</mock>", StandardCharsets.UTF_8);
+        Files.writeString(inputDir.resolve(parseExceptionDoc), "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+                "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test Author</metadata>" +
+                "<write element=\"p\">Some content before exception</write>" +
+                "<throw class=\"java.io.IOException\">Non-fatal parse exception</throw>" +
+                "</mock>", StandardCharsets.UTF_8);
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                sharedDir, inputDir, sharedDir.resolve("output"));
+        sharedClient = new PipesClient(PipesConfig.load(TikaJsonConfig.load(tikaConfigPath)), tikaConfigPath);
+    }
+
+    @AfterAll
+    public static void closeSharedClient() throws Exception {
+        if (sharedClient != null) {
+            sharedClient.close();
+        }
+    }
+
+    private static PipesResult processShared(String file, ParseContext parseContext) throws Exception {
+        return sharedClient.process(
+                new FetchEmitTuple(file, new FetchKey(fetcherName, file),
+                        new EmitKey(), new Metadata(), parseContext, FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+    }
+
+    @Test
+    public void testBasic() throws Exception {
+        PipesResult pipesResult = processShared(testDoc, new ParseContext());
+        Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+        assertEquals("testOverlappingText.pdf", metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY));
+    }
+
+    /** The request's "pages" crosses the fork: the PDF's first page comes back as a RENDERING. */
+    @Test
+    public void testPagesInFork() throws Exception {
+        ParseContext parseContext = new ParseContext();
+        parseContext.setJsonConfig("pages", """
+                {"emit": {"enabled": true, "maxPages": 1,
+                          "render": {"maxWidth": 64, "maxHeight": 64}}}
+                """);
+        PipesResult pipesResult = processShared(testDoc, parseContext);
+        java.util.List<Metadata> metadataList = pipesResult.emitData().getMetadataList();
+        assertEquals(2, metadataList.size(), "the PDF and one render");
+        Metadata render = metadataList.get(1);
+        assertEquals("RENDERING", render.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
+        assertTrue(render.getInt(org.apache.tika.metadata.TIFF.IMAGE_WIDTH) <= 64);
+    }
+
+    /** Wire test for the inference bindings: the dispatcher rides the fork's own config. */
+    @Test
+    public void testInferenceBindingInFork(@TempDir Path tmp) throws Exception {
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-inference-bindings.json", tmp, tmp.resolve("input"),
+                tmp.resolve("output"), false);
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        java.awt.image.BufferedImage image =
+                new java.awt.image.BufferedImage(10, 10, java.awt.image.BufferedImage.TYPE_INT_RGB);
+        javax.imageio.ImageIO.write(image, "png", inputDir.resolve("test.png").toFile());
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            PipesResult pipesResult = pipesClient.process(
+                    new FetchEmitTuple("test.png", new FetchKey(fetcherName, "test.png"),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("mock-images", metadata.get(MockTask.MARKER_KEY));
+            assertEquals("1", metadata.get(MockTask.UNITS_KEY));
+
+            // the TEXT stage runs at the emit edge of the fork
+            Files.writeString(inputDir.resolve("note.txt"), "a note with text");
+            pipesResult = pipesClient.process(
+                    new FetchEmitTuple("note.txt", new FetchKey(fetcherName, "note.txt"),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("mock-text", metadata.get(MockTask.MARKER_KEY));
+            assertEquals("1", metadata.get(MockTask.UNITS_KEY));
+
+            // a per-request filter list neither drops the TEXT stage nor runs ahead of it
+            ParseContext filtered = new ParseContext();
+            filtered.setJsonConfig("metadata-filters", "[\"mock-upper-case-filter\"]");
+            pipesResult = pipesClient.process(
+                    new FetchEmitTuple("note.txt", new FetchKey(fetcherName, "note.txt"),
+                            new EmitKey(), new Metadata(), filtered,
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("MOCK-TEXT", metadata.get(MockTask.MARKER_KEY));
+
+            // CONCATENATE hands back one object: a result two levels down lands on it
+            ByteArrayOutputStream inner = new ByteArrayOutputStream();
+            try (ZipOutputStream out = new ZipOutputStream(inner)) {
+                out.putNextEntry(new ZipEntry("test.png"));
+                Files.copy(inputDir.resolve("test.png"), out);
+                out.closeEntry();
+            }
+            Path zip = inputDir.resolve("pictures.zip");
+            try (ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(zip))) {
+                out.putNextEntry(new ZipEntry("inner.zip"));
+                out.write(inner.toByteArray());
+                out.closeEntry();
+            }
+            ParseContext concatenate = new ParseContext();
+            concatenate.set(ParseMode.class, ParseMode.CONCATENATE);
+            // the zip's entry names are text: keep the TEXT stage from overwriting the marker
+            concatenate.setJsonConfig("inference", "{\"bindings\": [\"mock-images\"]}");
+            pipesResult = pipesClient.process(
+                    new FetchEmitTuple("pictures.zip", new FetchKey(fetcherName, "pictures.zip"),
+                            new EmitKey(), new Metadata(), concatenate,
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertEquals(1, pipesResult.emitData().getMetadataList().size());
+            metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("application/zip", metadata.get(HttpHeaders.CONTENT_TYPE));
+            assertEquals("mock-images", metadata.get(MockTask.MARKER_KEY));
+            assertEquals("1", metadata.get(MockTask.UNITS_KEY));
+        }
+    }
+
+    /**
+     * Wire test for the text-recognizers slot (TIKA-4872): a config-named enricher is
+     * injected into the fork's parsers and its output survives the fork boundary.
+     */
+    @Test
+    public void testContentEnricherInFork(@TempDir Path tmp) throws Exception {
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-text-recognizers.json", tmp, tmp.resolve("input"),
+                tmp.resolve("output"), false);
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        java.awt.image.BufferedImage image =
+                new java.awt.image.BufferedImage(10, 10, java.awt.image.BufferedImage.TYPE_INT_RGB);
+        javax.imageio.ImageIO.write(image, "png", inputDir.resolve("test.png").toFile());
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            PipesResult pipesResult = pipesClient.process(
+                    new FetchEmitTuple("test.png", new FetchKey(fetcherName, "test.png"),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+            Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("ENRICHED", metadata.get(MockEnricher.MARKER_KEY));
+            assertTrue(metadata.get(TikaCoreProperties.TIKA_CONTENT)
+                    .contains(MockEnricher.MARKER_TEXT));
+        }
+    }
+
+    @Test
+    public void testMetadataFilterFromJsonConfig() throws Exception {
+        // Test that metadata filters specified as JSON array in jsonConfigs
+        // survive serialization to the forked PipesServer and are applied.
+        ParseContext parseContext = new ParseContext();
+        parseContext.setJsonConfig("metadata-filters", """
+            [
+              "mock-upper-case-filter"
+            ]
+        """);
+
+        PipesResult pipesResult = processShared(testDoc, parseContext);
+        Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+        // MockUpperCaseFilter uppercases all metadata values
+        assertEquals("TESTOVERLAPPINGTEXT.PDF", metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY));
+    }
+
+    @Test
+    public void testMultipleMetadataFiltersFromJsonConfig() throws Exception {
+        // Test multiple filters specified as JSON array survive serialization
+        ParseContext parseContext = new ParseContext();
+        parseContext.setJsonConfig("metadata-filters", """
+            [
+              "attachment-counting-list-filter",
+              "mock-upper-case-filter"
+            ]
+        """);
+
+        PipesResult pipesResult = processShared(embeddedDoc, parseContext);
+        Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+        assertEquals(5, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+        // AttachmentCountingListFilter should have added the count
+        assertEquals(4, Integer.parseInt(metadata.get("tk:attachment-count")));
+
+        // MockUpperCaseFilter should have uppercased the resource name
+        assertEquals("MOCK-EMBEDDED.XML", metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY));
+    }
+
+    @Test
+    public void testRuntimeTimeoutChange(@TempDir Path tmp) throws Exception {
+        // Test that TimeoutLimits can be changed at runtime via ParseContext
+        // Use a mock file with 3 second delay
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        String mockContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test</metadata>" +
+                "<write element=\"p\">main_content</write>" +
+                "<fakeload millis=\"3000\" cpu=\"1\" mb=\"10\"/>" +
+                "</mock>";
+        String testFile = "mock-3s-delay.xml";
+        Files.write(inputDir.resolve(testFile), mockContent.getBytes(StandardCharsets.UTF_8));
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(tmp, inputDir, tmp.resolve("output"));
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            // First test: Short timeout (1 second) - should timeout
+            ParseContext shortTimeoutContext = new ParseContext();
+            shortTimeoutContext.set(TimeoutLimits.class, new TimeoutLimits(1000, 1000));
+
+            PipesResult timeoutResult = pipesClient.process(
+                    new FetchEmitTuple(testFile, new FetchKey(fetcherName, testFile),
+                            new EmitKey(), new Metadata(), shortTimeoutContext,
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            assertEquals(PipesResult.RESULT_STATUS.TIMEOUT, timeoutResult.status(),
+                    "Should timeout with 1 second timeout on 3 second file");
+
+            // Second test: Long timeout (10 seconds) - should succeed
+            ParseContext longTimeoutContext = new ParseContext();
+            longTimeoutContext.set(TimeoutLimits.class, new TimeoutLimits(10000, 10000));
+
+            PipesResult successResult = pipesClient.process(
+                    new FetchEmitTuple(testFile, new FetchKey(fetcherName, testFile),
+                            new EmitKey(), new Metadata(), longTimeoutContext,
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            assertEquals(PipesResult.RESULT_STATUS.PARSE_SUCCESS, successResult.status(),
+                    "Should succeed with 10 second timeout on 3 second file");
+            Assertions.assertNotNull(successResult.emitData().getMetadataList());
+            assertFalse(successResult.emitData().getMetadataList().isEmpty());
+        }
+    }
+
+    @Test
+    public void testWatchdogHonorsCheckpointsDuringLongExternalCall() throws Exception {
+        // A long "external call" (checkpointedSleep, standing in for e.g. Tesseract's
+        // ProcessUtils.execute wait) reports progress every 500ms over its 6s run, under
+        // a progressTimeoutMillis (3000ms) shorter than that but a totalTaskTimeoutMillis
+        // with plenty of room. If the watchdog reads stale progress instead of live
+        // checkpoints, this times out well before the sleep completes. Margins (3000ms
+        // budget vs. 500ms checkpoints, i.e. 6 checkpoints per budget window) are wide on
+        // purpose -- a tighter 1000ms/300ms version previously flagged as flaky, since a
+        // single GC pause or scheduler stall over ~700ms in the freshly forked JVM could
+        // make one checkpoint arrive late enough to trip the watchdog.
+        ParseContext parseContext = new ParseContext();
+        parseContext.set(TimeoutLimits.class, new TimeoutLimits(20000, 3000));
+
+        PipesResult result = processShared(checkpointedSleepDoc, parseContext);
+        assertEquals(PipesResult.RESULT_STATUS.PARSE_SUCCESS, result.status(),
+                "A 6s checkpointing wait must not trip a 3000ms progress timeout");
+    }
+
+    @Test
+    public void testStartupFailure(@TempDir Path tmp) throws Exception {
+        // Create a config that references a non-existent fetcher plugin
+        // This should cause PipesServer to fail during initialization
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-bad-class.json", tmp);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testDoc,
+                    new FetchKey("bad-fetcher", testDoc),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            PipesResult pipesResult = pipesClient.process(tuple);
+            assertEquals(PipesResult.RESULT_STATUS.FAILED_TO_INITIALIZE, pipesResult.status());
+            assertTrue(pipesResult.isFatal(), "FAILED_TO_INITIALIZE should be a fatal error");
+            Assertions.assertNotNull(pipesResult.message(), "Should have error message from server");
+            assertTrue(pipesResult.message().contains("non-existent-fetcher-plugin"),
+                    "message should name the unknown component: " + pipesResult.message());
+        }
+    }
+
+    @Test
+    public void testJvmStartupFailure(@TempDir Path tmp) throws Exception {
+        // Create a config with bad JVM arguments
+        // This should cause the JVM process to fail before it can connect
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-bad-jvm-args.json", tmp);
+        PluginsTestHelper.copyTestFilesToTmpInput(tmp, testDoc);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testDoc,
+                    new FetchKey("fsf", testDoc),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            PipesResult pipesResult = pipesClient.process(tuple);
+            assertEquals(PipesResult.RESULT_STATUS.FAILED_TO_INITIALIZE, pipesResult.status());
+            assertTrue(pipesResult.isFatal(), "FAILED_TO_INITIALIZE should be a fatal error");
+            Assertions.assertNotNull(pipesResult.message(), "Should have error message");
+            assertTrue(pipesResult.message().contains("exit code") ||
+                            pipesResult.message().contains("JVM") ||
+                            pipesResult.message().contains("Process failed") ||
+                            pipesResult.message().contains("couldn't connect to server"),
+                    "Error message should indicate process failure: " + pipesResult.message());
+        }
+    }
+
+    @Test
+    public void testFailureBeforeJvm(@TempDir Path tmp) throws Exception {
+        // Create a config with bad application path
+        // This will cause failure before the process begins
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-bad-java-path.json", tmp);
+        PluginsTestHelper.copyTestFilesToTmpInput(tmp, testDoc);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testDoc,
+                    new FetchKey("fsf", testDoc),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            PipesResult pipesResult = pipesClient.process(tuple);
+            assertEquals(PipesResult.RESULT_STATUS.FAILED_TO_INITIALIZE, pipesResult.status());
+            assertTrue(pipesResult.isFatal(), "FAILED_TO_INITIALIZE should be a fatal error");
+            Assertions.assertNotNull(pipesResult.message(), "Should have error message");
+            assertTrue(pipesResult.message().contains("No such file") || pipesResult.message().contains("thisIsntJava"),
+                    "Error message should indicate process failure: " + pipesResult.message());
+        }
+    }
+
+    @Test
+    public void testCrashDuringDetection(@TempDir Path tmp) throws Exception {
+        // Test that crashes during pre-parse detection phase are handled correctly
+        // The detector will throw RuntimeException which should NOT be caught in pre-parse
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-crashing-detector.json", tmp);
+        PluginsTestHelper.copyTestFilesToTmpInput(tmp, testDoc);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testDoc,
+                    new FetchKey("fsf", testDoc),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            PipesResult pipesResult = pipesClient.process(tuple);
+
+            // Should be UNSPECIFIED_CRASH because RuntimeException during detection
+            // is not caught by pre-parse IOException handler
+            assertEquals(PipesResult.RESULT_STATUS.UNSPECIFIED_CRASH, pipesResult.status());
+            assertTrue(pipesResult.isProcessCrash(),
+                    "Should be categorized as a process crash");
+
+            // Should have error message about the crash
+            Assertions.assertNotNull(pipesResult.message(), "Should have error message");
+            assertTrue(pipesResult.message().contains("problem reading response") |
+                    pipesResult.message().contains("SocketException") |
+                    pipesResult.message().contains("EOFException") |
+                    pipesResult.message().contains("Stream closed"),
+                    "Error message should mention the detection crash: " + pipesResult.message());
+
+            // Note: Because crash happens during pre-parse (before intermediate result is sent),
+            // the emitData will have minimal metadata - just what was captured before the crash
+        }
+    }
+
+    @Test
+    public void testSocketTimeout(@TempDir Path tmp) throws Exception {
+        // Test socket timeout when heartbeats are sent too slowly
+        // Config has heartbeatIntervalMillis=10000 (10 seconds) but socketTimeoutMillis=3000 (3 seconds)
+        // This simulates a server that appears unresponsive (different from parse timeout)
+        // NOTE: This is an invalid configuration that would never be used in production,
+        // but we allow it for testing via system property
+
+        // Create input directory and mock XML file with 10 second fakeload
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        String mockContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test</metadata>" +
+                "<write element=\"p\">main_content</write>" +
+                "<fakeload millis=\"10000\" cpu=\"1\" mb=\"10\"/>" +
+                "</mock>";
+        String testFile = "mock-slow.xml";
+        Files.write(inputDir.resolve(testFile), mockContent.getBytes(StandardCharsets.UTF_8));
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-timeout-lt-heartbeat.json", tmp);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        // Verify the misconfiguration that triggers socket timeout
+        assertEquals(3000, pipesConfig.getSocketTimeoutMillis(), "Socket timeout should be 3 seconds");
+        assertEquals(10000, pipesConfig.getHeartbeatIntervalMillis(), "Heartbeat interval should be 10 seconds");
+        assertTrue(pipesConfig.getHeartbeatIntervalMillis() > pipesConfig.getSocketTimeoutMillis(),
+                "Test requires heartbeat > socket timeout to trigger timeout");
+
+        // The config file includes -Dtika.pipes.allowInvalidHeartbeat=true in forkedJvmArgs
+        // to allow this invalid configuration for testing only
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testFile,
+                    new FetchKey("fsf", testFile),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            long startTime = System.currentTimeMillis();
+            PipesResult pipesResult = pipesClient.process(tuple);
+            long elapsed = System.currentTimeMillis() - startTime;
+
+            // Should timeout due to socket timeout (no heartbeats received within socketTimeoutMillis).
+            // Startup/handshake is bounded by startupTimeoutMillis (not socketTimeoutMillis), so a slow
+            // fork cold-start no longer misfires here as FAILED_TO_INITIALIZE.
+            assertEquals(PipesResult.RESULT_STATUS.TIMEOUT, pipesResult.status(),
+                    "Should timeout when socket times out");
+
+            // Socket timeout is 3 seconds; allow generous headroom for slow CI runners.
+            assertTrue(elapsed < 60000,
+                    "Socket timeout should occur within 60s (elapsed: " + elapsed + "ms)");
+
+            // Verify it's a process crash category (socket timeout means process isn't responding)
+            assertTrue(pipesResult.isProcessCrash(),
+                    "Socket timeout should be categorized as process crash");
+        }
+    }
+
+    @Test
+    public void testParseSuccessWithException() throws Exception {
+        // content, then a non-fatal IOException
+        FetchEmitTuple tuple = new FetchEmitTuple(parseExceptionDoc,
+                new FetchKey(fetcherName, parseExceptionDoc),
+                new EmitKey(emitterName, ""), new Metadata(), new ParseContext(),
+                FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT);
+
+        PipesResult pipesResult = sharedClient.process(tuple);
+
+        // Should be PARSE_SUCCESS_WITH_EXCEPTION because content was produced despite exception
+        assertEquals(PipesResult.RESULT_STATUS.PARSE_SUCCESS_WITH_EXCEPTION, pipesResult.status(),
+                "Should return PARSE_SUCCESS_WITH_EXCEPTION when parse throws but produces content");
+
+        // Verify it's still categorized as SUCCESS
+        assertTrue(pipesResult.isSuccess(), "PARSE_SUCCESS_WITH_EXCEPTION should be success category");
+
+        // Verify we got the metadata before the exception
+        Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+        assertTrue(pipesResult.emitData().getMetadataList().size() > 0);
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+        assertEquals("Test Author", metadata.get("dc:creator"));
+    }
+
+    @Test
+    public void testFetchException() throws Exception {
+        // Test FETCH_EXCEPTION status
+        // Occurs when fetcher fails to retrieve the file
+        // Request a file that doesn't exist
+        String nonExistentFile = "does-not-exist.pdf";
+        FetchEmitTuple tuple = new FetchEmitTuple(nonExistentFile,
+                new FetchKey(fetcherName, nonExistentFile),
+                new EmitKey(), new Metadata(), new ParseContext(),
+                FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+        PipesResult pipesResult = sharedClient.process(tuple);
+
+        // Should be FETCH_EXCEPTION because file doesn't exist
+        assertEquals(PipesResult.RESULT_STATUS.FETCH_EXCEPTION, pipesResult.status(),
+                "Should return FETCH_EXCEPTION when file cannot be fetched");
+
+        // Verify it's categorized as TASK_EXCEPTION
+        assertTrue(pipesResult.isTaskException(),
+                "FETCH_EXCEPTION should be task exception category");
+
+        // Verify error message contains useful information
+        Assertions.assertNotNull(pipesResult.message());
+        assertTrue(pipesResult.message().contains("does-not-exist") ||
+                        pipesResult.message().contains("NoSuchFileException") ||
+                        pipesResult.message().contains("not found"),
+                "Error message should indicate file not found");
+    }
+
+    @Test
+    public void testEmitExceptionAndEmitterNotFound(@TempDir Path tmp) throws Exception {
+        // EMIT_EXCEPTION when the emitter fails to write; EMITTER_NOT_FOUND for an unknown emitter id
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+
+        String testFile = "test.xml";
+        String mockContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test</metadata>" +
+                "<write element=\"p\">content</write>" +
+                "</mock>";
+        Files.write(inputDir.resolve(testFile), mockContent.getBytes(StandardCharsets.UTF_8));
+
+        // pre-create the emitter's output so onExists=EXCEPTION fires
+        Path outputDir = tmp.resolve("output");
+        Files.createDirectories(outputDir);
+        Files.writeString(outputDir.resolve("test.xml.json"), "existing file");
+
+        // directEmitThresholdBytes=0 forces server-side emission
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig("tika-config-emit-all.json", tmp, inputDir, outputDir, false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            PipesResult pipesResult = pipesClient.process(new FetchEmitTuple(testFile,
+                    new FetchKey(fetcherName, testFile),
+                    new EmitKey(emitterName, ""), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertEquals(PipesResult.RESULT_STATUS.EMIT_EXCEPTION, pipesResult.status(),
+                    "Should return EMIT_EXCEPTION when emitter fails to write");
+            assertTrue(pipesResult.isTaskException(),
+                    "EMIT_EXCEPTION should be task exception category");
+
+            pipesResult = pipesClient.process(new FetchEmitTuple(testFile,
+                    new FetchKey(fetcherName, testFile),
+                    new EmitKey("non-existent-emitter", ""), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertEquals(PipesResult.RESULT_STATUS.EMITTER_NOT_FOUND, pipesResult.status(),
+                    "Should return EMITTER_NOT_FOUND when emitter name is invalid");
+            assertTrue(pipesResult.isTaskException(),
+                    "EMITTER_NOT_FOUND should be task exception category");
+            Assertions.assertNotNull(pipesResult.message());
+            assertTrue(pipesResult.message().contains("non-existent-emitter") ||
+                            pipesResult.message().contains("not found") ||
+                            pipesResult.message().contains("emitter"),
+                    "Error message should mention the missing emitter");
+            // the configured emitter ids must not be disclosed to the caller
+            assertFalse(pipesResult.message().contains("fse"), pipesResult.message());
+        }
+    }
+
+    @Test
+    public void testFetcherNotFound() throws Exception {
+        // Test FETCHER_NOT_FOUND status
+        // Occurs when FetchKey references a fetcher that doesn't exist
+        // Use invalid fetcher name
+        FetchEmitTuple tuple = new FetchEmitTuple("test.pdf",
+                new FetchKey("non-existent-fetcher", "test.pdf"),
+                new EmitKey(), new Metadata(), new ParseContext(),
+                FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+        PipesResult pipesResult = sharedClient.process(tuple);
+
+        // An unknown fetcher id is not an initialization failure: nothing failed to start,
+        // the caller named something this server does not have. FetchHandler used to catch
+        // IllegalArgumentException, which FetcherManager never throws, so this fell through
+        // to the initialization branch and FETCHER_NOT_FOUND was unreachable.
+        assertEquals(PipesResult.RESULT_STATUS.FETCHER_NOT_FOUND, pipesResult.status(),
+                "Should return FETCHER_NOT_FOUND when fetcher name is invalid");
+
+        assertTrue(pipesResult.isTaskException(),
+                "FETCHER_NOT_FOUND is a task exception, not an initialization failure");
+
+        // Verify error message mentions the fetcher name
+        Assertions.assertNotNull(pipesResult.message());
+        assertTrue(pipesResult.message().contains("non-existent-fetcher") ||
+                        pipesResult.message().contains("not found") ||
+                        pipesResult.message().contains("fetcher"),
+                "Error message should mention the missing fetcher");
+
+        // the configured fetcher ids must not be disclosed to the caller
+        assertFalse(pipesResult.message().contains("fsf"), pipesResult.message());
+    }
+
+    @Test
+    public void testCustomContentHandlerFactory(@TempDir Path tmp) throws Exception {
+        // Test that a custom ContentHandlerFactory configured in tika-config.json
+        // is properly used during parsing. The UppercasingContentHandlerFactory
+        // converts all extracted text to uppercase.
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+
+        // Create a simple mock XML file with known content
+        String mockContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Test Author</metadata>" +
+                "<write element=\"p\">Hello World from Tika</write>" +
+                "</mock>";
+        String testFile = "test-uppercase.xml";
+        Files.write(inputDir.resolve(testFile), mockContent.getBytes(StandardCharsets.UTF_8));
+
+        // Use the uppercasing config
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                "tika-config-uppercasing.json", tmp, inputDir, tmp.resolve("output"), false);
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            FetchEmitTuple tuple = new FetchEmitTuple(testFile,
+                    new FetchKey(fetcherName, testFile),
+                    new EmitKey(), new Metadata(), new ParseContext(),
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP);
+
+            PipesResult pipesResult = pipesClient.process(tuple);
+
+            // Should succeed
+            assertTrue(pipesResult.isSuccess(),
+                    "Processing should succeed. Got status: " + pipesResult.status() +
+                            ", message: " + pipesResult.message());
+
+            Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+            assertEquals(1, pipesResult.emitData().getMetadataList().size());
+
+            Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+            // The content should be uppercased due to UppercasingContentHandlerFactory
+            String content = metadata.get(TikaCoreProperties.TIKA_CONTENT);
+            Assertions.assertNotNull(content, "Content should not be null");
+            assertTrue(content.contains("HELLO WORLD FROM TIKA"),
+                    "Content should be uppercased. Actual content: " + content);
+        }
+    }
+
+    @Test
+    public void testHeartbeatProtocol(@TempDir Path tmp) throws Exception {
+        // Test that heartbeat protocol works correctly and doesn't cause protocol errors
+        // This test exercises the WORKING status messages during long-running operations
+        // to ensure the server properly awaits ACKs after sending heartbeats
+
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+
+        // Create a mock file with 2 second delay to trigger multiple heartbeats
+        String mockContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" +
+                "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Heartbeat Test</metadata>" +
+                "<write element=\"p\">Testing heartbeat protocol synchronization</write>" +
+                "<fakeload millis=\"2000\" cpu=\"1\" mb=\"10\"/>" +
+                "</mock>";
+        String testFile = "mock-heartbeat-test.xml";
+        Files.write(inputDir.resolve(testFile), mockContent.getBytes(StandardCharsets.UTF_8));
+
+        // Create config with very short heartbeat interval (100ms) to ensure heartbeats are sent
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(tmp, inputDir, tmp.resolve("output"));
+        String configContent = Files.readString(tikaConfigPath, StandardCharsets.UTF_8);
+
+        // Modify config to add very short heartbeat interval
+        configContent = configContent.replace(
+                "\"pipes\": {",
+                "\"pipes\": {\n    \"heartbeatIntervalMillis\": 100,"
+        );
+        Files.writeString(tikaConfigPath, configContent, StandardCharsets.UTF_8);
+
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            // Process file - should complete successfully despite multiple heartbeats
+            PipesResult pipesResult = pipesClient.process(
+                    new FetchEmitTuple(testFile, new FetchKey(fetcherName, testFile),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            // Verify successful completion
+            assertTrue(pipesResult.isSuccess(),
+                    "Processing should succeed even with heartbeat messages. Got status: " + pipesResult.status());
+            Assertions.assertNotNull(pipesResult.emitData().getMetadataList());
+            assertEquals(1, pipesResult.emitData().getMetadataList().size());
+            Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+            assertEquals("Heartbeat Test", metadata.get("dc:creator"));
+        }
+    }
+
+    @Test
+    public void testContentOnlyMode() throws Exception {
+        // Test that CONTENT_ONLY mode strips all metadata except tk:content
+        ParseContext parseContext = new ParseContext();
+        parseContext.set(ParseMode.class, ParseMode.CONTENT_ONLY);
+
+        PipesResult pipesResult = processShared(testDoc, parseContext);
+        assertNotNull(pipesResult.emitData().getMetadataList());
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+        // Content should be present
+        String content = metadata.get(TikaCoreProperties.TIKA_CONTENT);
+        assertNotNull(content, "TIKA_CONTENT should be present in CONTENT_ONLY mode");
+        assertFalse(content.isEmpty(), "TIKA_CONTENT should not be empty");
+
+        // Other metadata should be stripped by the IncludeFieldMetadataFilter
+        assertNull(metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY),
+                "RESOURCE_NAME should be stripped in CONTENT_ONLY mode");
+        assertNull(metadata.get(HttpHeaders.CONTENT_TYPE),
+                "CONTENT_TYPE should be stripped in CONTENT_ONLY mode");
+    }
+
+    @Test
+    public void testContentOnlyModeWithUserFilter() throws Exception {
+        // Test that CONTENT_ONLY mode respects a user-provided MetadataFilter
+        ParseContext parseContext = new ParseContext();
+        parseContext.set(ParseMode.class, ParseMode.CONTENT_ONLY);
+        // Set a user metadata filter via JSON - this should override the default CONTENT_ONLY filter
+        parseContext.setJsonConfig("metadata-filters", """
+            ["mock-upper-case-filter"]
+        """);
+
+        PipesResult pipesResult = processShared(testDoc, parseContext);
+        assertNotNull(pipesResult.emitData().getMetadataList());
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+        // User filter (uppercase) should take effect instead of CONTENT_ONLY filter
+        // So all metadata should still be present (but uppercased)
+        assertEquals("TESTOVERLAPPINGTEXT.PDF",
+                metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY),
+                "User filter should take priority over CONTENT_ONLY filter");
+    }
+
+    @Test
+    public void testRecoveryAfterServerCrash(@TempDir Path tmp) throws Exception {
+        // Test that after a server crash (System.exit), the client can recover
+        // and successfully process the next document.
+        // This exercises the full crash → restart → reconnect path.
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+
+        // Create a mock file that will crash the server
+        String crashContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Crash Test</metadata>" +
+                "<write element=\"p\">content before crash</write>" +
+                "<system_exit/>" + "</mock>";
+        String crashFile = "mock-crash.xml";
+        Files.write(inputDir.resolve(crashFile), crashContent.getBytes(StandardCharsets.UTF_8));
+
+        // Create a normal mock file
+        String normalContent = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" + "<mock>" +
+                "<metadata action=\"add\" name=\"dc:creator\">Normal Author</metadata>" +
+                "<write element=\"p\">normal content</write>" +
+                "</mock>";
+        String normalFile = "mock-normal.xml";
+        Files.write(inputDir.resolve(normalFile), normalContent.getBytes(StandardCharsets.UTF_8));
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(tmp, inputDir, tmp.resolve("output"));
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            // First: process the crashing file — server should die
+            PipesResult crashResult = pipesClient.process(
+                    new FetchEmitTuple(crashFile, new FetchKey(fetcherName, crashFile),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            assertTrue(crashResult.isProcessCrash(),
+                    "Crash file should result in process crash, got: " + crashResult.status());
+
+            // Second: process the normal file — client should restart server and succeed
+            PipesResult normalResult = pipesClient.process(
+                    new FetchEmitTuple(normalFile, new FetchKey(fetcherName, normalFile),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+
+            assertTrue(normalResult.isSuccess(),
+                    "Normal file should succeed after crash recovery, got: " + normalResult.status() +
+                            " message: " + normalResult.message());
+            Assertions.assertNotNull(normalResult.emitData().getMetadataList());
+            assertEquals(1, normalResult.emitData().getMetadataList().size());
+            Metadata metadata = normalResult.emitData().getMetadataList().get(0);
+            assertEquals("Normal Author", metadata.get("dc:creator"));
+        }
+    }
+
+    @Test
+    public void testRecoveryAfterRealOom(@TempDir Path tmp) throws Exception {
+        // Genuine heap exhaustion, not a thrown OutOfMemoryError: the fork must report OOM
+        // and the next document must succeed on a restarted fork.
+        Path inputDir = tmp.resolve("input");
+        Files.createDirectories(inputDir);
+        String oomFile = "mock-real-oom.xml";
+        Files.writeString(inputDir.resolve(oomFile),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" ?><mock><oom/></mock>", StandardCharsets.UTF_8);
+        String normalFile = "mock-normal.xml";
+        Files.writeString(inputDir.resolve(normalFile),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" ?><mock>" +
+                        "<metadata action=\"add\" name=\"dc:creator\">Normal Author</metadata>" +
+                        "<write element=\"p\">normal content</write></mock>", StandardCharsets.UTF_8);
+
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(tmp, inputDir, tmp.resolve("output"));
+        PipesConfig pipesConfig = PipesConfig.load(TikaJsonConfig.load(tikaConfigPath));
+        pipesConfig.setForkedJvmArgs(new ArrayList<>(List.of("-Xmx128m")));
+
+        try (PipesClient pipesClient = new PipesClient(pipesConfig, tikaConfigPath)) {
+            PipesResult oomResult = pipesClient.process(
+                    new FetchEmitTuple(oomFile, new FetchKey(fetcherName, oomFile),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertEquals(PipesResult.RESULT_STATUS.OOM, oomResult.status(), oomResult.message());
+
+            PipesResult normalResult = pipesClient.process(
+                    new FetchEmitTuple(normalFile, new FetchKey(fetcherName, normalFile),
+                            new EmitKey(), new Metadata(), new ParseContext(),
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            assertTrue(normalResult.isSuccess(), "after OOM: " + normalResult.status() + " " + normalResult.message());
+            assertEquals("Normal Author",
+                    normalResult.emitData().getMetadataList().get(0).get("dc:creator"));
+        }
+    }
+
+    @Test
+    public void testConcatenateMode() throws Exception {
+        // Test that CONCATENATE mode returns a single metadata object with content
+        // but preserves all metadata fields (unlike CONTENT_ONLY)
+        ParseContext parseContext = new ParseContext();
+        parseContext.set(ParseMode.class, ParseMode.CONCATENATE);
+        PipesResult pipesResult = processShared(embeddedDoc, parseContext);
+        assertNotNull(pipesResult.emitData().getMetadataList());
+        // CONCATENATE produces a single metadata object (not one per embedded doc)
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+        // Content should be present
+        String content = metadata.get(TikaCoreProperties.TIKA_CONTENT);
+        assertNotNull(content, "TIKA_CONTENT should be present in CONCATENATE mode");
+
+        // All metadata should still be present (unlike CONTENT_ONLY)
+        assertNotNull(metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY),
+                "RESOURCE_NAME should be preserved in CONCATENATE mode");
+    }
+
+    @Test
+    public void testConcatenateModeIgnoreHandlerDoesNotLeakContent() throws Exception {
+        // CONCATENATE + handler type "ignore" must not add TIKA_CONTENT at all -- previously
+        // ParseHandler.parseConcatenated's finally block unconditionally called
+        // handler.toString(), which for the DefaultHandler behind "ignore" produces garbage
+        // like "org.xml.sax.helpers.DefaultHandler@6c8b1edd" instead of skipping, unlike
+        // RecursiveParserWrapperHandler.addContent (used by RMETA mode), which already guards
+        // against this.
+        ParseContext parseContext = new ParseContext();
+        parseContext.set(ParseMode.class, ParseMode.CONCATENATE);
+        parseContext.set(ContentHandlerFactory.class,
+                new BasicContentHandlerFactory(BasicContentHandlerFactory.HANDLER_TYPE.IGNORE, -1));
+        PipesResult pipesResult = processShared(embeddedDoc, parseContext);
+        assertEquals(1, pipesResult.emitData().getMetadataList().size());
+        Metadata metadata = pipesResult.emitData().getMetadataList().get(0);
+
+        assertNull(metadata.get(TikaCoreProperties.TIKA_CONTENT),
+                "TIKA_CONTENT must not be set when the handler type is \"ignore\"");
+    }
+
+    @Test
+    public void testClientBackstopFiresAgainstChattyButNeverFinishingServer(@TempDir Path tmp) throws Exception {
+        // TIKA-4813 follow-up: a "server" that keeps sending WORKING heartbeats forever
+        // (well within SO_TIMEOUT) but never sends FINISHED, standing in for a
+        // wedged-but-chatty or compromised forked worker. Without a client-side backstop,
+        // PipesClient.waitForServer blocks forever, since SO_TIMEOUT resets on any
+        // received message and nothing else bounds total wait time.
+        Path tikaConfigPath = PluginsTestHelper.getFileSystemFetcherConfig(
+                tmp, tmp.resolve("input"), tmp.resolve("output"));
+        TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(tikaConfigPath);
+        PipesConfig pipesConfig = PipesConfig.load(tikaJsonConfig);
+
+        ParseContext parseContext = new ParseContext();
+        // clientBackstopMillis = total + 2*progress = 1000 + 2*400 = 1800ms
+        parseContext.set(TimeoutLimits.class, new TimeoutLimits(1000, 400));
+
+        try (ChattyNeverFinishingServerManager fakeServerManager = new ChattyNeverFinishingServerManager();
+             PipesClient pipesClient = new PipesClient(pipesConfig, fakeServerManager)) {
+            long startTime = System.currentTimeMillis();
+            PipesResult result = pipesClient.process(
+                    new FetchEmitTuple("id", new FetchKey(fetcherName, "x"),
+                            new EmitKey(), new Metadata(), parseContext,
+                            FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
+            long elapsed = System.currentTimeMillis() - startTime;
+
+            assertEquals(PipesResult.RESULT_STATUS.TIMEOUT, result.status());
+            assertTrue(elapsed < 10000,
+                    "client backstop should fire within a few seconds of its ~1800ms " +
+                            "deadline, not wait for the 60s default SO_TIMEOUT (took " + elapsed + "ms)");
+            // Returning TIMEOUT is only half the job: the worker is still wedged on this
+            // request, so it must also be marked, or the pool hands it the next document.
+            assertEquals(RestartReason.TIMEOUT, fakeServerManager.marked,
+                    "a worker that blew the client backstop must be marked for restart");
+        }
+    }
+
+    /**
+     * Fake {@link ServerManager} whose "server" accepts one connection, sends READY,
+     * reads the NEW_REQUEST, then sends WORKING heartbeats forever and never FINISHED --
+     * used to prove the client-side wall-clock backstop in
+     * {@code PipesClient#waitForServer} fires independently of anything the "server"
+     * reports about its own liveness.
+     */
+    private static class ChattyNeverFinishingServerManager implements ServerManager {
+        private final ServerSocket serverSocket;
+        private volatile boolean running = true;
+        volatile RestartReason marked;
+
+        ChattyNeverFinishingServerManager() throws IOException {
+            serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            Thread acceptor = new Thread(this::acceptLoop, "chatty-never-finishing-server-acceptor");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        private void acceptLoop() {
+            while (running) {
+                try {
+                    Socket socket = serverSocket.accept();
+                    Thread handler = new Thread(() -> handleConnection(socket),
+                            "chatty-never-finishing-server-connection");
+                    handler.setDaemon(true);
+                    handler.start();
+                } catch (IOException e) {
+                    // expected on shutdown when serverSocket.close() unblocks accept()
+                }
+            }
+        }
+
+        private void handleConnection(Socket socket) {
+            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                 DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()))) {
+                PipesMessage.ready().write(out);
+                PipesMessage.read(in); // NEW_REQUEST -- ignored, this fake never parses anything
+                while (!socket.isClosed()) {
+                    PipesMessage.working().write(out);
+                    Thread.sleep(200);
+                }
+            } catch (Exception e) {
+                // expected once the client closes the connection when its backstop fires
+            }
+        }
+
+        @Override
+        public int getPort() {
+            return serverSocket.getLocalPort();
+        }
+
+        @Override
+        public void ensureRunning() {
+            // already running from the constructor
+        }
+
+        @Override
+        public Socket connect(int socketTimeoutMillis) throws IOException {
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), getPort()), socketTimeoutMillis);
+            socket.setSoTimeout(socketTimeoutMillis);
+            return socket;
+        }
+
+        @Override
+        public void shutdown() {
+            running = false;
+        }
+
+        @Override
+        public boolean isRunning() {
+            return running;
+        }
+
+        @Override
+        public Path getTempDirectory() {
+            return null;
+        }
+
+        @Override
+        public long getGeneration() {
+            return 0;
+        }
+
+        @Override
+        public void markServerForRestart(RestartReason reason, long generation) {
+            marked = reason;
+        }
+
+        @Override
+        public int handleCrashAndGetExitCode(long generation) {
+            return -1;
+        }
+
+        @Override
+        public void close() throws IOException {
+            running = false;
+            serverSocket.close();
+        }
+    }
+}

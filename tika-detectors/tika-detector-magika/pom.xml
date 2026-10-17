@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-detectors</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
 
@@ -38,6 +38,20 @@
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <!-- Annotation processor - contains @TikaComponent and ensures build order.
+         "provided" because it is only used at compile time -->
+    <dependency>
+      <groupId>org.apache.tika</groupId>
+      <artifactId>tika-annotation-processor</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>tika-serialization</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>
@@ -60,40 +74,26 @@
   <build>
     <plugins>
       <plugin>
-        <artifactId>maven-shade-plugin</artifactId>
-        <executions>
-          <execution>
-            <phase>package</phase>
-            <goals>
-              <goal>shade</goal>
-            </goals>
-            <configuration>
-              <createDependencyReducedPom>
-                false
-              </createDependencyReducedPom>
-              <filters>
-                <filter>
-                  <artifact>*:*</artifact>
-                  <excludes>
-                    <exclude>module-info.class</exclude>
-                    <exclude>module-info.class</exclude>
-                    <exclude>META-INF/*.SF</exclude>
-                    <exclude>META-INF/*.DSA</exclude>
-                    <exclude>META-INF/*.RSA</exclude>
-                    <exclude>META-INF/*.txt</exclude>
-                  </excludes>
-                </filter>
-              </filters>
-              <transformers>
-                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <manifestEntries>
-                    <Multi-Release>true</Multi-Release>
-                  </manifestEntries>
-                </transformer>
-              </transformers>
-            </configuration>
-          </execution>
-        </executions>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>src/test/resources/test-documents/testPDF.pdf</inputExclude>
+          </inputExcludes>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.apache.tika</groupId>
+              <artifactId>tika-annotation-processor</artifactId>
+              <version>${project.version}</version>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.language.translate.impl;
 
 import java.io.BufferedReader;
@@ -27,12 +26,14 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
 import java.util.Properties;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 
 /**
  * Translator that uses the Moses decoder for translation.
  * Users must install the Moses system before using this Translator. @link http://www.statmt.org/moses/.
  */
+@TikaComponent
 public class MosesTranslator extends ExternalTranslator {
 
     private static final String DEFAULT_PATH = "dummy-path";

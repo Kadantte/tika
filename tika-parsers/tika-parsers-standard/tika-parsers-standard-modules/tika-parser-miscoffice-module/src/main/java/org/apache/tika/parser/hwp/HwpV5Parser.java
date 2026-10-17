@@ -17,20 +17,23 @@
 package org.apache.tika.parser.hwp;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Set;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class HwpV5Parser implements Parser {
 
     public static final String HWP_MIME_TYPE = "application/x-hwp-v5";
@@ -49,16 +52,16 @@ public class HwpV5Parser implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        metadata.set(Metadata.CONTENT_TYPE, HWP_MIME_TYPE);
+        metadata.set(HttpHeaders.CONTENT_TYPE, HWP_MIME_TYPE);
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         try {
-            extractor.extract(stream, metadata, xhtml);
+            extractor.extract(tis, metadata, xhtml);
         } finally {
             xhtml.endDocument();
         }

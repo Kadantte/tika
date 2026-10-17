@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-langdetect</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
 
@@ -41,18 +41,41 @@
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>tika-annotation-processor</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
   </dependencies>
 
   <build>
     <plugins>
       <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.apache.tika</groupId>
+              <artifactId>tika-annotation-processor</artifactId>
+              <version>${project.version}</version>
+            </path>
+            <path>
+              <groupId>org.apache.tika</groupId>
+              <artifactId>tika-core</artifactId>
+              <version>${project.version}</version>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+      <plugin>
         <groupId>org.apache.rat</groupId>
         <artifactId>apache-rat-plugin</artifactId>
-        <version>${rat.version}</version>
         <configuration>
-          <excludes>
-            <exclude>opennlp_langdetect_model_20190626.bin</exclude>
-          </excludes>
+          <inputExcludes>
+            <inputExclude>opennlp_langdetect_model_20190626.bin</inputExclude>
+          </inputExcludes>
         </configuration>
       </plugin>
       <plugin>
@@ -64,12 +87,16 @@
               <Automatic-Module-Name>org.apache.tika.langdetect.opennlp</Automatic-Module-Name>
             </manifestEntries>
           </archive>
+          <includes>
+            <include>**/*</include>
+            <include>META-INF/tika/**</include>
+          </includes>
         </configuration>
       </plugin>
     </plugins>
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

@@ -18,12 +18,11 @@ package org.apache.tika.parser.dif;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import java.io.InputStream;
-
 import org.junit.jupiter.api.Test;
 import org.xml.sax.ContentHandler;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
@@ -37,12 +36,14 @@ public class DIFParserTest extends TikaTest {
         ContentHandler handler = new BodyContentHandler();
         Metadata metadata = new Metadata();
 
-        try (InputStream stream = getResourceAsStream("/test-documents/Zamora2010.dif")) {
-            parser.parse(stream, handler, metadata, new ParseContext());
+        try (TikaInputStream tis = getResourceAsStream("/test-documents/Zamora2010.dif")) {
+            parser.parse(tis, handler, metadata, new ParseContext());
         }
 
-        assertEquals(metadata.get("DIF-Entry_ID"), "00794186-48f9-11e3-9dcb-00c0f03d5b7c");
-        assertEquals(metadata.get("DIF-Metadata_Name"), "ACADIS IDN DIF");
+        // DIF element-name paths are doc-derived, so DIFContentHandler routes them through the
+        // dif: KeyPrefix (TIKA-4816).
+        assertEquals(metadata.get("dif:DIF-Entry_ID"), "00794186-48f9-11e3-9dcb-00c0f03d5b7c");
+        assertEquals(metadata.get("dif:DIF-Metadata_Name"), "ACADIS IDN DIF");
 
         String content = handler.toString();
         assertContains("Title: Zamora 2010 Using Sediment Geochemistry", content);

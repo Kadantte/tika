@@ -17,6 +17,8 @@
 package org.apache.tika.eval.app;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
@@ -25,6 +27,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -46,7 +49,6 @@ import org.apache.commons.cli.help.HelpFormatter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.tika.config.TikaConfig;
 import org.apache.tika.eval.app.db.Cols;
 import org.apache.tika.eval.app.db.JDBCUtil;
 import org.apache.tika.eval.app.db.MimeBuffer;
@@ -55,10 +57,14 @@ import org.apache.tika.eval.app.io.DBWriter;
 import org.apache.tika.eval.app.io.ExtractReader;
 import org.apache.tika.eval.app.io.ExtractReaderException;
 import org.apache.tika.eval.app.io.IDBWriter;
-import org.apache.tika.pipes.FetchEmitTuple;
-import org.apache.tika.pipes.pipesiterator.CallablePipesIterator;
-import org.apache.tika.pipes.pipesiterator.PipesIterator;
-import org.apache.tika.pipes.pipesiterator.fs.FileSystemPipesIterator;
+import org.apache.tika.eval.app.io.PipesReport;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.mime.MimeTypes;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.pipesiterator.PipesIterator;
+import org.apache.tika.pipes.core.pipesiterator.CallablePipesIterator;
+import org.apache.tika.pipes.iterator.fs.FileSystemPipesIterator;
+import org.apache.tika.plugins.ExtensionConfig;
 
 public class ExtractProfileRunner {
 
@@ -76,8 +82,15 @@ public class ExtractProfileRunner {
                         + " If not specified, -extracts is crawled as is.").get())
                 .addOption(Option.builder("d").longOpt("db").hasArg().desc("optional: db path").get())
                 .addOption(Option.builder("c").longOpt("config").hasArg().desc("tika-eval json config file").get())
-                ;
+                .addOption(Option.builder("n").longOpt("numWorkers").hasArg().desc("number of worker threads").get())
+                .addOption(Option.builder("m").longOpt("maxExtractLength").hasArg().desc("maximum extract length").get())
+                .addOption(Option.builder("pr").longOpt("pipesReport").hasArg()
+                        .desc("optional: jsonl from tika-pipes' file-system-jsonl-reporter; default: <extracts>/.run-info/crashes-*.jsonl").get())
+                .addOption(Option.builder("ri").longOpt("runInfo").hasArg()
+                        .desc("optional: run-info json written by run-batch.sh; default: <extracts>/.run-info/run-info-*.json").get())
+        ;
     }
+
     public static void main(String[] args) throws Exception {
         DefaultParser defaultCLIParser = new DefaultParser();
         CommandLine commandLine = defaultCLIParser.parse(OPTIONS, args);
@@ -85,21 +98,28 @@ public class ExtractProfileRunner {
         Path extractsDir = commandLine.hasOption('e') ? Paths.get(commandLine.getOptionValue('e')) : Paths.get(USAGE_FAIL("Must specify extracts dir: -i"));
         Path inputDir = commandLine.hasOption('i') ? Paths.get(commandLine.getOptionValue('i')) : extractsDir;
         String dbPath = commandLine.hasOption('d') ? commandLine.getOptionValue('d') : USAGE_FAIL("Must specify the db name: -d");
-        String jdbcString = getJdbcConnectionString(dbPath);
-        execute(inputDir, extractsDir, jdbcString, evalConfig);
-    }
-
-    private static String getJdbcConnectionString(String dbPath) {
-        if (dbPath.startsWith("jdbc:")) {
-            return dbPath;
+        String jdbcString = JDBCUtil.getJdbcConnectionString(dbPath);
+        if (commandLine.hasOption('n')) {
+            evalConfig.setNumWorkers(Integer.parseInt(commandLine.getOptionValue('n')));
         }
-        //default to h2
-        Path p = Paths.get(dbPath);
-        return "jdbc:h2:file:" + p.toAbsolutePath();
 
+        if (commandLine.hasOption('m')) {
+            evalConfig.setMaxExtractLength(Long.parseLong(commandLine.getOptionValue('m')));
+        }
+        RunInfo.Side side = RunInfo.loadSide(optPath(commandLine, "pr"), optPath(commandLine, "ri"), extractsDir);
+        Map<String, String> runInfo = new LinkedHashMap<>(RunInfo.evalInfo(args, evalConfig, inputDir));
+        runInfo.putAll(side.batchInfo());
+        runInfo.putAll(RunInfo.pipesReportInfo(side.pipesReport()));
+        runInfo.putAll(RunInfo.extractsInfo(extractsDir));
+        execute(inputDir, extractsDir, jdbcString, evalConfig, side.pipesReport(), runInfo);
     }
 
-    private static void execute(Path inputDir, Path extractsDir, String dbPath, EvalConfig evalConfig) throws SQLException, IOException {
+    private static Path optPath(CommandLine commandLine, String opt) {
+        return commandLine.hasOption(opt) ? Paths.get(commandLine.getOptionValue(opt)) : null;
+    }
+
+    private static void execute(Path inputDir, Path extractsDir, String dbPath, EvalConfig evalConfig, PipesReport pipesReport,
+                                Map<String, String> runInfo) throws SQLException, IOException {
 
         //parameterize this? if necesssary
         try {
@@ -112,6 +132,10 @@ public class ExtractProfileRunner {
         ExtractProfilerBuilder builder = new ExtractProfilerBuilder();
         MimeBuffer mimeBuffer = initTables(jdbcUtil, builder, dbPath, evalConfig);
         builder.populateRefTables(jdbcUtil, mimeBuffer);
+        // before workers start, so an aborted run still says what it was
+        IDBWriter runInfoWriter = builder.getDBWriter(List.of(RunInfo.RUN_INFO_TABLE), jdbcUtil, mimeBuffer);
+        RunInfo.write(runInfoWriter, RunInfo.RUN_INFO_TABLE, runInfo);
+        runInfoWriter.close();
 
         AtomicInteger processed = new AtomicInteger(0);
         AtomicInteger activeWorkers = new AtomicInteger(evalConfig.getNumWorkers());
@@ -129,7 +153,8 @@ public class ExtractProfileRunner {
         executorCompletionService.submit(pipesIterator);
         for (int i = 0; i < evalConfig.getNumWorkers(); i++) {
             ExtractReader extractReader = new ExtractReader(ExtractReader.ALTER_METADATA_LIST.AS_IS, evalConfig.getMinExtractLength(), evalConfig.getMaxExtractLength());
-            ExtractProfiler extractProfiler = new ExtractProfiler(inputDir, extractsDir, extractReader, builder.getDBWriter(builder.tableInfos, jdbcUtil, mimeBuffer));
+            ExtractProfiler extractProfiler = new ExtractProfiler(inputDir, extractsDir, extractReader, builder.getDBWriter(builder.tableInfos, jdbcUtil, mimeBuffer),
+                    pipesReport);
             executorCompletionService.submit(new ProfileWorker(queue, extractProfiler, processed));
         }
 
@@ -155,17 +180,28 @@ public class ExtractProfileRunner {
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         } finally {
+            Map<TableInfo, PipesReport> ledgers = new HashMap<>();
+            ledgers.put(RunInfo.RUN_INFO_TABLE, pipesReport);
+            RunInfo.finish(runInfoWriter, RunInfo.RUN_INFO_TABLE, ledgers);
             mimeBuffer.close();
             executorService.shutdownNow();
         }
 
     }
 
-    private static PipesIterator createIterator(Path inputDir) {
-        FileSystemPipesIterator fs = new FileSystemPipesIterator(inputDir);
-        fs.setFetcherName("");
-        fs.setEmitterName("");
-        return fs;
+    private static PipesIterator createIterator(Path inputDir) throws IOException {
+        String json = null;
+        try (InputStream is = ExtractProfileRunner.class.getResourceAsStream("/pipes-iterator-template.json")) {
+            json = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        json = json.replace("FETCHER_BASE_PATH", inputDir.toAbsolutePath().toString());
+        json = json.replace("\\", "/");
+
+        try {
+            return FileSystemPipesIterator.build(new ExtensionConfig("", "", json));
+        } catch (TikaConfigException e) {
+            throw new IOException(e);
+        }
     }
 
     private static MimeBuffer initTables(JDBCUtil jdbcUtil, ExtractProfilerBuilder builder, String connectionString, EvalConfig evalConfig) throws SQLException, IOException {
@@ -175,7 +211,7 @@ public class ExtractProfileRunner {
         jdbcUtil.createTables(builder.getRefTableInfos(), JDBCUtil.CREATE_TABLE.THROW_EX_IF_EXISTS);
 
         //step 2. create mime buffer
-        return new MimeBuffer(jdbcUtil.getConnection(), builder.getMimeTable(), TikaConfig.getDefaultConfig());
+        return new MimeBuffer(jdbcUtil.getConnection(), builder.getMimeTable(), MimeTypes.getDefaultMimeTypes());
     }
 
     private static void USAGE() throws IOException {
@@ -216,6 +252,9 @@ public class ExtractProfileRunner {
                     queue.put(PipesIterator.COMPLETED_SEMAPHORE);
                     return PROFILE_WORKER_COMPLETED_VALUE;
                 }
+                if (RunInfo.isRunInfoPath(t.getFetchKey().getFetchKey())) {
+                    continue;
+                }
                 extractProfiler.processFileResource(t.getFetchKey());
                 processed.incrementAndGet();
             }
@@ -234,8 +273,10 @@ public class ExtractProfileRunner {
             tableInfos.add(ExtractProfiler.EXTRACT_EXCEPTION_TABLE);
             tableInfos.add(ExtractProfiler.EXCEPTION_TABLE);
             tableInfos.add(ExtractProfiler.CONTENTS_TABLE);
+            tableInfos.add(ExtractProfiler.ENCODINGS_TABLE);
             tableInfos.add(ExtractProfiler.TAGS_TABLE);
             tableInfos.add(ExtractProfiler.EMBEDDED_FILE_PATH_TABLE);
+            tableInfos.add(RunInfo.RUN_INFO_TABLE);
             this.tableInfos = Collections.unmodifiableList(tableInfos);
 
             List<TableInfo> refTableInfos = new ArrayList<>();

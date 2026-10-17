@@ -17,20 +17,12 @@
 package org.apache.tika.parser.pdf;
 
 import java.io.Serializable;
-import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
-import java.util.HashSet;
-import java.util.Locale;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.text.PDFTextStripper;
 
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.config.OperatorOnly;
+import org.apache.tika.parser.pages.PagesConfig;
 import org.apache.tika.parser.pdf.image.ImageGraphicsEngineFactory;
-import org.apache.tika.renderer.Renderer;
 
 /**
  * Config for PDFParser.
@@ -44,21 +36,32 @@ import org.apache.tika.renderer.Renderer;
  */
 public class PDFParserConfig implements Serializable {
 
-    public enum TikaImageType {
-        RGB(ImageType.RGB),
-        GRAY(ImageType.GRAY);
+    private static final long serialVersionUID = 6492570218190936986L;
 
-        private ImageType imageType;
-        TikaImageType(ImageType imageType) {
-            this.imageType = imageType;
-        }
-        public ImageType getImageType() {
-            return imageType;
-        }
+    /**
+     * Mode for checking document access permissions.
+     */
+    public enum AccessCheckMode {
+        /**
+         * Don't check extraction permissions. Content will always be extracted
+         * regardless of document permissions. This is the default for backwards
+         * compatibility with Tika's legacy behavior (&lt;= v1.7).
+         */
+        DONT_CHECK,
+
+        /**
+         * Check permissions, but allow extraction for accessibility purposes if
+         * extraction for accessibility is allowed.
+         */
+        ALLOW_EXTRACTION_FOR_ACCESSIBILITY,
+
+        /**
+         * If extraction is blocked, throw an {@link org.apache.tika.exception.AccessPermissionException}
+         * even if the document allows extraction for accessibility.
+         */
+        IGNORE_ACCESSIBILITY_ALLOWANCE
     }
 
-    private static final long serialVersionUID = 6492570218190936986L;
-    private final Set<String> userConfigured = new HashSet<>();
     // True if we let PDFBox "guess" where spaces should go:
     private boolean enableAutoSpace = true;
 
@@ -96,9 +99,7 @@ public class PDFParserConfig implements Serializable {
     //a pdf file) should only be extracted once.
     private boolean extractUniqueInlineImagesOnly = true;
 
-    //Should the PDFParser _try_ to extract marked content/structure tags (backoff to regular
-    //text extraction if the given PDF doesn't have marked content)
-    private boolean extractMarkedContent = false;
+    private MarkedContentConfig markedContent = new MarkedContentConfig();
 
     //The character width-based tolerance value used to estimate where spaces in text should be
     // added. Default taken from PDFBox.
@@ -116,27 +117,11 @@ public class PDFParserConfig implements Serializable {
     //content from elsewhere in the document.
     private boolean ifXFAExtractOnlyXFA = false;
 
-    private OCR_STRATEGY ocrStrategy = OCR_STRATEGY.AUTO;
+    /** This parser's overlay on the {@code "pages"} block; the 4.0 aliases write to it too. */
+    private PagesConfig pages = new PagesConfig();
 
-    // If OCR_Strategy=AUTO, then this controls the algorithm used
-    private static final OCRStrategyAuto OCR_STRATEGY_AUTO_BETTER = new OCRStrategyAuto(10, 10);
-    private static final OCRStrategyAuto OCR_STRATEGY_AUTO_FASTER = new OCRStrategyAuto(.1f, 10);
-    private static final int OCR_STRATEGY_AUTO_DEFAULT_CHARS_PER_PAGE = 10;
-
-    private OCRStrategyAuto ocrStrategyAuto = OCR_STRATEGY_AUTO_BETTER;
-
-    private OCR_RENDERING_STRATEGY ocrRenderingStrategy = OCR_RENDERING_STRATEGY.ALL;
-
-    private int ocrDPI = 300;
-    private TikaImageType ocrImageType = TikaImageType.GRAY;
-    private String ocrImageFormatName = "png";
-    private float ocrImageQuality = 1.0f;
-
-    /**
-     * Should the entire document be rendered?
-     */
-    private IMAGE_STRATEGY imageStrategy = IMAGE_STRATEGY.NONE;
-    private AccessChecker accessChecker = new AccessChecker();
+    private OcrConfig.RenderingStrategy renderingStrategy = OcrConfig.RenderingStrategy.ALL;
+    private AccessCheckMode accessCheckMode = AccessCheckMode.DONT_CHECK;
 
     //The PDFParser can throw IOExceptions if there is a problem
     //with a streams.  If this is set to true, Tika's
@@ -154,13 +139,13 @@ public class PDFParserConfig implements Serializable {
 
     private boolean detectAngles = false;
 
-    private Renderer renderer;
-
     private boolean extractIncrementalUpdateInfo = true;
 
     private boolean parseIncrementalUpdates = false;
 
     int maxIncrementalUpdates = 10;
+
+    private int maxPages = -1;
 
     private boolean throwOnEncryptedPayload = false;
 
@@ -184,24 +169,29 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractInlineImageMetadataOnly(boolean extractInlineImageMetadataOnly) {
         this.extractInlineImageMetadataOnly = extractInlineImageMetadataOnly;
-        userConfigured.add("extractInlineImageMetadataOnly");
     }
 
-    public boolean isExtractMarkedContent() {
-        return extractMarkedContent;
+    public MarkedContentConfig getMarkedContent() {
+        return markedContent;
     }
 
     /**
-     * If the PDF contains marked content, try to extract text and its marked structure.
-     * If the PDF does not contain marked content, backoff to the regular PDF2XHTML for
-     * text extraction.  As of 1.24, this is an "alpha" version.
-     *
-     * @param extractMarkedContent
-     * @since 1.24
+     * How to use a PDF's structure tree (tagged PDF); see {@link MarkedContentConfig}.
+     * A PDF without a structure tree always uses the text stripper.
      */
+    public void setMarkedContent(MarkedContentConfig markedContent) {
+        this.markedContent = markedContent == null ? new MarkedContentConfig() : markedContent;
+    }
+
+    /**
+     * @deprecated since 4.1.0; use {@link #setMarkedContent(MarkedContentConfig)}.
+     * {@code true} is {@link MarkedContentConfig.Strategy#TAGS}, {@code false} is
+     * {@link MarkedContentConfig.Strategy#NONE}.
+     */
+    @Deprecated
     public void setExtractMarkedContent(boolean extractMarkedContent) {
-        this.extractMarkedContent = extractMarkedContent;
-        userConfigured.add("extractMarkedContent");
+        markedContent.setStrategy(extractMarkedContent ? MarkedContentConfig.Strategy.TAGS :
+                MarkedContentConfig.Strategy.NONE);
     }
 
     /**
@@ -245,7 +235,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractAcroFormContent(boolean extractAcroFormContent) {
         this.extractAcroFormContent = extractAcroFormContent;
-        userConfigured.add("extractAcroFormContent");
     }
 
     /**
@@ -265,7 +254,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setIfXFAExtractOnlyXFA(boolean ifXFAExtractOnlyXFA) {
         this.ifXFAExtractOnlyXFA = ifXFAExtractOnlyXFA;
-        userConfigured.add("ifXFAExtractOnlyXFA");
     }
 
     /**
@@ -284,7 +272,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractBookmarksText(boolean extractBookmarksText) {
         this.extractBookmarksText = extractBookmarksText;
-        userConfigured.add("extractBookmarksText");
     }
 
     public boolean isExtractFontNames() {
@@ -298,7 +285,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractFontNames(boolean extractFontNames) {
         this.extractFontNames = extractFontNames;
-        userConfigured.add("extractFontNames");
     }
 
     /**
@@ -333,7 +319,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractInlineImages(boolean extractInlineImages) {
         this.extractInlineImages = extractInlineImages;
-        userConfigured.add("extractInlineImages");
     }
 
     /**
@@ -366,7 +351,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractUniqueInlineImagesOnly(boolean extractUniqueInlineImagesOnly) {
         this.extractUniqueInlineImagesOnly = extractUniqueInlineImagesOnly;
-        userConfigured.add("extractUniqueInlineImagesOnly");
     }
 
     /**
@@ -384,7 +368,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setEnableAutoSpace(boolean enableAutoSpace) {
         this.enableAutoSpace = enableAutoSpace;
-        userConfigured.add("enableAutoSpace");
     }
 
     /**
@@ -405,7 +388,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setSuppressDuplicateOverlappingText(boolean suppressDuplicateOverlappingText) {
         this.suppressDuplicateOverlappingText = suppressDuplicateOverlappingText;
-        userConfigured.add("suppressDuplicateOverlappingText");
     }
 
     /**
@@ -423,7 +405,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setIgnoreContentStreamSpaceGlyphs(boolean ignoreContentStreamSpaceGlyphs) {
         this.ignoreContentStreamSpaceGlyphs = ignoreContentStreamSpaceGlyphs;
-        userConfigured.add("ignoreContentStreamSpaceGlyphs");
     }
 
     /**
@@ -439,7 +420,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractAnnotationText(boolean extractAnnotationText) {
         this.extractAnnotationText = extractAnnotationText;
-        userConfigured.add("extractAnnotationText");
     }
 
     /**
@@ -459,7 +439,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setSortByPosition(boolean sortByPosition) {
         this.sortByPosition = sortByPosition;
-        userConfigured.add("sortByPosition");
     }
 
     /**
@@ -474,7 +453,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setAverageCharTolerance(Float averageCharTolerance) {
         this.averageCharTolerance = averageCharTolerance;
-        userConfigured.add("averageCharTolerance");
     }
 
     /**
@@ -489,7 +467,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setSpacingTolerance(Float spacingTolerance) {
         this.spacingTolerance = spacingTolerance;
-        userConfigured.add("spacingTolerance");
     }
 
     /**
@@ -504,16 +481,14 @@ public class PDFParserConfig implements Serializable {
      */
     public void setDropThreshold(Float dropThreshold) {
         this.dropThreshold = dropThreshold;
-        userConfigured.add("dropThreshold");
     }
 
-    public AccessChecker getAccessChecker() {
-        return accessChecker;
+    public AccessCheckMode getAccessCheckMode() {
+        return accessCheckMode;
     }
 
-    public void setAccessChecker(AccessChecker accessChecker) {
-        this.accessChecker = accessChecker;
-        userConfigured.add("accessChecker");
+    public void setAccessCheckMode(AccessCheckMode accessCheckMode) {
+        this.accessCheckMode = accessCheckMode;
     }
 
     /**
@@ -536,188 +511,54 @@ public class PDFParserConfig implements Serializable {
      */
     public void setCatchIntermediateIOExceptions(boolean catchIntermediateIOExceptions) {
         this.catchIntermediateIOExceptions = catchIntermediateIOExceptions;
-        userConfigured.add("catchIntermediateIOExceptions");
     }
 
     /**
-     * @return strategy to use for OCR
+     * This parser's overlay on the {@code "pages"} block, which the parser folds onto the
+     * context's {@code "pages"} and the defaults
+     * ({@code PagesConfig.resolve(context, defaultConfig.getPages(), localConfig.getPages())}).
+     * The 4.0 aliases ({@link #setOcr}, {@link #setImageStrategy}) write to the same overlay,
+     * so in one JSON object the later spelling of a field wins.
      */
-    public OCR_STRATEGY getOcrStrategy() {
-        return ocrStrategy;
+    public PagesConfig getPages() {
+        return pages;
+    }
+
+    /** The overlay, to configure in code: {@code config.pages().setText(TextPolicy.OCR)}. */
+    public PagesConfig pages() {
+        return pages;
+    }
+
+    /** Applies the set fields of {@code pages} to the overlay. */
+    public void setPages(PagesConfig pages) {
+        this.pages = this.pages.over(pages);
     }
 
     /**
-     * @return ocr auto strategy to use when ocr_strategy = Auto
+     * @deprecated since 4.1.0; the 4.0 {@code "ocr"} block. Every field it sets lands on
+     * {@link #pages()}: {@code strategy} as {@code text}, {@code strategyAuto} as
+     * {@code ocr.auto}, {@code maxPagesToOcr} as {@code ocr.maxPages}, the image settings as
+     * {@code render}, {@code renderingStrategy} as {@link #setRenderingStrategy}.
      */
-    public OCRStrategyAuto getOcrStrategyAuto() {
-        return ocrStrategyAuto;
-    }
-
-    /**
-     * Which strategy to use for OCR
-     *
-     * @param ocrStrategy
-     */
-    public void setOcrStrategy(OCR_STRATEGY ocrStrategy) {
-        this.ocrStrategy = ocrStrategy;
-        userConfigured.add("ocrStrategy");
-    }
-
-
-    public void setOcrStrategyAuto(String ocrStrategyAuto) {
-        final String regex = "^\\s*(faster|better)|(\\d{1,3})(%)?(?:,\\s*(\\d{1,3}))?\\s*$";
-        Pattern pattern = Pattern.compile(regex);
-        Matcher matcher = pattern.matcher(ocrStrategyAuto);
-        if (matcher.matches()) {
-            final String group1 = matcher.group(1);
-
-            if ("better".equals(group1)) {
-                this.ocrStrategyAuto = OCR_STRATEGY_AUTO_BETTER;
-            } else if ("faster".equals(group1)) {
-                this.ocrStrategyAuto = OCR_STRATEGY_AUTO_FASTER;
-            } else {
-                float unmappedUnicodeCharsPerPage = Integer.parseInt(matcher.group(2));
-                if (matcher.group(3) != null) {
-                    // If we have the percent sign, then convert
-                    if (unmappedUnicodeCharsPerPage > 100.0) {
-                        throw new IllegalArgumentException
-                        ("Error parsing OCRStrategyAuto - Percent cannot exceed 100%");
-                    }
-                    unmappedUnicodeCharsPerPage = unmappedUnicodeCharsPerPage / 100f;
-                }
-                // The 2nd number is optional.  Default to 10 chars per page
-                int totalCharsPerPage = matcher.group(4) == null
-                        ? OCR_STRATEGY_AUTO_DEFAULT_CHARS_PER_PAGE
-                        : Integer.parseInt(matcher.group(4));
-                this.ocrStrategyAuto = new OCRStrategyAuto(unmappedUnicodeCharsPerPage, totalCharsPerPage);
-            }
-            userConfigured.add("ocrStrategyAuto");
-
-        } else {
-            throw new IllegalArgumentException("Error parsing OCRStrategyAuto - Must be in the form 'num[%], num'");
+    @Deprecated
+    public void setOcr(OcrConfig ocr) {
+        if (ocr == null) {
+            return;
+        }
+        ocr.applyTo(pages);
+        if (ocr.getRenderingStrategy() != null) {
+            renderingStrategy = ocr.getRenderingStrategy();
         }
     }
 
-    /**
-     * Which strategy to use for OCR
-     *
-     * @param ocrStrategyString
-     */
-    public void setOcrStrategy(String ocrStrategyString) {
-        setOcrStrategy(OCR_STRATEGY.parse(ocrStrategyString));
+    /** What PDFBox draws when it renders a page for OCR: everything, text only, no text, or vector graphics only. */
+    public OcrConfig.RenderingStrategy getRenderingStrategy() {
+        return renderingStrategy;
     }
 
-    public OCR_RENDERING_STRATEGY getOcrRenderingStrategy() {
-        return ocrRenderingStrategy;
-    }
-
-    public void setOcrRenderingStrategy(String ocrRenderingStrategyString) {
-        setOcrRenderingStrategy(OCR_RENDERING_STRATEGY.parse(ocrRenderingStrategyString));
-    }
-
-    /**
-     * When rendering the page for OCR, do you want to include the rendering of the electronic text,
-     * ALL, or do you only want to run OCR on the images and vector graphics (NO_TEXT)?
-     *
-     * @param ocrRenderingStrategy
-     */
-    public void setOcrRenderingStrategy(OCR_RENDERING_STRATEGY ocrRenderingStrategy) {
-        this.ocrRenderingStrategy = ocrRenderingStrategy;
-        userConfigured.add("ocrRenderingStrategy");
-    }
-
-    /**
-     * String representation of the image format used to render
-     * the page image for OCR (examples: png, tiff, jpeg)
-     *
-     * @return
-     */
-    public String getOcrImageFormatName() {
-        return ocrImageFormatName;
-    }
-
-    /**
-     * @param ocrImageFormatName name of image format used to render
-     *                           page image
-     * @see #getOcrImageFormatName()
-     */
-    public void setOcrImageFormatName(String ocrImageFormatName) {
-        if (!ocrImageFormatName.equals("png") && !ocrImageFormatName.equals("tiff") &&
-                !ocrImageFormatName.equals("jpeg")) {
-            throw new IllegalArgumentException(
-                    "Available options: png, tiff, jpeg. " + "I'm sorry, but I don't recognize: " +
-                            ocrImageFormatName);
-        }
-        this.ocrImageFormatName = ocrImageFormatName;
-        userConfigured.add("ocrImageFormatName");
-    }
-
-    /**
-     * Image type used to render the page image for OCR.
-     *
-     * @return image type
-     * @see #setOcrImageType(TikaImageType)
-     */
-    public TikaImageType getOcrImageType() {
-        return ocrImageType;
-    }
-
-    /**
-     * Image type used to render the page image for OCR.
-     *
-     * @param ocrImageType
-     */
-    public void setOcrImageType(TikaImageType ocrImageType) {
-        this.ocrImageType = ocrImageType;
-        userConfigured.add("ocrImageType");
-    }
-
-    /**
-     * Image type used to render the page image for OCR.
-     *
-     * @see #setOcrImageType(TikaImageType)
-     */
-    public void setOcrImageType(String ocrImageTypeString) {
-        setOcrImageType(parseImageType(ocrImageTypeString));
-    }
-
-    /**
-     * Dots per inch used to render the page image for OCR
-     *
-     * @return dots per inch
-     */
-    public int getOcrDPI() {
-        return ocrDPI;
-    }
-
-    /**
-     * Dots per inch used to render the page image for OCR.
-     * This does not apply to all image formats.
-     *
-     * @param ocrDPI
-     */
-    public void setOcrDPI(int ocrDPI) {
-        this.ocrDPI = ocrDPI;
-        userConfigured.add("ocrDPI");
-    }
-
-    /**
-     * Image quality used to render the page image for OCR.
-     * This does not apply to all image formats
-     *
-     * @return
-     */
-    public float getOcrImageQuality() {
-        return ocrImageQuality;
-    }
-
-    /**
-     * Image quality used to render the page image for OCR.
-     * This does not apply to all image formats
-     */
-    public void setOcrImageQuality(float ocrImageQuality) {
-        this.ocrImageQuality = ocrImageQuality;
-        userConfigured.add("ocrImageQuality");
+    public void setRenderingStrategy(OcrConfig.RenderingStrategy renderingStrategy) {
+        this.renderingStrategy = renderingStrategy == null
+                ? OcrConfig.RenderingStrategy.ALL : renderingStrategy;
     }
 
     /**
@@ -737,7 +578,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setExtractActions(boolean v) {
         extractActions = v;
-        userConfigured.add("extractActions");
     }
 
     /**
@@ -752,7 +592,6 @@ public class PDFParserConfig implements Serializable {
 
     public void setMaxMainMemoryBytes(long maxMainMemoryBytes) {
         this.maxMainMemoryBytes = maxMainMemoryBytes;
-        userConfigured.add("maxMainMemoryBytes");
     }
 
     public boolean isSetKCMS() {
@@ -779,27 +618,6 @@ public class PDFParserConfig implements Serializable {
      */
     public void setSetKCMS(boolean setKCMS) {
         this.setKCMS = setKCMS;
-        userConfigured.add("setKCMS");
-    }
-
-    private TikaImageType parseImageType(String ocrImageType) {
-        for (TikaImageType t : TikaImageType.values()) {
-            if (ocrImageType.equalsIgnoreCase(t.toString())) {
-                return t;
-            }
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.append("I regret that I could not parse '");
-        sb.append(ocrImageType);
-        sb.append("'. I'm only familiar with: ");
-        int i = 0;
-        for (ImageType t : ImageType.values()) {
-            if (i++ == 0) {
-                sb.append(", ");
-            }
-            sb.append(t.toString());
-        }
-        throw new IllegalArgumentException(sb.toString());
     }
 
     public boolean isDetectAngles() {
@@ -808,53 +626,31 @@ public class PDFParserConfig implements Serializable {
 
     public void setDetectAngles(boolean detectAngles) {
         this.detectAngles = detectAngles;
-        userConfigured.add("detectAngles");
     }
 
-    public PDFParserConfig cloneAndUpdate(PDFParserConfig updates) throws TikaException {
-        PDFParserConfig updated = new PDFParserConfig();
-        for (Field field : this.getClass().getDeclaredFields()) {
-            if (Modifier.isFinal(field.getModifiers())) {
-                continue;
-            } else if (Modifier.isStatic(field.getModifiers())) {
-                continue;
-            }
-            if ("userConfigured".equals(field.getName())) {
-                continue;
-            }
-            if (updates.userConfigured.contains(field.getName())) {
-                try {
-                    field.set(updated, field.get(updates));
-                } catch (IllegalAccessException e) {
-                    throw new TikaException("can't update " + field.getName(), e);
-                }
-            } else {
-                try {
-                    field.set(updated, field.get(this));
-                } catch (IllegalAccessException e) {
-                    throw new TikaException("can't update " + field.getName(), e);
-                }
-            }
-        }
-        return updated;
-    }
-
-    public void setRenderer(Renderer renderer) {
-        this.renderer = renderer;
-        userConfigured.add("renderer");
-    }
-
-    public Renderer getRenderer() {
-        return renderer;
-    }
-
-    public void setImageStrategy(String imageStrategy) {
-        setImageStrategy(PDFParserConfig.IMAGE_STRATEGY.parse(imageStrategy));
-    }
-
+    /**
+     * @deprecated since 4.1.0; {@code RAW_IMAGES} is {@link #setExtractInlineImages}, the
+     * {@code RENDER_PAGES_*} values are {@code "pages": {"emit": {"enabled": true}}} and
+     * {@code NONE} is {@code false}. Renders are emitted at page end whichever value is given;
+     * when the engine renders is its own business.
+     */
+    @Deprecated
     public void setImageStrategy(IMAGE_STRATEGY imageStrategy) {
-        this.imageStrategy = imageStrategy;
-        userConfigured.add("imageStrategy");
+        if (imageStrategy == null) {
+            return;
+        }
+        switch (imageStrategy) {
+            case RAW_IMAGES:
+                extractInlineImages = true;
+                break;
+            case RENDER_PAGES_BEFORE_PARSE:
+            case RENDER_PAGES_AT_PAGE_END:
+                pages.emit().setEnabled(true);
+                break;
+            case NONE:
+                pages.emit().setEnabled(false);
+                break;
+        }
     }
 
     /**
@@ -862,17 +658,29 @@ public class PDFParserConfig implements Serializable {
      *
      * @param imageGraphicsEngineFactory
      */
+    @OperatorOnly
     public void setImageGraphicsEngineFactory(ImageGraphicsEngineFactory imageGraphicsEngineFactory) {
         this.imageGraphicsEngineFactory = imageGraphicsEngineFactory;
-        userConfigured.add("imageGraphicsEngineFactory");
+    }
+
+    /**
+     * EXPERT: Customize the class that handles inline images within a PDF page.
+     * Use this setter when specifying the factory class name in JSON config.
+     *
+     * @param className fully qualified class name of an ImageGraphicsEngineFactory implementation
+     */
+    @OperatorOnly
+    public void setImageGraphicsEngineFactoryClass(String className) {
+        try {
+            Class<?> clazz = Class.forName(className);
+            this.imageGraphicsEngineFactory = (ImageGraphicsEngineFactory) clazz.getDeclaredConstructor().newInstance();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to instantiate ImageGraphicsEngineFactory: " + className, e);
+        }
     }
 
     public ImageGraphicsEngineFactory getImageGraphicsEngineFactory() {
         return imageGraphicsEngineFactory;
-    }
-
-    public IMAGE_STRATEGY getImageStrategy() {
-        return imageStrategy;
     }
 
     public boolean isExtractIncrementalUpdateInfo() {
@@ -881,7 +689,6 @@ public class PDFParserConfig implements Serializable {
 
     public void setExtractIncrementalUpdateInfo(boolean extractIncrementalUpdateInfo) {
         this.extractIncrementalUpdateInfo = extractIncrementalUpdateInfo;
-        userConfigured.add("extractIncrementalUpdateInfo");
     }
 
     public boolean isParseIncrementalUpdates() {
@@ -890,7 +697,6 @@ public class PDFParserConfig implements Serializable {
 
     public void setParseIncrementalUpdates(boolean parseIncrementalUpdates) {
         this.parseIncrementalUpdates = parseIncrementalUpdates;
-        userConfigured.add("parseIncrementalUpdates");
     }
 
     public int getMaxIncrementalUpdates() {
@@ -905,178 +711,44 @@ public class PDFParserConfig implements Serializable {
      */
     public void setMaxIncrementalUpdates(int maxIncrementalUpdates) {
         this.maxIncrementalUpdates = maxIncrementalUpdates;
-        userConfigured.add("maxIncrementalUpdates");
+    }
+
+    /**
+     * @return maximum number of pages to process, or -1 for no limit
+     */
+    public int getMaxPages() {
+        return maxPages;
+    }
+
+    /**
+     * Set the maximum number of pages to process per document.
+     * Use -1 (the default) for no limit.
+     *
+     * @param maxPages must be -1 or &gt;= 1
+     * @throws IllegalArgumentException if the value is 0 or less than -1
+     */
+    public void setMaxPages(int maxPages) {
+        if (maxPages != -1 && maxPages < 1) {
+            throw new IllegalArgumentException(
+                    "maxPages must be -1 (no limit) or >= 1, got: " + maxPages);
+        }
+        this.maxPages = maxPages;
     }
 
     public void setThrowOnEncryptedPayload(boolean throwOnEncryptedPayload) {
         this.throwOnEncryptedPayload = throwOnEncryptedPayload;
-        userConfigured.add("throwOnEncryptedPayload");
     }
 
     public boolean isThrowOnEncryptedPayload() {
         return throwOnEncryptedPayload;
     }
 
-    public enum OCR_STRATEGY {
-        AUTO, NO_OCR, OCR_ONLY, OCR_AND_TEXT_EXTRACTION;
-
-        private static OCR_STRATEGY parse(String s) {
-            if (s == null) {
-                return NO_OCR;
-            } else if ("no_ocr".equals(s.toLowerCase(Locale.ROOT))) {
-                return NO_OCR;
-            } else if ("ocr_only".equals(s.toLowerCase(Locale.ROOT))) {
-                return OCR_ONLY;
-            } else if (s.toLowerCase(Locale.ROOT).contains("ocr_and_text")) {
-                return OCR_AND_TEXT_EXTRACTION;
-            } else if ("auto".equals(s.toLowerCase(Locale.ROOT))) {
-                return AUTO;
-            }
-            StringBuilder sb = new StringBuilder();
-            sb.append("I regret that I don't recognize '").append(s);
-            sb.append("' as an OCR_STRATEGY. I only recognize:");
-            int i = 0;
-            for (OCR_STRATEGY strategy : OCR_STRATEGY.values()) {
-                if (i++ > 0) {
-                    sb.append(", ");
-                }
-                sb.append(strategy.toString());
-
-            }
-            throw new IllegalArgumentException(sb.toString());
-        }
-    }
-
-    /**
-     * Encapsulate the numbers used to control OCR Strategy when set to auto
-     * <p>
-     * If the total characters on the page < this.totalCharsPerPage
-     * or
-     * total unmapped unicode characters on the page > this.unmappedUnicodeCharsPerPage
-     * then we will perform OCR on the page
-     * <p>
-     * If unamppedUnicodeCharsPerPage is an integer > 0, then we compare absolute number of characters.
-     * If it is a float < 1, then we assume it is a percentage and we compare it to the
-     * percentage of unmappedCharactersPerPage/totalCharsPerPage
-     */
-    public static class OCRStrategyAuto implements Serializable {
-        private final float unmappedUnicodeCharsPerPage;
-        private final int totalCharsPerPage;
-
-        public OCRStrategyAuto(float unmappedUnicodeCharsPerPage, int totalCharsPerPage) {
-            this.totalCharsPerPage = totalCharsPerPage;
-            this.unmappedUnicodeCharsPerPage = unmappedUnicodeCharsPerPage;
-        }
-
-        public float getUnmappedUnicodeCharsPerPage() {
-            return unmappedUnicodeCharsPerPage;
-        }
-
-        public int getTotalCharsPerPage() {
-            return totalCharsPerPage;
-        }
-
-        @Override
-        public String toString() {
-            //TODO -- figure out if this is actual BEST or whatever
-            //and return that instead of the literal values
-            String unmappedString = null;
-            if (unmappedUnicodeCharsPerPage < 1.0) {
-                unmappedString = String.format(Locale.US, "%.03f",
-                        unmappedUnicodeCharsPerPage * 100) + "%";
-            } else {
-                unmappedString = String.format(Locale.US, "%.0f", unmappedUnicodeCharsPerPage);
-            }
-            return unmappedString + "," + totalCharsPerPage;
-        }
-    }
-
-    public enum OCR_RENDERING_STRATEGY {
-
-        NO_TEXT, //includes vector graphics and image
-        TEXT_ONLY, //renders only glyphs
-        VECTOR_GRAPHICS_ONLY, //renders only vector graphics
-        ALL;
-        //TODO: add AUTO?
-
-        private static OCR_RENDERING_STRATEGY parse(String s) {
-            if (s == null) {
-                return ALL;
-            }
-            String lc = s.toLowerCase(Locale.US);
-            switch (lc) {
-                case "vector_graphics_only":
-                    return VECTOR_GRAPHICS_ONLY;
-                case "text_only":
-                    return TEXT_ONLY;
-                case "no_text":
-                    return NO_TEXT;
-                case "all":
-                    return ALL;
-            }
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("I regret that I don't recognize '").append(s);
-            sb.append("' as an OCR_STRATEGY. I only recognize:");
-            int i = 0;
-            for (OCR_RENDERING_STRATEGY strategy : OCR_RENDERING_STRATEGY.values()) {
-                if (i++ > 0) {
-                    sb.append(", ");
-                }
-                sb.append(strategy.toString());
-
-            }
-            throw new IllegalArgumentException(sb.toString());
-        }
-    }
-
+    /** @deprecated since 4.1.0; see {@link #setImageStrategy}. */
+    @Deprecated
     public enum IMAGE_STRATEGY {
         NONE,
-        /**
-         * This is the more modern version of {@link PDFParserConfig#extractInlineImages}
-         */
         RAW_IMAGES,
-        /**
-         * If you want the rendered images, and you don't care that there's
-         * markup in the xhtml handler per page then go with this option.
-         * For some rendering engines, it is faster to render the full document
-         * upfront than to parse a page, render a page, etc.
-         */
         RENDER_PAGES_BEFORE_PARSE,
-        /**
-         * This renders each page, one at a time, at the end of the page.
-         * For some rendering engines, this may be slower, but it allows the writing
-         * of image metadata into the xhtml in the proper location
-         */
-        RENDER_PAGES_AT_PAGE_END;
-        //TODO: add LOGICAL_IMAGES
-
-        private static IMAGE_STRATEGY parse(String s) {
-            String lc = s.toLowerCase(Locale.US);
-            switch (lc) {
-                case "rawimages" :
-                    return RAW_IMAGES;
-                case "renderpagesbeforeparse":
-                    return RENDER_PAGES_BEFORE_PARSE;
-                case "renderpagesatpageend":
-                    return RENDER_PAGES_AT_PAGE_END;
-                case "none":
-                    return NONE;
-                default:
-                    //fall through to exception
-                    break;
-            }
-            StringBuilder sb = new StringBuilder();
-            sb.append("I regret that I don't recognize '").append(s);
-            sb.append("' as an IMAGE_STRATEGY. I only recognize:");
-            int i = 0;
-            for (IMAGE_STRATEGY strategy : IMAGE_STRATEGY.values()) {
-                if (i++ > 0) {
-                    sb.append(", ");
-                }
-                sb.append(strategy.toString());
-            }
-            throw new IllegalArgumentException(sb.toString());
-        }
+        RENDER_PAGES_AT_PAGE_END
     }
 }

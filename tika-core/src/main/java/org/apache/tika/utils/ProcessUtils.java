@@ -20,12 +20,33 @@ package org.apache.tika.utils;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.tika.config.ParseTimeout;
+import org.apache.tika.parser.ParseContext;
 
 public class ProcessUtils {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ProcessUtils.class);
+
+    // How often a bounded subprocess wait checkpoints the task's ParseTimeout -- must be
+    // finer-grained than progressTimeoutMillis or a long wait looks like a false "hung" kill.
+    public static final long HEARTBEAT_INTERVAL_MILLIS = 1000;
+
+    // Timeout for checkCommand's binary-existence probe (e.g. "myapp --version") -- kept
+    // short since an unresponsive binary isn't usable and a full minute would delay
+    // every task that happens to probe first.
+    public static final long DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS = 5000;
 
     private static final ConcurrentHashMap<String, Process> PROCESS_MAP = new ConcurrentHashMap<>();
 
@@ -66,6 +87,39 @@ public class ProcessUtils {
         return arg;
     }
 
+    /**
+     * The -D arguments that give a child JVM {@code locale} as its default: a fresh JVM reads
+     * the OS locale, not its parent's, and a command-line -D beats JAVA_TOOL_OPTIONS.
+     * Empty for {@link Locale#ROOT}.
+     */
+    public static List<String> defaultLocaleJvmArgs(Locale locale) {
+        List<String> args = new ArrayList<>();
+        if (locale.getLanguage().isEmpty()) {
+            return args;
+        }
+        args.add("-Duser.language=" + locale.getLanguage());
+        if (!locale.getScript().isEmpty()) {
+            args.add("-Duser.script=" + locale.getScript());
+        }
+        if (!locale.getCountry().isEmpty()) {
+            args.add("-Duser.country=" + locale.getCountry());
+        }
+        if (!locale.getVariant().isEmpty()) {
+            args.add("-Duser.variant=" + locale.getVariant());
+        }
+        StringBuilder extensions = new StringBuilder();
+        for (char key : locale.getExtensionKeys()) {
+            if (extensions.length() > 0) {
+                extensions.append('-');
+            }
+            extensions.append(key).append('-').append(locale.getExtension(key));
+        }
+        if (extensions.length() > 0) {
+            args.add("-Duser.extensions=" + extensions);
+        }
+        return args;
+    }
+
     public static String unescapeCommandLine(String arg) {
         if (arg.contains(" ") && SystemUtils.IS_OS_WINDOWS &&
                 (arg.startsWith("\"") && arg.endsWith("\""))) {
@@ -76,18 +130,65 @@ public class ProcessUtils {
 
     /**
      * This writes stdout and stderr to the FileProcessResult.
+     * <p>
+     * Equivalent to {@link #execute(ProcessBuilder, ParseContext, long, int, int)} with a
+     * null context: {@code requestedTimeoutMillis} is granted unclipped, no checkpointing.
      *
      * @param pb
-     * @param timeoutMillis
+     * @param requestedTimeoutMillis
      * @param maxStdoutBuffer
      * @param maxStdErrBuffer
      * @return
      * @throws IOException
      */
     public static FileProcessResult execute(ProcessBuilder pb,
-                                            long timeoutMillis,
+                                            long requestedTimeoutMillis,
                                             int maxStdoutBuffer, int maxStdErrBuffer)
             throws IOException {
+        return execute(pb, null, requestedTimeoutMillis, maxStdoutBuffer, maxStdErrBuffer);
+    }
+
+    /**
+     * Same as {@link #execute(ProcessBuilder, long, int, int)}, but bounds the wait to
+     * {@code min(requestedTimeoutMillis, ParseTimeout.remainingMillis())} (see
+     * {@link ParseTimeout#budgetFor(long)}) so no single call can outlast the task's
+     * total timeout regardless of its own configuration. The granted budget and original
+     * request are both recorded on the result (see
+     * {@link FileProcessResult#getRequestedTimeoutMillis()},
+     * {@link FileProcessResult#isClippedByRemaining()}).
+     * <p>
+     * While waiting, checkpoints the {@link ParseTimeout} in {@code context} (if any)
+     * every {@value #HEARTBEAT_INTERVAL_MILLIS} ms, so a bounded external call can run
+     * longer than the progress (stall-detection) timeout without looking like a hang --
+     * the wait itself is progress. A null {@code context} behaves like the
+     * four-argument overload.
+     *
+     * @param pb
+     * @param context                may be null
+     * @param requestedTimeoutMillis the timeout the caller's own configuration asks for
+     * @param maxStdoutBuffer
+     * @param maxStdErrBuffer
+     * @return
+     * @throws IOException
+     */
+    public static FileProcessResult execute(ProcessBuilder pb, ParseContext context,
+                                            long requestedTimeoutMillis,
+                                            int maxStdoutBuffer, int maxStdErrBuffer)
+            throws IOException {
+        // A null context has no task to clip against -- getOrCreate(null) would otherwise
+        // hand back a detached ParseTimeout built from *default* TimeoutLimits (1 hour),
+        // silently capping any request above that and breaking the "granted unclipped"
+        // contract documented above for null-context callers (e.g. a one-off version-check
+        // process run outside any parse).
+        long grantedTimeoutMillis = context == null
+                ? requestedTimeoutMillis
+                : ParseTimeout.getOrCreate(context).budgetFor(requestedTimeoutMillis);
+
+        Optional<FileProcessResult> potentiallyFailedResult = failFastIfNoGrantedTimeout(requestedTimeoutMillis, grantedTimeoutMillis);
+        if (potentiallyFailedResult.isPresent()) {
+            return potentiallyFailedResult.get();
+        }
+
         Process p = null;
         String id = null;
         try {
@@ -106,7 +207,7 @@ public class ProcessUtils {
             int exitValue = -1;
             boolean complete = false;
             try {
-                complete = p.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
+                complete = waitForWithHeartbeat(p, context, grantedTimeoutMillis);
                 elapsed = System.currentTimeMillis() - start;
                 if (complete) {
                     exitValue = p.exitValue();
@@ -126,6 +227,8 @@ public class ProcessUtils {
                     }
                 }
             } catch (InterruptedException e) {
+                // restore the flag or the interrupt is misread as a subprocess timeout
+                Thread.currentThread().interrupt();
                 exitValue = -1000;
             } finally {
                 outThread.interrupt();
@@ -141,6 +244,8 @@ public class ProcessUtils {
             result.stderr = StringUtils.joinWith("\n", errGobbler.getLines());
             result.stdoutTruncated = outGobbler.getIsTruncated();
             result.stderrTruncated = errGobbler.getIsTruncated();
+            result.requestedTimeoutMillis = requestedTimeoutMillis;
+            result.grantedTimeoutMillis = grantedTimeoutMillis;
             return result;
         } finally {
             if (p != null) {
@@ -154,23 +259,59 @@ public class ProcessUtils {
 
     /**
      * This redirects stdout to stdoutRedirect path.
+     * <p>
+     * Equivalent to {@link #execute(ProcessBuilder, ParseContext, long, Path, int)} with
+     * a null context, i.e. {@code requestedTimeoutMillis} is granted unclipped and the
+     * wait does not checkpoint any task's progress timeout.
      *
      * @param pb
-     * @param timeoutMillis
+     * @param requestedTimeoutMillis
      * @param stdoutRedirect
      * @param maxStdErrBuffer
      * @return
      * @throws IOException
      */
     public static FileProcessResult execute(ProcessBuilder pb,
-                                            long timeoutMillis,
+                                            long requestedTimeoutMillis,
+                                            Path stdoutRedirect, int maxStdErrBuffer) throws IOException {
+        return execute(pb, null, requestedTimeoutMillis, stdoutRedirect, maxStdErrBuffer);
+    }
+
+    /**
+     * Same as {@link #execute(ProcessBuilder, long, Path, int)}, but bounds the wait to
+     * {@code min(requestedTimeoutMillis, ParseTimeout.remainingMillis())} and checkpoints
+     * while waiting -- see {@link #execute(ProcessBuilder, ParseContext, long, int, int)}.
+     *
+     * @param pb
+     * @param context                may be null
+     * @param requestedTimeoutMillis the timeout the caller's own configuration asks for
+     * @param stdoutRedirect
+     * @param maxStdErrBuffer
+     * @return
+     * @throws IOException
+     */
+    public static FileProcessResult execute(ProcessBuilder pb, ParseContext context,
+                                            long requestedTimeoutMillis,
                                             Path stdoutRedirect, int maxStdErrBuffer) throws IOException {
 
         if (!Files.isDirectory(stdoutRedirect.getParent())) {
             Files.createDirectories(stdoutRedirect.getParent());
         }
 
+        // See the (ProcessBuilder, ParseContext, long, int, int) overload above: a null
+        // context must grant requestedTimeoutMillis unclipped, not silently cap it against
+        // a detached, default-TimeoutLimits ParseTimeout.
+        long grantedTimeoutMillis = context == null
+                ? requestedTimeoutMillis
+                : ParseTimeout.getOrCreate(context).budgetFor(requestedTimeoutMillis);
+
+        Optional<FileProcessResult> potentiallyFailedResult = failFastIfNoGrantedTimeout(requestedTimeoutMillis, grantedTimeoutMillis);
+        if (potentiallyFailedResult.isPresent()) {
+            return potentiallyFailedResult.get();
+        }
+
         pb.redirectOutput(stdoutRedirect.toFile());
+
         Process p = null;
         String id = null;
         try {
@@ -185,7 +326,7 @@ public class ProcessUtils {
             int exitValue = -1;
             boolean complete = false;
             try {
-                complete = p.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
+                complete = waitForWithHeartbeat(p, context, grantedTimeoutMillis);
                 elapsed = System.currentTimeMillis() - start;
                 if (complete) {
                     exitValue = p.exitValue();
@@ -195,6 +336,7 @@ public class ProcessUtils {
                     errThread.join(1000);
                 }
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 exitValue = -1000;
             }
             FileProcessResult result = new FileProcessResult();
@@ -207,6 +349,8 @@ public class ProcessUtils {
             result.stderr = StringUtils.joinWith("\n", errGobbler.getLines());
             result.stdoutTruncated = false;
             result.stderrTruncated = errGobbler.getIsTruncated();
+            result.requestedTimeoutMillis = requestedTimeoutMillis;
+            result.grantedTimeoutMillis = grantedTimeoutMillis;
             return result;
         } finally {
             if (p != null) {
@@ -219,4 +363,155 @@ public class ProcessUtils {
 
     }
 
+    /**
+     * Checks to see if the command can be run. Typically used with
+     * something like "myapp --version" to check to see if "myapp"
+     * is installed and on the path.
+     * <p>
+     * Equivalent to {@link #checkCommandWithTimeout(String[], long, int...)} with
+     * {@link #DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS}.
+     *
+     * @param checkCmd   The check command to run
+     * @param errorValue What is considered an error value? Default is 127 (command not found).
+     * @return true if the command ran successfully (exit code not in errorValue list)
+     */
+    public static boolean checkCommand(String checkCmd, int... errorValue) {
+        return checkCommandWithTimeout(new String[]{checkCmd}, DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS, errorValue);
+    }
+
+    /**
+     * Checks to see if the command can be run. Typically used with
+     * something like {@code new String[]{"myapp", "--version"}} to check to see if "myapp"
+     * is installed and on the path.
+     * <p>
+     * Equivalent to {@link #checkCommandWithTimeout(String[], long, int...)} with
+     * {@link #DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS}.
+     *
+     * @param checkCmd   The check command to run
+     * @param errorValue What is considered an error value? Default is 127 (command not found).
+     * @return true if the command ran successfully (exit code not in errorValue list)
+     */
+    public static boolean checkCommand(String[] checkCmd, int... errorValue) {
+        return checkCommandWithTimeout(checkCmd, DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS, errorValue);
+    }
+
+    /**
+     * Same as {@link #checkCommand(String[], int...)}, but with a caller-specified timeout
+     * instead of the {@value #DEFAULT_CHECK_COMMAND_TIMEOUT_MILLIS}ms default.
+     * <p>
+     * Deliberately a distinct method name, not a same-named overload: {@code checkCommand(cmd, 500)}
+     * would silently resolve to {@code checkCommand(String[], int...)} with
+     * {@code errorValue={500}} at the default timeout -- Java prefers the varargs-only
+     * overload over widening {@code int} to this method's {@code long} parameter, with no
+     * compile error to catch the mistake.
+     *
+     * @param timeoutMillis how long to wait for the command to exit
+     * @param errorValue    What is considered an error value? Default is 127 (command not found).
+     * @return true if the command ran successfully (exit code not in errorValue list)
+     */
+    public static boolean checkCommandWithTimeout(String[] checkCmd, long timeoutMillis, int... errorValue) {
+        if (errorValue.length == 0) {
+            errorValue = new int[]{127};
+        }
+
+        Process process = null;
+        try {
+            process = Runtime.getRuntime().exec(checkCmd);
+            StreamGobbler outGobbler = new StreamGobbler(process.getInputStream(), 0);
+            StreamGobbler errGobbler = new StreamGobbler(process.getErrorStream(), 0);
+            Thread outThread = new Thread(outGobbler);
+            Thread errThread = new Thread(errGobbler);
+            outThread.start();
+            errThread.start();
+            boolean finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                throw new TimeoutException();
+            }
+            outThread.join(1000);
+            errThread.join(1000);
+            int result = process.exitValue();
+            LOG.debug("exit value for {}: {}", checkCmd[0], result);
+            for (int err : errorValue) {
+                if (result == err) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.debug("interrupted trying to run " + checkCmd[0], e);
+            return false;
+        } catch (IOException | TimeoutException e) {
+            LOG.debug("exception trying to run " + checkCmd[0], e);
+            return false;
+        } catch (SecurityException se) {
+            throw se;
+        } catch (Error err) {
+            if (err.getMessage() != null && (err.getMessage().contains("posix_spawn") ||
+                    err.getMessage().contains("UNIXProcess"))) {
+                LOG.debug("(TIKA-1526): exception trying to run: " + checkCmd[0], err);
+                return false;
+            }
+            throw err;
+        } finally {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    /**
+     * Waits for the process to exit, like {@link Process#waitFor(long, TimeUnit)}, but polls
+     * in {@value #HEARTBEAT_INTERVAL_MILLIS} ms increments and checkpoints {@code context}'s
+     * {@link ParseTimeout} after each increment that doesn't complete -- this is what lets a
+     * bounded external call run longer than the progress timeout without tripping the stall
+     * detector: the wait itself is progress.
+     * <p>
+     * Public so callers managing their own {@link Process} (not going through
+     * {@link #execute(ProcessBuilder, ParseContext, long, int, int)}) can still checkpoint
+     * while waiting.
+     *
+     * @param context       may be null, in which case no checkpoint is recorded
+     * @param timeoutMillis total wait time in ms; zero or negative checks once without waiting
+     * @return true if the process exited before the timeout elapsed
+     */
+    public static boolean waitForWithHeartbeat(Process p, ParseContext context, long timeoutMillis)
+            throws InterruptedException {
+        long startNanos = System.nanoTime();
+        while (true) {
+            long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+            long remaining = timeoutMillis - elapsedMillis;
+            long pollMillis = remaining <= 0 ? 0 : Math.min(remaining, HEARTBEAT_INTERVAL_MILLIS);
+            if (p.waitFor(pollMillis, TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+            if (remaining <= 0) {
+                return false;
+            }
+            ParseTimeout.checkpoint(context);
+        }
+    }
+
+    /**
+     * Guards against both 0 and negative grants.
+     *
+     * @param requestedTimeoutMillis
+     * @param grantedTimeoutMillis
+     * @return result, if the process shouldn't be started, otherwise empty optional
+     */
+    private static Optional<FileProcessResult> failFastIfNoGrantedTimeout(long requestedTimeoutMillis, long grantedTimeoutMillis) {
+        if (grantedTimeoutMillis <= 0) {
+            FileProcessResult result = new FileProcessResult();
+            result.isTimeout = true;
+            result.requestedTimeoutMillis = requestedTimeoutMillis;
+            result.grantedTimeoutMillis = grantedTimeoutMillis;
+            result.processTimeMillis = 0;
+            result.stdoutLength = 0;
+            result.stderrLength = 0;
+
+            return Optional.of(result);
+        }
+
+        return Optional.empty();
+    }
 }

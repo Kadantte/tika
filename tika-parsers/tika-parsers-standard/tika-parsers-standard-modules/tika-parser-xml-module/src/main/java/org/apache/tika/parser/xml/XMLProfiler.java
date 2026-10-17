@@ -17,7 +17,6 @@
 package org.apache.tika.parser.xml;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -27,13 +26,14 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.mime.MediaType;
@@ -66,6 +66,7 @@ import org.apache.tika.utils.XMLReaderUtils;
  * xmp in other file formats.  Please open a ticket.
  * </p>
  */
+@TikaComponent(spi = false)
 public class XMLProfiler implements Parser {
 
 
@@ -76,10 +77,10 @@ public class XMLProfiler implements Parser {
                     MediaType.application("rdf+xml"),//xmp
                     //xfa: https://en.wikipedia.org/wiki/XFA
                     MediaType.application("vnd.adobe.xdp+xml"))));
-    public static Property ROOT_ENTITY = Property.internalText("xmlprofiler:root_entity");
-    public static Property ENTITY_URIS = Property.internalTextBag("xmlprofiler:entity_uris");
+    public static Property ROOT_ENTITY = Property.internalText("xmlprofiler:root-entity");
+    public static Property ENTITY_URIS = Property.internalTextBag("xmlprofiler:entity-uris");
     public static Property ENTITY_LOCAL_NAMES =
-            Property.internalTextBag("xmlprofiler:entity_local_names");
+            Property.internalTextBag("xmlprofiler:entity-local-names");
 
     @Override
     public Set<MediaType> getSupportedTypes(ParseContext context) {
@@ -87,10 +88,14 @@ public class XMLProfiler implements Parser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        XMLReaderUtils.parseSAX(CloseShieldInputStream.wrap(stream),
-                new XMLProfileHandler(metadata), context);
+        tis.setCloseShield();
+        try {
+            XMLReaderUtils.parseSAX(tis, new XMLProfileHandler(metadata), context);
+        } finally {
+            tis.removeCloseShield();
+        }
     }
 
     private static class XMLProfileHandler extends DefaultHandler {

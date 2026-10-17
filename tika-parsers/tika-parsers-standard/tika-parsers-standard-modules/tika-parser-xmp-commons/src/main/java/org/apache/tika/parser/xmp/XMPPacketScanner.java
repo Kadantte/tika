@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,9 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-/* $Id: XMPPacketParser.java 750418 2009-03-05 11:03:54Z vhennebert $ */
-
 package org.apache.tika.parser.xmp;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
@@ -25,13 +22,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
+/* $Id: XMPPacketParser.java 750418 2009-03-05 11:03:54Z vhennebert $ */
+
 /**
  * This class is a parser for XMP packets. By default, it tries to locate the first XMP packet
  * it finds and parses it.
- * <p/>
+ * <p>
  * Important: Before you use this class to look for an XMP packet in some random file, please read
  * the chapter on "Scanning Files for XMP Packets" in the XMP specification!
- * <p/>
+ * <p>
  * Thic class was branched from http://xmlgraphics.apache.org/ XMPPacketParser.
  * See also org.semanticdesktop.aperture.extractor.xmp.XMPExtractor, a variant.
  */
@@ -51,10 +50,14 @@ public class XMPPacketScanner {
         return skipAfter(in, match, null);
     }
 
+    // Cap the captured packet so a crafted stream can't read an unbounded xpacket into memory.
+    private static final long MAX_PACKET = 64L * 1024 * 1024;
+
     private static boolean skipAfter(InputStream in, byte[] match, OutputStream out)
             throws IOException {
         int found = 0;
         int len = match.length;
+        long written = 0;
         int b;
         while ((b = in.read()) >= 0) {
             if (b == match[found]) {
@@ -66,8 +69,12 @@ public class XMPPacketScanner {
                 if (out != null) {
                     if (found > 0) {
                         out.write(match, 0, found);
+                        written += found;
                     }
                     out.write(b);
+                    if (++written > MAX_PACKET) {
+                        throw new IOException("XMP packet exceeds " + MAX_PACKET + " bytes");
+                    }
                 }
                 found = 0;
             }
@@ -80,7 +87,7 @@ public class XMPPacketScanner {
      * XMP packet is found until the stream ends, null is returned. Note: This method
      * only finds the first XMP packet in a stream. And it cannot determine whether it
      * has found the right XMP packet if there are multiple packets.
-     * <p/>
+     * <p>
      * Does <em>not</em> close the stream.
      * If XMP block was found reading can continue below the block.
      *
@@ -88,7 +95,6 @@ public class XMPPacketScanner {
      * @param xmlOut to write the XMP packet to
      * @return true if XMP packet is found, false otherwise
      * @throws IOException          if an I/O error occurs
-     * @throws TransformerException if an error occurs while parsing the XMP packet
      */
     public boolean parse(InputStream in, OutputStream xmlOut) throws IOException {
         if (!in.markSupported()) {
@@ -110,4 +116,3 @@ public class XMPPacketScanner {
     }
 
 }
-

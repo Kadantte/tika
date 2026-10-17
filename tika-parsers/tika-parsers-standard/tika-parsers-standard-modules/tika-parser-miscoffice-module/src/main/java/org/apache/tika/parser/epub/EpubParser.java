@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -35,26 +34,26 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
-import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
 import org.apache.commons.compress.archivers.zip.ZipFile;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.xml.sax.Attributes;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 import org.xml.sax.helpers.DefaultHandler;
 
-import org.apache.tika.config.Field;
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.WriteLimitReachedException;
 import org.apache.tika.extractor.EmbeddedDocumentExtractor;
 import org.apache.tika.extractor.EmbeddedDocumentUtil;
-import org.apache.tika.io.FilenameUtils;
 import org.apache.tika.io.TemporaryResources;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -62,17 +61,19 @@ import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.xml.DcXMLParser;
 import org.apache.tika.sax.BodyContentHandler;
-import org.apache.tika.sax.ContentHandlerDecorator;
 import org.apache.tika.sax.EmbeddedContentHandler;
+import org.apache.tika.sax.XHTMLBalancingHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
-import org.apache.tika.utils.ParserUtils;
 import org.apache.tika.utils.XMLReaderUtils;
-import org.apache.tika.zip.utils.ZipSalvager;
+import org.apache.tika.zip.utils.ZipFileHelper;
 
 /**
  * Epub parser
  */
+@TikaComponent
 public class EpubParser implements Parser {
+
+    private static final Logger LOG = LoggerFactory.getLogger(EpubParser.class);
 
     /**
      * Serial version UID
@@ -84,8 +85,6 @@ public class EpubParser implements Parser {
                     MediaType.application("x-ibooks+zip"))));
 
     private static final String META_INF_ENCRYPTION = "META-INF/encryption.xml";
-    @Field
-    boolean streaming = false;
     private Parser meta = new DcXMLParser();
 
     private Parser opf = new OPFParser();
@@ -107,37 +106,25 @@ public class EpubParser implements Parser {
         this.content = content;
     }
 
-    @Field
-    public void setStreaming(boolean streaming) {
-        this.streaming = streaming;
-    }
-
     public Set<MediaType> getSupportedTypes(ParseContext context) {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         // Because an EPub file is often made up of multiple XHTML files,
         //  we need explicit control over the start and end of the document
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         IOException caughtException = null;
-        ContentHandler childHandler = new EmbeddedContentHandler(
-                new EpubNormalizingHandler(new BodyContentHandler(xhtml)));
+        EpubNormalizingHandler normalizer =
+                new EpubNormalizingHandler(new BodyContentHandler(xhtml));
+        ContentHandler childHandler = new EmbeddedContentHandler(normalizer);
         Set<String> encryptedItems = Collections.EMPTY_SET;
-        if (streaming) {
-            try {
-                streamingParse(stream, childHandler, metadata, context);
-            } catch (IOException e) {
-                caughtException = e;
-            }
-        } else {
-            try {
-                encryptedItems = bufferedParse(stream, childHandler, xhtml, metadata, context);
-            } catch (IOException e) {
-                caughtException = e;
-            }
+        try {
+            encryptedItems = bufferedParse(tis, childHandler, normalizer, xhtml, metadata, context);
+        } catch (IOException e) {
+            caughtException = e;
         }
         // Finish everything
         xhtml.endDocument();
@@ -147,160 +134,85 @@ public class EpubParser implements Parser {
         maybeThrowEncryptedException(encryptedItems);
     }
 
-    private Set<String> streamingParse(InputStream stream, ContentHandler bodyHandler,
-                                   Metadata metadata,
-                                ParseContext context)
-            throws IOException, TikaException, SAXException {
-        ZipArchiveInputStream zip = new ZipArchiveInputStream(stream, "UTF-8", false, true, false);
-
-        ZipArchiveEntry entry = zip.getNextEntry();
-        SAXException sax = null;
-        while (entry != null) {
-            if (entry.getName().equals("mimetype")) {
-                updateMimeType(zip, metadata);
-            } else if (entry.getName().equals(META_INF_ENCRYPTION)) {
-                //when streaming, throw an encryption exception if anything is encrypted
-                checkForDRM(zip, context);
-            } else if (entry.getName().equals("metadata.xml")) {
-                meta.parse(zip, new DefaultHandler(), metadata, context);
-            } else if (entry.getName().endsWith(".opf")) {
-                opf.parse(zip, new DefaultHandler(), metadata, context);
-            } else if (entry.getName().endsWith(".htm") || entry.getName().endsWith(".html") ||
-                    entry.getName().endsWith(".xhtml") || entry.getName().endsWith(".xml")) {
-                try {
-                    content.parse(zip, bodyHandler, metadata, context);
-                } catch (SAXException e) {
-                    if (WriteLimitReachedException.isWriteLimitReached(e)) {
-                        throw e;
-                    }
-                    if (sax == null) {
-                        sax = e;
-                    }
-                }
-            }
-            entry = zip.getNextEntry();
-        }
-        if (sax != null) {
-            throw sax;
-        }
-        //always empty -- we throw an encryption exception
-        //as soon as checkForDRM hits an encrypted item
-        return Collections.EMPTY_SET;
-    }
-
     private void updateMimeType(InputStream is, Metadata metadata) throws IOException {
         String type = IOUtils.toString(is, UTF_8);
         //often has trailing new lines
         if (type != null) {
             type = type.trim();
         }
-        metadata.set(Metadata.CONTENT_TYPE, type);
+        metadata.set(HttpHeaders.CONTENT_TYPE, type);
 
     }
 
-    private Set<String> bufferedParse(InputStream stream, ContentHandler bodyHandler,
+    private Set<String> bufferedParse(TikaInputStream tis, ContentHandler bodyHandler,
+                               EpubNormalizingHandler normalizer,
                                XHTMLContentHandler xhtml, Metadata metadata, ParseContext context)
             throws IOException, TikaException, SAXException {
-        TikaInputStream tis;
-        TemporaryResources temporaryResources = null;
-        if (TikaInputStream.isTikaInputStream(stream)) {
-            tis = TikaInputStream.cast(stream);
-            if (tis.getOpenContainer() instanceof ZipFile) {
-                return bufferedParseZipFile((ZipFile) tis.getOpenContainer(), bodyHandler, xhtml,
-                        metadata, context, true);
-            }
-        } else {
-            temporaryResources = new TemporaryResources();
-            tis = TikaInputStream.get(CloseShieldInputStream.wrap(stream), temporaryResources, metadata);
+        // DefaultZipContainerDetector opens (and salvages, if needed) the ZipFile and
+        // stashes it on the TikaInputStream. Reuse it when present; otherwise open ourselves.
+        if (tis.getOpenContainer() instanceof ZipFile) {
+            return bufferedParseZipFile((ZipFile) tis.getOpenContainer(), bodyHandler,
+                    normalizer, xhtml, metadata, context);
         }
-        ZipFile zipFile = null;
-        try {
-            zipFile = ZipFile.builder().setFile(tis.getPath().toFile()).get();
-        } catch (IOException e) {
-            ParserUtils.recordParserFailure(this, e, metadata);
-            return trySalvage(tis.getPath(), bodyHandler, xhtml, metadata, context);
-        } finally {
-            //if we had to wrap tis
-            if (temporaryResources != null) {
-                tis.close();
-            }
-        }
-        try {
-            return bufferedParseZipFile(zipFile, bodyHandler, xhtml, metadata, context, true);
-        } finally {
-            zipFile.close();
-        }
-    }
-
-    private Set<String> trySalvage(Path brokenZip, ContentHandler bodyHandler,
-                               XHTMLContentHandler xhtml,
-                            Metadata metadata, ParseContext context)
-            throws IOException, TikaException, SAXException {
-        try (TemporaryResources resources = new TemporaryResources()) {
-            Path salvaged =
-                    resources.createTempFile(FilenameUtils.getSuffixFromPath(brokenZip.getFileName().toString()));
-            ZipSalvager.salvageCopy(brokenZip.toFile(), salvaged.toFile());
-            try (ZipFile zipFile = ZipFile.builder().setFile(salvaged.toFile()).get()) {
-                return bufferedParseZipFile(zipFile, bodyHandler, xhtml, metadata, context, false);
-            } catch (EpubZipException e) {
-                try (InputStream is = TikaInputStream.get(salvaged)) {
-                    return streamingParse(is, xhtml, metadata, context);
-                }
-            }
+        try (ZipFile zipFile = ZipFileHelper.open(tis, null)) {
+            return bufferedParseZipFile(zipFile, bodyHandler, normalizer, xhtml, metadata, context);
         }
     }
 
     private Set<String> bufferedParseZipFile(ZipFile zipFile, ContentHandler bodyHandler,
+                                         EpubNormalizingHandler normalizer,
                                          XHTMLContentHandler xhtml, Metadata metadata,
-                                         ParseContext context, boolean isStrict)
-            throws IOException, TikaException, SAXException, EpubZipException {
+                                         ParseContext context)
+            throws IOException, TikaException, SAXException {
 
         String rootOPF = getRoot(zipFile, context);
+        LOG.trace("epub bufferedParseZipFile: rootOPF={}", rootOPF);
         if (rootOPF == null) {
-            throw new EpubZipException();
+            // No container.xml and no .opf — typical of truncated epubs where
+            // the OPF lives past the truncation point.  Fall back to iterating
+            // the recoverable HTML/XHTML entries in stored order so we still
+            // emit partial content (matching 3.x's streamingParse contract),
+            // then throw to signal the result is incomplete.
+            LOG.trace("epub fallback: rootOPF=null, streaming all html entries");
+            return fallbackParseAllHtmlEntries(zipFile, bodyHandler, normalizer, metadata, context,
+                    "no OPF found in (possibly truncated) container");
         }
         ZipArchiveEntry zae = zipFile.getEntry(rootOPF);
+        LOG.trace("epub OPF entry: zae={} canReadEntryData={}",
+                zae, zae == null ? "n/a" : zipFile.canReadEntryData(zae));
         if (zae == null || !zipFile.canReadEntryData(zae)) {
-            throw new EpubZipException();
+            LOG.trace("epub fallback: OPF entry missing/unreadable, streaming all html entries");
+            return fallbackParseAllHtmlEntries(zipFile, bodyHandler, normalizer, metadata, context,
+                    "OPF entry missing or unreadable in (possibly truncated) container");
         }
-        opf.parse(zipFile.getInputStream(zae), new DefaultHandler(), metadata, context);
+        try (TikaInputStream tis = entryStream(zipFile, zae)) {
+            opf.parse(tis, new DefaultHandler(), metadata, context);
+        }
 
         ContentOrderScraper contentOrderScraper = new ContentOrderScraper();
         try (InputStream is = zipFile.getInputStream(zae)) {
             XMLReaderUtils.parseSAX(is, contentOrderScraper, context);
         }
-        //if no content items, false
-        if (contentOrderScraper.contentItems.size() == 0) {
-            throw new EpubZipException();
+        LOG.trace("epub OPF parsed: spine items={}, manifest entries={}",
+                contentOrderScraper.contentItems.size(),
+                contentOrderScraper.locationMap.size());
+        if (contentOrderScraper.contentItems.isEmpty()) {
+            LOG.trace("epub fallback: empty spine, streaming all html entries");
+            return fallbackParseAllHtmlEntries(zipFile, bodyHandler, normalizer, metadata, context,
+                    "OPF declared no spine items in (possibly truncated) container");
         }
         String relativePath = "";
         if (rootOPF.lastIndexOf("/") > -1) {
             relativePath = rootOPF.substring(0, rootOPF.lastIndexOf("/") + 1);
         }
 
-        if (isStrict) {
-            int found = 0;
-            for (String id : contentOrderScraper.contentItems) {
-                HRefMediaPair hRefMediaPair = contentOrderScraper.locationMap.get(id);
-                if (hRefMediaPair != null && hRefMediaPair.href != null) {
-                    zae = zipFile.getEntry(relativePath + hRefMediaPair.href);
-                    if (zae != null && zipFile.canReadEntryData(zae)) {
-                        found++;
-                    }
-                }
-            }
-            //if not perfect match btwn items and readable items
-            //return false
-            if (found != contentOrderScraper.contentItems.size()) {
-                throw new EpubZipException();
-            }
-        }
-
         extractMetadata(zipFile, metadata, context);
         Set<String> encryptedItems = checkForDRM(zipFile);
         Set<String> processed = new HashSet<>();
         Set<SAXException> saxExceptions = new HashSet<>();
+        int spineSeen = 0, spineParsed = 0, spineMissing = 0, spineNonHtml = 0;
         for (String id : contentOrderScraper.contentItems) {
+            spineSeen++;
             HRefMediaPair hRefMediaPair = contentOrderScraper.locationMap.get(id);
             if (hRefMediaPair != null && hRefMediaPair.href != null) {
                 //we need to test for xhtml/xml because the content parser
@@ -323,20 +235,42 @@ public class EpubParser implements Parser {
                     }
                     zae = zipFile.getEntry(relativePath + hRefMediaPair.href);
                     if (zae != null) {
-                        try (InputStream is = zipFile.getInputStream(zae)) {
-                            content.parse(is, bodyHandler, metadata, context);
+                        try (TikaInputStream tis = entryStream(zipFile, zae)) {
+                            content.parse(tis, bodyHandler, metadata, context);
+                            spineParsed++;
                         } catch (SAXException e) {
                             if (WriteLimitReachedException.isWriteLimitReached(e)) {
                                 throw e;
                             }
                             saxExceptions.add(e);
+                            // The aborted spine item may have left <svg>,
+                            // <g>, <p>, etc. open on the wire. Close them
+                            // before the next item (or the outer </body>)
+                            // emits, otherwise the validator sees cross-
+                            // nested events.
+                            normalizer.drainOpenElements();
+                        } catch (IOException ioe) {
+                            LOG.trace("epub spine read IOException on {}: {}", path, ioe.toString());
+                            // Same risk as the SAX path: the partial parse may
+                            // have left elements open. Drain before rethrow so
+                            // subsequent spine items and the outer </body>
+                            // don't land on a corrupted stack.
+                            normalizer.drainOpenElements();
+                            throw ioe;
                         } finally {
                             processed.add(id);
                         }
+                    } else {
+                        spineMissing++;
+                        LOG.trace("epub spine: getEntry({}) returned null (truncated?)", path);
                     }
+                } else {
+                    spineNonHtml++;
                 }
             }
         }
+        LOG.trace("epub spine summary: seen={} parsed={} missing={} non-html={}",
+                spineSeen, spineParsed, spineMissing, spineNonHtml);
 
         //now handle embedded files
         EmbeddedDocumentExtractor embeddedDocumentExtractor =
@@ -349,8 +283,9 @@ public class EpubParser implements Parser {
                     continue;
                 }
                 if (shouldHandleEmbedded(hRefMediaPair.media)) {
-                    handleEmbedded(zipFile, relativePath, hRefMediaPair, embeddedDocumentExtractor,
-                            xhtml, metadata);
+                    handleEmbedded(zipFile, relativePath, hRefMediaPair,
+                            id.equals(contentOrderScraper.getCoverId()),
+                            embeddedDocumentExtractor, xhtml, metadata, context);
                 }
             }
         }
@@ -358,7 +293,85 @@ public class EpubParser implements Parser {
         for (SAXException e : saxExceptions) {
             throw e;
         }
+        // If spine items referenced entries not in the (possibly salvaged)
+        // zip — typical of truncated epubs where the OPF survived but later
+        // chapters didn't — throw IOException so the outer parse() flushes
+        // the partial content already in xhtml and signals incompleteness.
+        // This restores 3.x's partial-content-plus-exception contract.
+        if (spineMissing > 0) {
+            throw new IOException("EPUB: " + spineMissing + " of "
+                    + spineSeen + " spine items missing from (possibly truncated) "
+                    + "container; emitted " + spineParsed + " recovered chapters");
+        }
         return encryptedItems;
+    }
+
+    /**
+     * Fallback used when the OPF can't be located or parsed (typically a
+     * truncated epub where the OPF lives past the truncation point).
+     * Iterates the zip's entries in stored order and parses any HTML/XHTML/XML
+     * entry, mirroring 3.x's {@code streamingParse} behaviour.  Throws
+     * IOException at the end so the outer parse() flushes the partial content
+     * and the caller learns that extraction was incomplete.
+     */
+    private Set<String> fallbackParseAllHtmlEntries(ZipFile zipFile,
+                                                   ContentHandler bodyHandler,
+                                                   EpubNormalizingHandler normalizer,
+                                                   Metadata metadata,
+                                                   ParseContext context,
+                                                   String reason)
+            throws IOException, TikaException, SAXException {
+        // Try to recover mimetype + metadata.xml even in the fallback path,
+        // since they may be present even when the OPF isn't.
+        try {
+            extractMetadata(zipFile, metadata, context);
+        } catch (Exception e) {
+            LOG.trace("epub fallback: extractMetadata threw {}", e.toString());
+        }
+        int parsed = 0;
+        int failed = 0;
+        Enumeration<ZipArchiveEntry> entries = zipFile.getEntries();
+        while (entries.hasMoreElements()) {
+            ZipArchiveEntry entry = entries.nextElement();
+            String name = entry.getName().toLowerCase(Locale.US);
+            if (!(name.endsWith(".xhtml") || name.endsWith(".html")
+                    || name.endsWith(".htm") || name.endsWith(".xml"))) {
+                continue;
+            }
+            // Skip the OPF file if we somehow have one but it didn't parse
+            // upstream — body handler isn't the right place for it.
+            if (name.endsWith(".opf")) {
+                continue;
+            }
+            if (!zipFile.canReadEntryData(entry)) {
+                continue;
+            }
+            try (TikaInputStream tis = entryStream(zipFile, entry)) {
+                content.parse(tis, bodyHandler, metadata, context);
+                parsed++;
+            } catch (SAXException e) {
+                if (WriteLimitReachedException.isWriteLimitReached(e)) {
+                    throw e;
+                }
+                failed++;
+                LOG.trace("epub fallback: SAX failure on {}: {}", entry.getName(), e.toString());
+                // Close any tags the aborted parse left open.
+                normalizer.drainOpenElements();
+            } catch (IOException e) {
+                failed++;
+                LOG.trace("epub fallback: IO failure on {}: {}", entry.getName(), e.toString());
+                // Same drain need as the SAX path: a partial parse before the
+                // IO failure may have left elements open for the next iter.
+                normalizer.drainOpenElements();
+            }
+        }
+        LOG.trace("epub fallback summary: parsed={} failed={}", parsed, failed);
+        // Always throw — the caller asked for an EPUB and we couldn't follow
+        // the spine.  Partial content was emitted to xhtml; outer parse()
+        // flushes it.
+        throw new IOException("EPUB: fallback recovery (" + reason
+                + "); recovered " + parsed + " HTML/XHTML entries"
+                + (failed > 0 ? " (" + failed + " failed)" : ""));
     }
 
     private Set<String> checkForDRM(ZipFile zipFile) throws IOException, TikaException,
@@ -370,12 +383,6 @@ public class EpubParser implements Parser {
         try (InputStream is = zipFile.getInputStream(zae)) {
             return EncryptionHandler.parse(is, new ParseContext());
         }
-    }
-
-    private void checkForDRM(InputStream is, ParseContext parseContext)
-            throws IOException, TikaException, SAXException {
-        Set<String> encryptedItems = EncryptionHandler.parse(is, parseContext);
-        maybeThrowEncryptedException(encryptedItems);
     }
 
     private void maybeThrowEncryptedException(Set<String> encryptedItems)
@@ -418,10 +425,21 @@ public class EpubParser implements Parser {
         return true;
     }
 
+    /**
+     * @param cover whether this is the publication's cover image, emitted as
+     *              the {@link TikaCoreProperties.EmbeddedResourceType#THUMBNAIL}
+     */
+    /** Re-opened from the zip on rewind rather than cached: the entry is in the container already. */
+    private static TikaInputStream entryStream(ZipFile zipFile, ZipArchiveEntry entry) {
+        return TikaInputStream.get(() -> zipFile.getInputStream(entry), new TemporaryResources(), null);
+    }
+
     private void handleEmbedded(ZipFile zipFile, String relativePath, HRefMediaPair hRefMediaPair,
+                                boolean cover,
                                 EmbeddedDocumentExtractor embeddedDocumentExtractor,
-                                XHTMLContentHandler xhtml, Metadata parentMetadata)
-            throws IOException, SAXException {
+                                XHTMLContentHandler xhtml, Metadata parentMetadata,
+                                ParseContext context)
+            throws IOException, SAXException, TikaException {
         if (hRefMediaPair.href == null) {
             return;
         }
@@ -431,36 +449,40 @@ public class EpubParser implements Parser {
         if (ze == null || !zipFile.canReadEntryData(ze)) {
             return;
         }
-        Metadata embeddedMetadata = new Metadata();
+        Metadata embeddedMetadata = Metadata.newInstance(context);
         if (!StringUtils.isBlank(hRefMediaPair.media)) {
-            embeddedMetadata.set(Metadata.CONTENT_TYPE, hRefMediaPair.media);
+            embeddedMetadata.set(HttpHeaders.CONTENT_TYPE, hRefMediaPair.media);
         }
         embeddedMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, fullPath);
-        if (!embeddedDocumentExtractor.shouldParseEmbedded(embeddedMetadata)) {
+        if (cover) {
+            embeddedMetadata.set(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE,
+                    TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString());
+        }
+        if (!embeddedDocumentExtractor.shouldParseEmbedded(embeddedMetadata, context)) {
             return;
         }
 
-        TikaInputStream stream = null;
+        //open once now so a broken entry is recorded here, not mid-parse
         try {
-            stream = TikaInputStream.get(zipFile.getInputStream(ze));
+            zipFile.getInputStream(ze).close();
         } catch (IOException e) {
-            //store this exception in the parent's metadata
-            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata);
+            EmbeddedDocumentUtil.recordEmbeddedStreamException(e, parentMetadata, context);
             return;
         }
+        TikaInputStream tis = entryStream(zipFile, ze);
 
         xhtml.startElement("div", "class", "embedded");
         try {
             boolean outputHtml = true;
-            if (hRefMediaPair.media.contains("font") || hRefMediaPair.href.startsWith("fonts")) {
+            if ((hRefMediaPair.media != null && hRefMediaPair.media.contains("font"))
+                    || hRefMediaPair.href.startsWith("fonts")) {
                 outputHtml = false;
             }
             embeddedDocumentExtractor
-                    .parseEmbedded(stream, new EmbeddedContentHandler(xhtml), embeddedMetadata,
-                            outputHtml);
+                    .parseEmbedded(tis, new EmbeddedContentHandler(xhtml), embeddedMetadata, context, outputHtml);
 
         } finally {
-            IOUtils.closeQuietly(stream);
+            IOUtils.closeQuietly(tis);
         }
         xhtml.endElement("div");
     }
@@ -475,8 +497,8 @@ public class EpubParser implements Parser {
         }
         zae = zipFile.getEntry("metadata.xml");
         if (zae != null && zipFile.canReadEntryData(zae)) {
-            try (InputStream is = zipFile.getInputStream(zae)) {
-                meta.parse(is, new DefaultHandler(), metadata, context);
+            try (TikaInputStream tis = entryStream(zipFile, zae)) {
+                meta.parse(tis, new DefaultHandler(), metadata, context);
             }
         }
     }
@@ -519,8 +541,19 @@ public class EpubParser implements Parser {
 
         Map<String, HRefMediaPair> locationMap = new HashMap<>();
         List<String> contentItems = new ArrayList<>();
+        //the cover image: EPUB 3 marks its manifest item with the
+        //cover-image property, EPUB 2 names the item id in a cover meta
+        String coverImageItem;
+        String coverMetaItem;
         boolean inManifest = false;
         boolean inSpine = false;
+
+        /**
+         * The manifest id of the cover image, or null if the OPF names none.
+         */
+        String getCoverId() {
+            return coverImageItem != null ? coverImageItem : coverMetaItem;
+        }
 
         @Override
         public void startElement(String uri, String localName, String name, Attributes atts)
@@ -542,7 +575,19 @@ public class EpubParser implements Parser {
                             //swallow
                         }
                         locationMap.put(id, new HRefMediaPair(href, mime));
+                        String properties = XMLReaderUtils.getAttrValue("properties", atts);
+                        if (coverImageItem == null && properties != null
+                                && Arrays.asList(properties.trim().split("\\s+"))
+                                .contains("cover-image")) {
+                            coverImageItem = id;
+                        }
                     }
+                }
+            } else if ("meta".equalsIgnoreCase(localName) && coverMetaItem == null
+                    && "cover".equals(XMLReaderUtils.getAttrValue("name", atts))) {
+                String content = XMLReaderUtils.getAttrValue("content", atts);
+                if (!StringUtils.isBlank(content)) {
+                    coverMetaItem = content.trim();
                 }
             }
             if (inSpine) {
@@ -603,16 +648,11 @@ public class EpubParser implements Parser {
         }
     }
 
-    //any problem with parsing an epub file when it is
-    //a zip file
-    private static class EpubZipException extends IOException {
-
-    }
-
     //for now, this simply converts all names to local names to avoid
     //namespace conflicts in the content handler. This also removes namespaces
     //from attributes
-    private static class EpubNormalizingHandler extends ContentHandlerDecorator {
+    private static class EpubNormalizingHandler extends XHTMLBalancingHandler {
+
         public EpubNormalizingHandler(ContentHandler contentHandler) {
             super(contentHandler);
         }
@@ -631,7 +671,15 @@ public class EpubParser implements Parser {
             if (needToRewrite) {
                 AttributesImpl simplifiedAtts = new AttributesImpl();
                 for (int i = 0; i < atts.getLength(); i++) {
-                    simplifiedAtts.addAttribute("", atts.getLocalName(i), atts.getLocalName(i),
+                    String localAttName = atts.getLocalName(i);
+                    // Stripping the namespace prefix can collapse two distinct
+                    // qnames onto one local name (e.g. xml:lang + lang). The
+                    // serialized XHTML must have unique attribute names, so
+                    // keep the first occurrence and drop later duplicates.
+                    if (simplifiedAtts.getIndex("", localAttName) >= 0) {
+                        continue;
+                    }
+                    simplifiedAtts.addAttribute("", localAttName, localAttName,
                             atts.getType(i), atts.getValue(i));
                 }
                 super.startElement(uri, localName, localName, simplifiedAtts);

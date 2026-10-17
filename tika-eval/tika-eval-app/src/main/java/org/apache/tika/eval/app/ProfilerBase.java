@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.eval.app;
 
 
@@ -46,11 +45,15 @@ import org.apache.tika.eval.app.db.Cols;
 import org.apache.tika.eval.app.db.TableInfo;
 import org.apache.tika.eval.app.io.ExtractReaderException;
 import org.apache.tika.eval.app.io.IDBWriter;
+import org.apache.tika.eval.app.io.PipesReport;
 import org.apache.tika.eval.core.langid.LanguageIDWrapper;
+import org.apache.tika.eval.core.metadata.TikaEvalMetadataFilter;
 import org.apache.tika.eval.core.textstats.BasicTokenCountStatsCalculator;
 import org.apache.tika.eval.core.textstats.CommonTokens;
 import org.apache.tika.eval.core.textstats.CompositeTextStatsCalculator;
 import org.apache.tika.eval.core.textstats.ContentLengthCalculator;
+import org.apache.tika.eval.core.textstats.NonAsciiCharCounter;
+import org.apache.tika.eval.core.textstats.ReplacementCharCounter;
 import org.apache.tika.eval.core.textstats.TextStatsCalculator;
 import org.apache.tika.eval.core.textstats.TokenEntropy;
 import org.apache.tika.eval.core.textstats.TokenLengths;
@@ -66,13 +69,15 @@ import org.apache.tika.eval.core.util.ContentTags;
 import org.apache.tika.eval.core.util.EvalExceptionUtils;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.language.detect.LanguageResult;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.PDF;
 import org.apache.tika.metadata.PagedText;
-import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.pipes.fetcher.FetchKey;
-import org.apache.tika.sax.ToXMLContentHandler;
+import org.apache.tika.ml.junkdetect.JunkDetector;
+import org.apache.tika.pipes.api.fetcher.FetchKey;
+import org.apache.tika.quality.TextQualityScore;
+import org.apache.tika.sax.BasicContentHandlerFactory.HANDLER_TYPE;
 import org.apache.tika.utils.StringUtils;
 
 public abstract class ProfilerBase {
@@ -82,15 +87,17 @@ public abstract class ProfilerBase {
     protected static final AtomicInteger ID = new AtomicInteger();
     static final long NON_EXISTENT_FILE_LENGTH = -1l;
     final static int FILE_PATH_MAX_LEN = 1024;//max len for varchar for file_path
-    //Container exception key from the 1.x branch
-    private static final Property CONTAINER_EXCEPTION_1X = Property.externalText("X-TIKA" + ":EXCEPTION:runtime");
+    final static int PIPES_STATUS_MAX_LEN = 64;
+    final static int PIPES_MESSAGE_MAX_LEN = 4096;
+    //Container exception key from the 1.x branch; read-only lookup against legacy extract JSON, so a plain String key suffices.
+    private static final String CONTAINER_EXCEPTION_1X = "X-TIKA" + ":EXCEPTION:runtime";
     private static final Logger LOG = LoggerFactory.getLogger(ProfilerBase.class);
     private static final String[] EXTRACT_EXTENSIONS = {".json", ".txt", ""};
     private static final String[] COMPRESSION_EXTENSIONS = {"", ".bz2", ".gzip", ".zip",};
     private static final String ZERO = "0";
     private static final String UNKNOWN_EXTENSION = "unk";
     //make this configurable
-    private static final String DIGEST_KEY = "X-TIKA:digest:MD5";
+    private static final String DIGEST_KEY = "tk:digest:MD5";
     private static final Map<String, Cols> UC_TAGS_OF_INTEREST = initTags();
     private final static Pattern ACCESS_PERMISSION_EXCEPTION = Pattern.compile("org\\.apache\\.tika\\.exception\\.AccessPermissionException");
     private final static Pattern ENCRYPTION_EXCEPTION = Pattern.compile("org\\.apache\\.tika.exception\\.EncryptedDocumentException");
@@ -101,6 +108,7 @@ public abstract class ProfilerBase {
     public static TableInfo REF_PARSE_EXCEPTION_TYPES =
             new TableInfo("ref_parse_exception_types", new ColInfo(Cols.PARSE_EXCEPTION_ID, Types.INTEGER), new ColInfo(Cols.PARSE_EXCEPTION_DESCRIPTION, Types.VARCHAR, 128));
     public static TableInfo MIME_TABLE = new TableInfo("mimes", new ColInfo(Cols.MIME_ID, Types.INTEGER, "PRIMARY KEY"), new ColInfo(Cols.MIME_STRING, Types.VARCHAR, 256),
+            new ColInfo(Cols.BASE_MIME, Types.VARCHAR, 256),
             new ColInfo(Cols.FILE_EXTENSION, Types.VARCHAR, 12));
     private static CommonTokenCountManager COMMON_TOKEN_COUNT_MANAGER;
     private static Pattern FILE_NAME_CLEANER = Pattern.compile("\\.(json|txt)(\\.(bz2|gz|zip))?$");
@@ -143,7 +151,7 @@ public abstract class ProfilerBase {
     /**
      * @param p               path to the common_tokens directory.  If this is null, try to load from classPath
      * @param defaultLangCode this is the language code to use if a common_words list doesn't exist for the
-     *                        detected langauge; can be <code>null</code>
+     *                        detected language; can be <code>null</code>
      * @throws IOException
      */
     public static void loadCommonTokens(Path p, String defaultLangCode) throws IOException {
@@ -266,7 +274,7 @@ public abstract class ProfilerBase {
             return ContentTags.EMPTY_CONTENT_TAGS;
         }
 
-        String handlerClass = metadata.get(TikaCoreProperties.TIKA_CONTENT_HANDLER);
+        String handlerType = metadata.get(TikaCoreProperties.TIKA_CONTENT_HANDLER_TYPE);
         if (evalFilePaths
                 .getExtractFile()
                 .getFileName()
@@ -288,7 +296,7 @@ public abstract class ProfilerBase {
                 .getFileName()
                 .toString()
                 .toLowerCase(Locale.ENGLISH)
-                .endsWith(".xhtml") || (handlerClass != null && handlerClass.equals(ToXMLContentHandler.class.getSimpleName()))) {
+                .endsWith(".xhtml") || HANDLER_TYPE.XML.name().equals(handlerType)) {
             try {
                 return ContentTagParser.parseXML(s, UC_TAGS_OF_INTEREST.keySet());
             } catch (TikaException | IOException | SAXException e) {
@@ -321,9 +329,11 @@ public abstract class ProfilerBase {
         calculators.add(new TopNTokens(10));
         calculators.add(new BasicTokenCountStatsCalculator());
         calculators.add(new ContentLengthCalculator());
+        calculators.add(new ReplacementCharCounter());
+        calculators.add(new NonAsciiCharCounter());
         calculators.add(new UnicodeBlockCounter(maxContentLengthForLangId));
 
-        return new CompositeTextStatsCalculator(calculators, analyzerManager.getGeneralAnalyzer(), langIder);
+        return new CompositeTextStatsCalculator(calculators, analyzerManager, langIder);
     }
 
     /**
@@ -353,6 +363,18 @@ public abstract class ProfilerBase {
     public void setMaxTokens(int maxTokens) {
         this.maxTokens = maxTokens;
         initAnalyzersAndTokenCounter(maxTokens, new LanguageIDWrapper());
+    }
+
+    protected static void putPipesResult(Map<Cols, String> row, PipesReport report, EvalFilePaths fps, Cols statusCol, Cols messageCol) {
+        if (report == null) {
+            return;
+        }
+        PipesReport.Row r = report.get(fps.getRelativeSourceFilePath());
+        if (r == null) {
+            return;
+        }
+        row.put(statusCol, r.status());
+        row.put(messageCol, r.message());
     }
 
     protected void writeExtractException(TableInfo extractExceptionTable, String containerId, String filePath, ExtractReaderException.TYPE type) throws IOException {
@@ -461,8 +483,20 @@ public abstract class ProfilerBase {
         if (content == null || content.isBlank()) {
             content = "";
         }
-        return compositeTextStatsCalculator.calculate(content);
+        Map<Class, Object> results = compositeTextStatsCalculator.calculate(content);
+
+        JunkDetector jd = TikaEvalMetadataFilter.getJunkDetector();
+        if (jd != null && !content.isEmpty()) {
+            TextQualityScore q = jd.score(content);
+            if (!q.isUnknown()) {
+                results.put(LanguagenessMarker.class, q.getZScore());
+            }
+        }
+        return results;
     }
+
+    /** Sentinel key for the junk-detector z-score in the textStats map. */
+    static final class LanguagenessMarker { }
 
     /**
      * Checks to see if metadata is null or content is empty (null or only whitespace).
@@ -482,6 +516,19 @@ public abstract class ProfilerBase {
                 return;
             }
             data.put(Cols.CONTENT_LENGTH, Integer.toString(length));
+            Integer numReplacement = (Integer) textStats.get(ReplacementCharCounter.class);
+            if (numReplacement != null) {
+                data.put(Cols.NUM_REPLACEMENT, Integer.toString(numReplacement));
+            }
+            // Store raw counts only; derive the FFFD rate in SQL.  Decode failures
+            // come only from high bytes, so num_replacement/num_non_ascii is the
+            // un-diluted rate (num_replacement/content_length dilutes to ~0 on
+            // ASCII-dominated docs).  U+FFFD is itself >= 0x80, so it is counted in
+            // num_non_ascii and both ratios stay in [0,1].
+            Integer numNonAscii = (Integer) textStats.get(NonAsciiCharCounter.class);
+            if (numNonAscii != null) {
+                data.put(Cols.NUM_NON_ASCII, Integer.toString(numNonAscii));
+            }
         }
         langid(textStats, data);
 
@@ -496,6 +543,9 @@ public abstract class ProfilerBase {
             double oov = commonTokenResult.getAlphabeticTokens() > 0 ? commonTokenResult.getOOV() : -1.0;
             data.put(Cols.OOV, Double.toString(oov));
         }
+        Float zScore = (Float) textStats.get(LanguagenessMarker.class);
+        double langness = (zScore != null && !Float.isNaN(zScore)) ? zScore : -99.0;
+        data.put(Cols.LANGUAGENESS, Double.toString(langness));
         TokenCounts tokenCounts = (TokenCounts) textStats.get(BasicTokenCountStatsCalculator.class);
         if (tokenCounts != null) {
 
@@ -518,6 +568,35 @@ public abstract class ProfilerBase {
         unicodeBlocks(textStats, data);
         try {
             writer.writeRow(contentsTable, data);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Per-file charset-detection record: the final detected encoding, the
+     * detector that won, and the declared charset from metadata
+     * (tk:content-type-hint).  Writes a row only when a detected encoding is
+     * present, so the table holds only files that ran charset detection.
+     */
+    protected void writeEncodingData(String fileId, Metadata m, TableInfo encodingsTable) {
+        String detected = m.get(TikaCoreProperties.DETECTED_ENCODING);
+        if (detected == null) {
+            return;
+        }
+        Map<Cols, String> data = new HashMap<>();
+        data.put(Cols.ID, fileId);
+        data.put(Cols.DETECTED_ENCODING, detected);
+        String detector = m.get(TikaCoreProperties.ENCODING_DETECTOR);
+        if (detector != null) {
+            data.put(Cols.ENCODING_DETECTOR, detector);
+        }
+        String declared = m.get(TikaCoreProperties.CONTENT_TYPE_HINT);
+        if (declared != null) {
+            data.put(Cols.DECLARED_METADATA, declared);
+        }
+        try {
+            writer.writeRow(encodingsTable, data);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -668,7 +747,7 @@ public abstract class ProfilerBase {
         if (metadata == null) {
             return;
         }
-        String type = metadata.get(Metadata.CONTENT_TYPE);
+        String type = metadata.get(HttpHeaders.CONTENT_TYPE);
         if (type == null) {
             return;
         }
@@ -773,7 +852,7 @@ public abstract class ProfilerBase {
     }
 
     long getSourceFileLength(Metadata m) {
-        String lenString = m.get(Metadata.CONTENT_LENGTH);
+        String lenString = m.get(HttpHeaders.CONTENT_LENGTH);
         if (lenString == null) {
             return NON_EXISTENT_FILE_LENGTH;
         }
@@ -812,4 +891,3 @@ public abstract class ProfilerBase {
 
 
 }
-

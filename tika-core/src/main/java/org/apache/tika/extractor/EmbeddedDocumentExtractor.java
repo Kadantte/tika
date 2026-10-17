@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.extractor;
 
 import java.io.IOException;
@@ -24,21 +23,38 @@ import org.xml.sax.SAXException;
 
 import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
 
+/**
+ * Implementations are typically bound as a single shared instance reused across concurrent
+ * parses (see {@link ParsingEmbeddedDocumentExtractor#INSTANCE}) -- do not cache per-parse
+ * state on {@code this}; read it from the {@link ParseContext} parameter on each call instead.
+ */
 public interface EmbeddedDocumentExtractor {
-    boolean shouldParseEmbedded(Metadata metadata);
+    /**
+     * Determines whether the given embedded document should be parsed.
+     * <p>
+     * Note: Implementations may throw {@link org.apache.tika.exception.EmbeddedLimitReachedException}
+     * (a RuntimeException) if a limit is exceeded and throwing is configured.
+     *
+     * @param metadata     the metadata for the embedded document
+     * @param parseContext the parse context of the enclosing parse
+     * @return true if the embedded document should be parsed
+     */
+    boolean shouldParseEmbedded(Metadata metadata, ParseContext parseContext);
 
     /**
      * Processes the supplied embedded resource, calling the delegating
-     *  parser with the appropriate details.
-     * @param stream The embedded resource
-     * @param handler The handler to use
-     * @param metadata The metadata for the embedded resource
-     * @param outputHtml Should we output HTML for this resource, or has the parser already done so?
+     * parser with the appropriate details.
+     *
+     * @param stream       The embedded resource
+     * @param handler      The handler to use
+     * @param metadata     The metadata for the embedded resource
+     * @param parseContext The parse context
+     * @param outputHtml   Should we output HTML for this resource, or has the parser already done so?
      * @throws org.xml.sax.SAXException
      * @throws java.io.IOException
      */
-    void parseEmbedded(
-            TikaInputStream stream, ContentHandler handler, Metadata metadata, boolean outputHtml)
-            throws SAXException, IOException;
+    void parseEmbedded(TikaInputStream stream, ContentHandler handler, Metadata metadata, ParseContext parseContext,
+                       boolean outputHtml) throws SAXException, IOException;
 }

@@ -1,0 +1,678 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.core;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.util.StdConverter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.tika.config.ExceptionReporting;
+import org.apache.tika.config.TimeoutLimits;
+import org.apache.tika.config.loader.TikaJsonConfig;
+import org.apache.tika.config.loader.TikaObjectMapperFactory;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.pipes.api.FetchEmitTuple;
+import org.apache.tika.pipes.api.ParseMode;
+import org.apache.tika.pipes.core.protocol.PipesMessage;
+import org.apache.tika.pipes.core.server.ServerProtocolIO;
+import org.apache.tika.utils.StringUtils;
+
+// Cross-field limits are checked after binding, so JSON key order cannot change the outcome.
+@JsonDeserialize(converter = PipesConfig.PostDeserializationCheck.class)
+public class PipesConfig {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PipesConfig.class);
+
+    /** Runs {@link #checkPayloadLimits()} on every Jackson deserialization path. */
+    public static class PostDeserializationCheck extends StdConverter<PipesConfig, PipesConfig> {
+        @Override
+        public PipesConfig convert(PipesConfig config) {
+            config.checkPayloadLimits();
+            return config;
+        }
+    }
+
+
+    public static final int DEFAULT_MAX_IPC_PAYLOAD_BYTES = PipesMessage.MAX_PAYLOAD_BYTES;
+
+    /**
+     * Largest request body carried inline to the forked worker rather than spooled to disk.
+     * <p>
+     * Sized for the common case -- most documents are far smaller -- because the cost is heap,
+     * not disk: the parent holds the payload and the Smile frame containing a copy of it, and the
+     * child holds it again. Budget roughly {@code 2 * maxInlineBytes * concurrent-requests} in the
+     * parent before raising this.
+     */
+    public static final int DEFAULT_MAX_INLINE_BYTES = 10 * 1024 * 1024;
+
+    /** Past this, worker count becomes a memory decision, and memory is not visible here. */
+    public static final int MAX_AUTO_NUM_CLIENTS = 4;
+
+    private static final int PARENT_RESERVED_CORES = 2;
+    private static final int MIN_CORES_PER_CLIENT = 2;
+
+    /**
+     * Worker count when the operator has not chosen one. CPU-derived, so the default
+     * satisfies Tika's own sizing rule on any host; a fixed 4 needs 10 cores and would
+     * warn about itself on smaller ones. Memory cannot participate -- no Java SE API
+     * exposes container memory -- so each fork checks its own heap at startup instead.
+     */
+    public static int defaultNumClients() {
+        int hostCores = Runtime.getRuntime().availableProcessors();
+        int byCores = (hostCores - PARENT_RESERVED_CORES) / MIN_CORES_PER_CLIENT;
+        return Math.max(1, Math.min(byCores, MAX_AUTO_NUM_CLIENTS));
+    }
+
+    public static final int DEFAULT_MAX_FILES_PROCESSED_PER_PROCESS = 100000;
+
+    public static final long DEFAULT_MAX_WAIT_FOR_CLIENT_MILLIS = 60000;
+
+    public static final long DEFAULT_SOCKET_TIMEOUT_MILLIS = 60000;
+
+    public static final long DEFAULT_STARTUP_TIMEOUT_MILLIS = 60000;
+
+    public static final long DEFAULT_HEARTBEAT_INTERVAL_MILLIS = 1000;
+
+    public static final boolean DEFAULT_USE_SHARED_SERVER = false;
+
+    /**
+     * The emit strategy configuration determines how the forked PipesServer handles emitting data.
+     * See {@link EmitStrategyConfig} for details.
+     */
+    private EmitStrategyConfig emitStrategy = new EmitStrategyConfig(EmitStrategyConfig.DEFAULT_EMIT_STRATEGY);
+
+    /**
+     * When true, multiple PipesClients connect to a single shared PipesServer process
+     * instead of each client spawning its own server. This reduces memory overhead
+     * and startup time at the cost of reduced isolation - one crash affects all in-flight requests.
+     */
+    private boolean useSharedServer = DEFAULT_USE_SHARED_SERVER;
+
+    private int maxIpcPayloadBytes = DEFAULT_MAX_IPC_PAYLOAD_BYTES;
+    private int maxInlineBytes = DEFAULT_MAX_INLINE_BYTES;
+
+    private long socketTimeoutMillis = DEFAULT_SOCKET_TIMEOUT_MILLIS;
+    private long startupTimeoutMillis = DEFAULT_STARTUP_TIMEOUT_MILLIS;
+    private long heartbeatIntervalMillis = DEFAULT_HEARTBEAT_INTERVAL_MILLIS;
+
+    public static final long DEFAULT_MAX_TOTAL_TASK_TIMEOUT_MILLIS = 3_600_000L;
+
+    /**
+     * Ceiling for request-supplied {@code TimeoutLimits}, so a client cannot disable the
+     * forked server's self-termination. Limits in the server's own tika-config
+     * {@code parse-context} are trusted and not capped.
+     */
+    private long maxTotalTaskTimeoutMillis = DEFAULT_MAX_TOTAL_TASK_TIMEOUT_MILLIS;
+
+    private int numClients = defaultNumClients();
+
+    private long maxWaitForClientMillis = DEFAULT_MAX_WAIT_FOR_CLIENT_MILLIS;
+    private int maxFilesProcessedPerProcess = DEFAULT_MAX_FILES_PROCESSED_PER_PROCESS;
+
+    // Async-specific fields (used by AsyncProcessor, ignored by PipesServer)
+    public static final long DEFAULT_EMIT_WITHIN_MILLIS = 10000;
+    public static final long DEFAULT_EMIT_MAX_ESTIMATED_BYTES = 100000;
+    public static final int DEFAULT_QUEUE_SIZE = 10000;
+    public static final int DEFAULT_NUM_EMITTERS = 1;
+
+    private long emitWithinMillis = DEFAULT_EMIT_WITHIN_MILLIS;
+    private long emitMaxEstimatedBytes = DEFAULT_EMIT_MAX_ESTIMATED_BYTES;
+    private int queueSize = DEFAULT_QUEUE_SIZE;
+    private int numEmitters = DEFAULT_NUM_EMITTERS;
+    private boolean emitIntermediateResults = false;
+    /**
+     * When true, only stop processing on fatal errors (FAILED_TO_INITIALIZE).
+     * When false (default), also stop on initialization failures and not-found errors.
+     * <p>
+     * Use true for server mode (tika-server /pipes, /async) where different requests
+     * may use different fetchers/emitters.
+     * Use false (default) for CLI batch mode where all tasks typically use the same
+     * fetcher/emitter configuration.
+     */
+    private boolean stopOnlyOnFatal = false;
+
+    /**
+     * Default parse mode for how embedded documents are handled.
+     * Can be overridden per-file via ParseContext.
+     */
+    private ParseMode parseMode = ParseMode.RMETA;
+
+    /**
+     * Default behavior when a parse exception occurs.
+     */
+    private FetchEmitTuple.ON_PARSE_EXCEPTION onParseException = FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT;
+
+    private ArrayList<String> forkedJvmArgs = new ArrayList<>();
+    private String javaPath = "java";
+
+    /** @deprecated since 4.1, removal planned for 5.0; see {@link #setTempDirectory(String)} */
+    @Deprecated
+    private String tempDirectory = null;
+
+    /**
+     * Type of ConfigStore to use for distributed state management.
+     * Options: "memory" (default), "ignite"
+     */
+    private String configStoreType = "memory";
+    
+    /**
+     * JSON configuration parameters for the ConfigStore.
+     * The structure depends on the configStoreType selected.
+     */
+    private String configStoreParams = "{}";
+
+    /**
+     * Loads PipesConfig from the "pipes" section of the JSON configuration.
+     * <p>
+     * This configuration is used by both PipesServer (forking process) and
+     * AsyncProcessor (async processing). Some fields are specific to each:
+     * <ul>
+     *   <li>PipesServer uses: numClients, socketTimeoutMillis, directEmitThresholdBytes, etc.</li>
+     *   <li>AsyncProcessor uses: emitWithinMillis, queueSize, numEmitters, etc.</li>
+     * </ul>
+     * Unused fields in each context are simply ignored.
+     *
+     * @param tikaJsonConfig the JSON configuration to load from
+     * @return the loaded PipesConfig, or a new default instance if not found in config
+     * @throws IOException if deserialization fails
+     * @throws TikaConfigException if configuration is invalid
+     */
+    public static PipesConfig load(TikaJsonConfig tikaJsonConfig) throws IOException, TikaConfigException {
+        PipesConfig config = tikaJsonConfig.deserialize("pipes", PipesConfig.class);
+        if (config == null) {
+            config = new PipesConfig();
+        }
+        // Carry the config-default limits and reporting policy to the client (for its backstop
+        // and for the results it fabricates itself) without full parse-context resolution --
+        // the client JVM may lack the plugin classes it needs. Bind with Tika's own mapper so
+        // the parent reads these two exactly as the fork does.
+        ObjectMapper mapper = TikaObjectMapperFactory.getMapper();
+        JsonNode parseContextNode = tikaJsonConfig.getRootNode().path("parse-context");
+        JsonNode limitsNode = parseContextNode.path("timeout-limits");
+        //isNull: an explicit JSON null keeps the default rather than binding a null field
+        if (!limitsNode.isMissingNode() && !limitsNode.isNull()) {
+            try {
+                config.defaultTimeoutLimits = mapper.treeToValue(limitsNode, TimeoutLimits.class);
+            } catch (JsonProcessingException e) {
+                throw new TikaConfigException("problem parsing parse-context.timeout-limits", e);
+            }
+        }
+        JsonNode reportingNode = parseContextNode.path("exception-reporting");
+        if (!reportingNode.isMissingNode() && !reportingNode.isNull()) {
+            try {
+                config.defaultExceptionReporting =
+                        mapper.treeToValue(reportingNode, ExceptionReporting.class);
+            } catch (JsonProcessingException e) {
+                throw new TikaConfigException("problem parsing parse-context.exception-reporting", e);
+            }
+        }
+        return config;
+    }
+
+    private TimeoutLimits defaultTimeoutLimits = new TimeoutLimits();
+
+    private ExceptionReporting defaultExceptionReporting = new ExceptionReporting();
+
+    /**
+     * The config-level {@code parse-context.timeout-limits} defaults -- what the forked
+     * server enforces when a request carries no {@link TimeoutLimits} of its own.
+     */
+    @JsonIgnore
+    public TimeoutLimits getDefaultTimeoutLimits() {
+        return defaultTimeoutLimits;
+    }
+
+    /**
+     * The config-level {@code parse-context.exception-reporting} policy. The parent JVM needs
+     * it for the results it fabricates itself (crash, timeout, failed-to-initialize): the
+     * request's own ParseContext can never carry the policy -- it is wire-blocked.
+     */
+    @JsonIgnore
+    public ExceptionReporting getDefaultExceptionReporting() {
+        return defaultExceptionReporting;
+    }
+
+    public long getSocketTimeoutMillis() {
+        return socketTimeoutMillis;
+    }
+
+    /**
+     * Socket timeout in milliseconds for reading from the forked process.
+     * If no data is received within this time, the connection is considered timed out.
+     * This is distinct from the parse/processing timeout, which lives on
+     * {@link org.apache.tika.config.TimeoutLimits} under {@code parse-context.timeout-limits}.
+     * @param socketTimeoutMillis
+     */
+    public void setSocketTimeoutMillis(long socketTimeoutMillis) {
+        this.socketTimeoutMillis = socketTimeoutMillis;
+    }
+
+    public long getMaxTotalTaskTimeoutMillis() {
+        return maxTotalTaskTimeoutMillis;
+    }
+
+    public void setMaxTotalTaskTimeoutMillis(long maxTotalTaskTimeoutMillis) {
+        if (maxTotalTaskTimeoutMillis <= 0) {
+            throw new IllegalArgumentException("maxTotalTaskTimeoutMillis must be > 0, was " +
+                    maxTotalTaskTimeoutMillis + "; use Long.MAX_VALUE for no cap");
+        }
+        this.maxTotalTaskTimeoutMillis = maxTotalTaskTimeoutMillis;
+    }
+
+    public long getStartupTimeoutMillis() {
+        return startupTimeoutMillis;
+    }
+
+    /**
+     * Timeout in milliseconds for the forked server to start up and send its READY handshake.
+     * Distinct from {@link #getSocketTimeoutMillis()}: cold-starting the forked JVM (loading config,
+     * parsers and plugins) can take far longer than a normal per-read timeout, so the handshake
+     * gets its own generous budget. Once the server is ready, reads switch to {@code socketTimeoutMillis}.
+     * @param startupTimeoutMillis
+     */
+    public void setStartupTimeoutMillis(long startupTimeoutMillis) {
+        this.startupTimeoutMillis = startupTimeoutMillis;
+    }
+
+    public long getHeartbeatIntervalMillis() {
+        return heartbeatIntervalMillis;
+    }
+
+    /**
+     * Interval in milliseconds between heartbeat messages sent from server to client.
+     * Should be significantly less than socketTimeoutMillis to ensure the client doesn't timeout.
+     * WARNING: Setting this >= socketTimeoutMillis will cause socket timeouts during normal processing.
+     * This only exists for testing. We encourage you never to use it.
+     * @param heartbeatIntervalMillis
+     */
+    public void setHeartbeatIntervalMillis(long heartbeatIntervalMillis) {
+        this.heartbeatIntervalMillis = heartbeatIntervalMillis;
+    }
+
+    public int getNumClients() {
+        return numClients;
+    }
+
+    public void setNumClients(int numClients) {
+        // Without this, 0 surfaces at startup as the client queue's message-less IAE.
+        if (numClients <= 0) {
+            throw new IllegalArgumentException("numClients must be > 0, was " + numClients);
+        }
+        this.numClients = numClients;
+    }
+
+    public void setForkedJvmArgs(ArrayList<String> jvmArgs) {
+        this.forkedJvmArgs = jvmArgs;
+    }
+    //ArrayList to make jackson happy
+    public ArrayList<String> getForkedJvmArgs() {
+        return forkedJvmArgs;
+    }
+
+    /**
+     * Restart the forked PipesServer after it has processed this many files to avoid
+     * slow-building memory leaks.
+     * @return
+     */
+    public int getMaxFilesProcessedPerProcess() {
+        return maxFilesProcessedPerProcess;
+    }
+
+    public void setMaxFilesProcessedPerProcess(int maxFilesProcessedPerProcess) {
+        this.maxFilesProcessedPerProcess = maxFilesProcessedPerProcess;
+    }
+
+    public String getJavaPath() {
+        return javaPath;
+    }
+
+    public void setJavaPath(String javaPath) {
+        this.javaPath = javaPath;
+    }
+
+    /**
+     * Get the emit strategy configuration.
+     *
+     * @return the emit strategy configuration
+     */
+    public EmitStrategyConfig getEmitStrategy() {
+        return emitStrategy;
+    }
+
+    /**
+     * Set the emit strategy configuration.
+     *
+     * @param emitStrategy the emit strategy configuration
+     */
+    public void setEmitStrategy(EmitStrategyConfig emitStrategy) {
+        this.emitStrategy = emitStrategy;
+    }
+
+    public long getMaxWaitForClientMillis() {
+        return maxWaitForClientMillis;
+    }
+
+    public void setMaxWaitForClientMillis(long maxWaitForClientMillis) {
+        this.maxWaitForClientMillis = maxWaitForClientMillis;
+    }
+
+    // Async-specific getters/setters (used by AsyncProcessor, ignored by PipesServer)
+
+    public long getEmitWithinMillis() {
+        return emitWithinMillis;
+    }
+
+    /**
+     * If nothing has been emitted in this amount of time
+     * and the {@link #getEmitMaxEstimatedBytes()} has not been reached yet,
+     * emit what's in the emit queue.
+     *
+     * @param emitWithinMillis time in milliseconds
+     */
+    public void setEmitWithinMillis(long emitWithinMillis) {
+        this.emitWithinMillis = emitWithinMillis;
+    }
+
+    /**
+     * When the emit queue hits this estimated size (sum of
+     * estimated extract sizes), emit the batch.
+     *
+     * @return the maximum estimated bytes before emitting
+     */
+    public long getEmitMaxEstimatedBytes() {
+        return emitMaxEstimatedBytes;
+    }
+
+    public void setEmitMaxEstimatedBytes(long emitMaxEstimatedBytes) {
+        this.emitMaxEstimatedBytes = emitMaxEstimatedBytes;
+    }
+
+    /**
+     * FetchEmitTuple queue size
+     *
+     * @return the queue size
+     */
+    public int getQueueSize() {
+        return queueSize;
+    }
+
+    public void setQueueSize(int queueSize) {
+        this.queueSize = queueSize;
+    }
+
+    /**
+     * Number of emitters
+     *
+     * @return the number of emitters
+     */
+    public int getNumEmitters() {
+        return numEmitters;
+    }
+
+    public void setNumEmitters(int numEmitters) {
+        this.numEmitters = numEmitters;
+    }
+
+    public boolean isEmitIntermediateResults() {
+        return emitIntermediateResults;
+    }
+
+    public void setEmitIntermediateResults(boolean emitIntermediateResults) {
+        this.emitIntermediateResults = emitIntermediateResults;
+    }
+
+    /**
+     * When true, only stop processing on fatal errors (FAILED_TO_INITIALIZE).
+     * When false (default), also stop on initialization failures (FETCHER_INITIALIZATION_EXCEPTION,
+     * EMITTER_INITIALIZATION_EXCEPTION, CLIENT_UNAVAILABLE_WITHIN_MS) and not-found errors
+     * (FETCHER_NOT_FOUND, EMITTER_NOT_FOUND).
+     * <p>
+     * Use true for server mode (tika-server /pipes, /async) where different requests
+     * may use different fetchers/emitters - a bad request shouldn't kill the server.
+     * Use false (default) for CLI batch mode where all tasks typically use the same
+     * fetcher/emitter configuration - no point continuing if configuration is wrong.
+     *
+     * @return true if only fatal errors should stop processing
+     */
+    public boolean isStopOnlyOnFatal() {
+        return stopOnlyOnFatal;
+    }
+
+    public void setStopOnlyOnFatal(boolean stopOnlyOnFatal) {
+        this.stopOnlyOnFatal = stopOnlyOnFatal;
+    }
+
+    /**
+     * Gets the default parse mode for how embedded documents are handled.
+     *
+     * @return the default parse mode
+     */
+    public ParseMode getParseMode() {
+        return parseMode;
+    }
+
+    /**
+     * Sets the default parse mode for how embedded documents are handled.
+     * This can be overridden per-file via ParseContext.
+     *
+     * @param parseMode the parse mode (RMETA or CONCATENATE)
+     */
+    public void setParseMode(ParseMode parseMode) {
+        this.parseMode = parseMode;
+    }
+
+    /**
+     * Sets the default parse mode from a string.
+     *
+     * @param parseMode the parse mode name (rmeta or concatenate)
+     */
+    public void setParseMode(String parseMode) {
+        this.parseMode = ParseMode.parse(parseMode);
+    }
+
+    /**
+     * Gets the default behavior when a parse exception occurs.
+     *
+     * @return the parse exception behavior
+     */
+    public FetchEmitTuple.ON_PARSE_EXCEPTION getOnParseException() {
+        return onParseException;
+    }
+
+    /**
+     * Sets the default behavior when a parse exception occurs.
+     *
+     * @param onParseException the parse exception behavior
+     */
+    public void setOnParseException(FetchEmitTuple.ON_PARSE_EXCEPTION onParseException) {
+        this.onParseException = onParseException;
+    }
+
+    public String getConfigStoreType() {
+        return configStoreType;
+    }
+
+    public void setConfigStoreType(String configStoreType) {
+        this.configStoreType = configStoreType;
+    }
+
+    public String getConfigStoreParams() {
+        return configStoreParams;
+    }
+
+    public void setConfigStoreParams(String configStoreParams) {
+        this.configStoreParams = configStoreParams;
+    }
+
+    /** @deprecated since 4.1, removal planned for 5.0; see {@link #setTempDirectory(String)} */
+    @Deprecated
+    public String getTempDirectory() {
+        return tempDirectory;
+    }
+
+    /**
+     * Creates a temp directory under {@link #getTempDirectory()}, or under the system default
+     * when unset. Callers must not use {@code Files.createTempDirectory} directly or the
+     * configured directory is silently ignored.
+     *
+     * @deprecated since 4.1, removal planned for 5.0; use {@code Files.createTempDirectory(prefix)}
+     */
+    @Deprecated
+    public Path createTempDirectory(String prefix) throws IOException {
+        if (StringUtils.isBlank(tempDirectory)) {
+            return Files.createTempDirectory(prefix);
+        }
+        Path base = Paths.get(tempDirectory);
+        Files.createDirectories(base);
+        return Files.createTempDirectory(base, prefix);
+    }
+
+    /**
+     * Directory the forks create their private temp dirs under. It only ever covered the
+     * forks: this JVM's own spooling and every library calling {@code File.createTempFile}
+     * use {@code java.io.tmpdir}, fixed at JVM start. Set {@code -Djava.io.tmpdir} on the
+     * parent JVM instead; forks inherit subdirectories under it.
+     * <p>
+     * <b>DO NOT USE tmpfs</b> ({@code /dev/shm}) here or for {@code java.io.tmpdir}: spool
+     * size is bounded by input, not config, and a fork dir orphaned by a killed parent pins
+     * RAM until deleted.
+     *
+     * @deprecated since 4.1, removal planned for 5.0; set {@code -Djava.io.tmpdir} instead
+     */
+    @Deprecated
+    public void setTempDirectory(String tempDirectory) {
+        if (!StringUtils.isBlank(tempDirectory)) {
+            LOG.warn("pipes.tempDirectory={} is deprecated (removal in 5.0) and only redirects " +
+                    "the forks; this JVM's dependencies (POI, PDFBox, ...) write to " +
+                    "java.io.tmpdir={}, fixed at JVM start. Set -Djava.io.tmpdir on the parent JVM.",
+                    tempDirectory, System.getProperty("java.io.tmpdir"));
+        }
+        this.tempDirectory = tempDirectory;
+    }
+
+    /**
+     * Returns whether shared server mode is enabled.
+     *
+     * @return true if shared server mode is enabled
+     * @see #setUseSharedServer(boolean)
+     */
+    public boolean isUseSharedServer() {
+        return useSharedServer;
+    }
+
+    /**
+     * Sets whether to use shared server mode.
+     * <p>
+     * When {@code true}, multiple PipesClients connect to a single shared PipesServer
+     * process instead of each client having its own dedicated server. This reduces
+     * memory overhead but sacrifices isolation: one crash affects all in-flight requests.
+     * <p>
+     * <b>Not recommended for production.</b> See the Tika Pipes documentation for
+     * limitations and guidance.
+     *
+     * @param useSharedServer true to enable shared server mode, false for per-client mode (default)
+     */
+    public void setUseSharedServer(boolean useSharedServer) {
+        this.useSharedServer = useSharedServer;
+    }
+
+    /**
+     * Returns the maximum IPC payload size in bytes.
+     * Configurable via {@code maxIpcPayloadBytes} in the {@code pipes} section of tika-config.json.
+     *
+     * @return the maximum IPC payload size in bytes (default 100 MB)
+     */
+    public int getMaxIpcPayloadBytes() {
+        return maxIpcPayloadBytes;
+    }
+
+    /**
+     * @return largest request body sent inline instead of spooled; see
+     *         {@link #DEFAULT_MAX_INLINE_BYTES}
+     */
+    public int getMaxInlineBytes() {
+        return maxInlineBytes;
+    }
+
+    /**
+     * Sets the inline-payload threshold. Must stay under {@code maxIpcPayloadBytes}: the payload
+     * travels inside the NEW_REQUEST frame, so a threshold above that limit would let the parent
+     * build requests the child refuses, surfacing as an undiagnosable crash rather than a clean
+     * fallback to spooling. The pair is checked in {@link #checkPayloadLimits()}, not here, so
+     * the two fields may be set in either order.
+     *
+     * @throws IllegalArgumentException if negative
+     */
+    public void setMaxInlineBytes(int maxInlineBytes) {
+        if (maxInlineBytes < 0) {
+            throw new IllegalArgumentException("maxInlineBytes must be >= 0, got: " + maxInlineBytes);
+        }
+        this.maxInlineBytes = maxInlineBytes;
+    }
+
+    /**
+     * Sets the maximum IPC payload size in bytes. This limit is <em>bidirectional</em>:
+     * it controls both the largest result the client will accept back from the forked server
+     * (the FINISHED payload) and the largest request the server will accept from the client
+     * (the NEW_REQUEST payload). Lowering this value below the size of a typical
+     * {@link org.apache.tika.pipes.api.FetchEmitTuple} will cause requests to be rejected
+     * client-side before sending, reported as {@code PAYLOAD_LIMIT_EXCEEDED}.
+     * <p>
+     * The value must be at least {@link org.apache.tika.pipes.core.server.ServerProtocolIO#MIN_FALLBACK_PAYLOAD_BYTES}
+     * so that the server can always write a {@code PAYLOAD_LIMIT_EXCEEDED} response
+     * that the client will accept.
+     *
+     * @param maxIpcPayloadBytes payload limit in bytes (must be &ge; {@code ServerProtocolIO.MIN_FALLBACK_PAYLOAD_BYTES})
+     * @throws IllegalArgumentException if the value is below the minimum
+     */
+    public void setMaxIpcPayloadBytes(int maxIpcPayloadBytes) {
+        if (maxIpcPayloadBytes < ServerProtocolIO.MIN_FALLBACK_PAYLOAD_BYTES) {
+            throw new IllegalArgumentException(
+                    "maxIpcPayloadBytes must be at least " +
+                    ServerProtocolIO.MIN_FALLBACK_PAYLOAD_BYTES +
+                    " (minimum to carry a PAYLOAD_LIMIT_EXCEEDED response), got: " + maxIpcPayloadBytes);
+        }
+        this.maxIpcPayloadBytes = maxIpcPayloadBytes;
+    }
+
+    /**
+     * Checks that {@code maxInlineBytes} leaves headroom for the rest of the tuple (metadata,
+     * parseContext) inside {@code maxIpcPayloadBytes}. Runs automatically after Jackson
+     * deserialization; call it directly after configuring an instance through setters.
+     *
+     * @throws IllegalArgumentException if the pair is inconsistent
+     */
+    public void checkPayloadLimits() {
+        long ceiling = maxIpcPayloadBytes - (maxIpcPayloadBytes / 10);
+        if (maxInlineBytes > ceiling) {
+            throw new IllegalArgumentException("maxInlineBytes (" + maxInlineBytes +
+                    ") must leave room for the rest of the request inside maxIpcPayloadBytes (" +
+                    maxIpcPayloadBytes + "); keep it at or below " + ceiling);
+        }
+    }
+}

@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.microsoft.ooxml;
 
 import org.apache.poi.xwpf.usermodel.UnderlinePatterns;
@@ -31,12 +30,25 @@ public class RunProperties {
 
     UnderlinePatterns underline = UnderlinePatterns.NONE;
 
+    // PPTX hlinkClick hyperlink URL — set from <a:hlinkClick> inside <a:rPr>
+    String hlinkClickUrl = null;
+
+    // docx character style (w:rStyle); direct b/i, once set, override it
+    String styleID = null;
+    boolean boldSet = false;
+    boolean italicsSet = false;
+
     public boolean isItalics() {
         return italics;
     }
 
     public void setItalics(boolean italics) {
         this.italics = italics;
+        this.italicsSet = true;
+    }
+
+    public boolean isItalicsSet() {
+        return italicsSet;
     }
 
     public boolean isBold() {
@@ -45,6 +57,19 @@ public class RunProperties {
 
     public void setBold(boolean bold) {
         this.bold = bold;
+        this.boldSet = true;
+    }
+
+    public boolean isBoldSet() {
+        return boldSet;
+    }
+
+    public String getStyleID() {
+        return styleID;
+    }
+
+    public void setStyleID(String styleID) {
+        this.styleID = styleID;
     }
 
     public boolean isStrikeThrough() {
@@ -68,5 +93,35 @@ public class RunProperties {
             //TODO -- fill out rest
             underline = UnderlinePatterns.SINGLE;
         }
+    }
+
+    public String getHlinkClickUrl() {
+        return hlinkClickUrl;
+    }
+
+    public void setHlinkClickUrl(String url) {
+        this.hlinkClickUrl = url;
+    }
+
+    void copyFrom(RunProperties other) {
+        italics = other.italics;
+        bold = other.bold;
+        strikeThrough = other.strikeThrough;
+        underline = other.underline;
+        hlinkClickUrl = other.hlinkClickUrl;
+        styleID = other.styleID;
+        boldSet = other.boldSet;
+        italicsSet = other.italicsSet;
+    }
+
+    public void reset() {
+        italics = false;
+        bold = false;
+        strikeThrough = false;
+        underline = UnderlinePatterns.NONE;
+        hlinkClickUrl = null;
+        styleID = null;
+        boldSet = false;
+        italicsSet = false;
     }
 }

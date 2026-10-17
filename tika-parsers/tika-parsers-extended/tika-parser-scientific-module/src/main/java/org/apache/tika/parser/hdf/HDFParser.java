@@ -14,13 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.parser.hdf;
 
 //JDK imports
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Collections;
 import java.util.Set;
 
@@ -32,8 +30,12 @@ import ucar.nc2.Attribute;
 import ucar.nc2.Group;
 import ucar.nc2.NetcdfFile;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.KeyPrefix;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
@@ -48,6 +50,7 @@ import org.apache.tika.sax.XHTMLContentHandler;
  * "http://www.unidata.ucar.edu/software/netcdf-java/formats/FileTypes.html"
  * >this link</a> for more information.
  */
+@TikaComponent
 public class HDFParser implements Parser {
 
     /**
@@ -57,6 +60,11 @@ public class HDFParser implements Parser {
 
     private static final Set<MediaType> SUPPORTED_TYPES =
             Collections.singleton(MediaType.application("x-hdf"));
+
+    private static final KeyPrefix HDF = KeyPrefix.file("hdf:", "HDF/NetCDF group attribute names");
+
+    private static final Property FILE_TYPE_DESCRIPTION =
+            Property.externalText("hdf:file-type-description");
 
     /*
      * (non-Javadoc)
@@ -77,10 +85,10 @@ public class HDFParser implements Parser {
      * org.xml.sax.ContentHandler, org.apache.tika.metadata.Metadata,
      * org.apache.tika.parser.ParseContext)
      */
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
         UnsynchronizedByteArrayOutputStream os = UnsynchronizedByteArrayOutputStream.builder().get();
-        IOUtils.copy(stream, os);
+        IOUtils.copy(tis, os);
 
         String name = metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY);
         if (name == null) {
@@ -93,7 +101,7 @@ public class HDFParser implements Parser {
             throw new TikaException("HDF parse error", e);
         }
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         xhtml.endDocument();
     }
@@ -104,14 +112,16 @@ public class HDFParser implements Parser {
         }
 
         // get file type
-        met.set("File-Type-Description", ncFile.getFileTypeDescription());
-        // unravel its string attrs
+        met.set(FILE_TYPE_DESCRIPTION, ncFile.getFileTypeDescription());
+        // the same attribute name can recur across sibling/nested groups (recursed via
+        // group.getGroups() below), so values accumulate
         for (Attribute attribute : group.getAttributes()) {
             if (attribute.isString()) {
-                met.add(attribute.getFullName(), attribute.getStringValue());
+                met.add(HDF, attribute.getFullName(), attribute.getStringValue());
             } else {
                 // try and cast its value to a string
-                met.add(attribute.getFullName(), String.valueOf(attribute.getNumericValue()));
+                met.add(HDF, attribute.getFullName(),
+                        String.valueOf(attribute.getNumericValue()));
             }
         }
 

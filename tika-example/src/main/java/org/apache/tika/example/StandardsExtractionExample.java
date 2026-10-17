@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import java.io.BufferedInputStream;
@@ -29,6 +28,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Collections;
 import java.util.HashSet;
 
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.AutoDetectParser;
 import org.apache.tika.parser.ParseContext;
@@ -101,8 +101,9 @@ public class StandardsExtractionExample {
         // to the underlying Handler.
         StandardsExtractingContentHandler handler = new StandardsExtractingContentHandler(new BodyContentHandler(-1), metadata);
         handler.setThreshold(0.75);
-        try (InputStream stream = new BufferedInputStream(Files.newInputStream(path))) {
-            parser.parse(stream, handler, metadata, new ParseContext());
+        try (InputStream stream = new BufferedInputStream(Files.newInputStream(path));
+             TikaInputStream tis = TikaInputStream.get(stream)) {
+            parser.parse(tis, handler, metadata, new ParseContext());
         }
         String[] references = metadata.getValues(StandardsExtractingContentHandler.STANDARD_REFERENCES);
         Collections.addAll(standardReferences, references);

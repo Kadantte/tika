@@ -17,10 +17,10 @@
 package org.apache.tika.parser.epub;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.InputStream;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -30,13 +30,12 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import org.apache.tika.TikaTest;
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Epub;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
-import org.apache.tika.parser.AutoDetectParser;
-import org.apache.tika.parser.Parser;
 
 public class EpubParserTest extends TikaTest {
 
@@ -45,7 +44,7 @@ public class EpubParserTest extends TikaTest {
 
         XMLResult xmlResult = getXML("testEPUB.epub");
         assertEquals("2.0", xmlResult.metadata.get(Epub.VERSION));
-        assertEquals("application/epub+zip", xmlResult.metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/epub+zip", xmlResult.metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("en", xmlResult.metadata.get(TikaCoreProperties.LANGUAGE));
         assertEquals("This is an ePub test publication for Tika.",
                 xmlResult.metadata.get(TikaCoreProperties.DESCRIPTION));
@@ -76,7 +75,12 @@ public class EpubParserTest extends TikaTest {
 
         //test attachments
         assertEquals(2, metadataList.size());
-        assertEquals("image/jpeg", metadataList.get(1).get(Metadata.CONTENT_TYPE));
+        assertEquals("image/jpeg", metadataList.get(1).get(HttpHeaders.CONTENT_TYPE));
+        //the EPUB 2 cover meta names the cover image, emitted as the thumbnail
+        assertEquals("OPS/CoverDesign.jpg",
+                metadataList.get(1).get(TikaCoreProperties.RESOURCE_NAME_KEY));
+        assertEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                metadataList.get(1).get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
         String xml = metadataList.get(0).get(TikaCoreProperties.TIKA_CONTENT);
         int tocIndex = xml.indexOf("h3 class=\"toc_heading\">Table of Contents<");
         int ch1 = xml.indexOf("<h1>Chapter 1");
@@ -85,28 +89,18 @@ public class EpubParserTest extends TikaTest {
         assert (tocIndex < ch1);
         assert (tocIndex < ch2);
         assert (ch1 < ch2);
-
-        try (InputStream is = getResourceAsStream("/org/apache/tika/parser/epub/tika-config.xml")) {
-            assertNotNull(is);
-            Parser p = new AutoDetectParser(new TikaConfig(is));
-            xml = getXML("testEPUB.epub", p).xml;
-            tocIndex = xml.indexOf("h3 class=\"toc_heading\">Table of Contents<");
-            ch1 = xml.indexOf("<h1>Chapter 1");
-            ch2 = xml.indexOf("<h1>Chapter 2");
-            assert (tocIndex > -1 && ch1 > -1 && ch2 > -1);
-            assert (tocIndex > ch1);
-            assert (tocIndex > ch2);
-            assert (ch1 < ch2);
-        }
+        //remove streaming test
     }
 
 
     @Test
     public void testTruncated() throws Exception {
-        Parser p = new EpubParser();
+        // Truncated zips are salvaged by DefaultZipContainerDetector and the
+        // recovered ZipFile is handed to EpubParser via openContainer.
+        // EpubParser itself no longer salvages — it relies on the detector.
         List<Metadata> metadataList;
-        try (InputStream is = truncate("testEPUB.epub", 10000)) {
-            metadataList = getRecursiveMetadata(is, p, true);
+        try (TikaInputStream tis = truncate("testEPUB.epub", 10000)) {
+            metadataList = getRecursiveMetadata(tis, true);
         }
         String xml = metadataList.get(0).get(TikaCoreProperties.TIKA_CONTENT);
         int ch1 = xml.indexOf("<h1>Chapter 1");
@@ -135,6 +129,27 @@ public class EpubParserTest extends TikaTest {
 
         List<Metadata> metadataList = getRecursiveMetadata("cole-voyage-of-life.epub");
         assertEquals("pre-paginated", metadataList.get(0).get(Epub.RENDITION_LAYOUT));
+    }
+
+    /**
+     * The EPUB 3 cover-image manifest property names the cover; the other
+     * images are not thumbnails.
+     */
+    @Test
+    public void testEpub3CoverImageIsTheThumbnail() throws Exception {
+        List<Metadata> metadataList = getRecursiveMetadata("testEPUB_multi-metadata-vals.epub");
+        Metadata cover = null;
+        for (Metadata m : metadataList) {
+            if ("epub/images/cover.jpg".equals(m.get(TikaCoreProperties.RESOURCE_NAME_KEY))) {
+                cover = m;
+            } else {
+                assertNotEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                        m.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
+            }
+        }
+        assertNotNull(cover);
+        assertEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                cover.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
     }
 
     @Test

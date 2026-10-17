@@ -14,10 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.eval.app;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.commons.io.FileUtils;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,6 +42,7 @@ import org.junit.jupiter.api.Test;
 import org.apache.tika.eval.app.db.Cols;
 import org.apache.tika.eval.app.db.H2Util;
 import org.apache.tika.eval.app.db.TableInfo;
+import org.apache.tika.eval.app.reports.ResultsReporter;
 
 public class ProfilerBatchTest {
 
@@ -60,24 +62,28 @@ public class ProfilerBatchTest {
                 .toURI());
 
         DB = DB_DIR.resolve("mydb");
+        Path pipesReports = extractsRoot.resolveSibling("pipes-reports");
         String[] args = new String[]{
             "-i", inputRoot.toAbsolutePath().toString(),
             "-e", extractsRoot.toAbsolutePath().toString(),
-                "-d", "jdbc:h2:file:" + DB.toAbsolutePath().toString()
+                "-d", "jdbc:h2:file:" + DB.toAbsolutePath().toString(),
+                "-pr", pipesReports.resolve("crashes-run-a1.jsonl").toString(),
+                "-ri", pipesReports.resolve("run-info-run-a1.json").toString()
         };
 
         ExtractProfileRunner.main(args);
     }
 
-    @AfterEach
-    public void tearDown() throws IOException {
+    @AfterAll
+    public static void tearDown() throws IOException {
         try {
-            CONN.close();
+            if (CONN != null) {
+                CONN.close();
+            }
         } catch (SQLException e) {
-            throw new RuntimeException(e);
+            // ignore
         }
         FileUtils.deleteDirectory(DB_DIR.toFile());
-
     }
 
     @BeforeEach
@@ -121,6 +127,36 @@ public class ProfilerBatchTest {
         assertTrue(fNameList.contains("file4_emptyB.pdf"), "file4_emptyB.pdf");
         assertTrue(fNameList.contains("file7_badJson.pdf"), "file4_emptyB.pdf");
         assertTrue(fNameList.contains("file9_noextract.txt"), "file9_noextract.txt");
+    }
+
+    @Test
+    public void testPipesStatusJoin() throws Exception {
+        assertEquals("OOM", getSingleResult("select pipes_status from containers where file_path='file9_noextract.txt'"));
+        assertEquals("EMIT_SUCCESS", getSingleResult("select pipes_status from containers where file_path='file1.pdf'"));
+        assertEquals(null, getSingleResult("select pipes_status from containers where file_path='file2_attachANotB.doc'"));
+        assertEquals("CRASH", getSingleResult(
+                "select case when c.pipes_status in ('OOM','TIMEOUT') then 'CRASH' else 'OTHER' end from extract_exceptions e " +
+                "join containers c on c.container_id = e.container_id where c.file_path='file9_noextract.txt'"));
+    }
+
+    @Test
+    public void testRunInfo() throws Exception {
+        assertEquals("run-a1", getSingleResult("select run_value from run_info where run_key='batch.run.id'"));
+        assertEquals("16", getSingleResult("select run_value from run_info where run_key='extracts.count'"));
+        assertEquals("5", getSingleResult("select run_value from run_info where run_key='pipes_report.rows'"));
+        assertEquals("1", getSingleResult("select run_value from run_info where run_key='pipes_report.errors'"));
+        assertEquals("64", getSingleResult("select length(run_value) from run_info where run_key='extracts.fingerprint'"));
+        for (String k : new String[]{"eval.start", "eval.end", "eval.tika_version", "eval.args", "pipes_report.path"}) {
+            assertNotNull(getSingleResult("select run_value from run_info where run_key='" + k + "'"), k);
+        }
+    }
+
+    @Test
+    public void testReportsRun() throws Exception {
+        Path reportsDir = DB_DIR.resolve("reports");
+        ResultsReporter.main(new String[]{"-db", DB.toAbsolutePath().toString(), "-rd", reportsDir.toString()});
+        assertTrue(Files.isRegularFile(reportsDir.resolve("exceptions/extract_exceptions_by_pipes_status.xlsx")));
+        assertTrue(Files.isRegularFile(reportsDir.resolve("exceptions/crash_status_extract_present.xlsx")));
     }
 
     @Test

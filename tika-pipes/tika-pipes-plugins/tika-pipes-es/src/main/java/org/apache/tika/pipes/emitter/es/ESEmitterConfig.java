@@ -1,0 +1,97 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.tika.pipes.emitter.es;
+
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.plugins.PluginJson;
+
+/**
+ * Configuration for the ES emitter.
+ *
+ * @param esUrl              Full URL including index, e.g. {@code https://localhost:9200/my-index}
+ * @param idField            Metadata field to use as the document {@code _id}
+ * @param attachmentStrategy How to handle embedded documents
+ * @param updateStrategy     Whether to overwrite or upsert
+ * @param commitWithin       Not used by ES, kept for API parity with OpenSearch emitter
+ * @param embeddedFileFieldName Field name for embedded-file relation
+ * @param apiKey             API key for authentication (Base64-encoded {@code id:api_key}).
+ *                           Sent as {@code Authorization: ApiKey <value>}.
+ *                           If null/empty, falls back to httpClientConfig's userName/password
+ *                           for basic auth.
+ * @param httpClientConfig   HTTP connection settings (basic auth, timeouts, proxy)
+ * @param chunkStrategy      Where {@code tk:chunks} goes; null means {@link ChunkStrategy#INLINE}
+ */
+public record ESEmitterConfig(String esUrl, String idField,
+                              AttachmentStrategy attachmentStrategy,
+                              UpdateStrategy updateStrategy, int commitWithin,
+                              String embeddedFileFieldName, String apiKey,
+                              HttpClientConfig httpClientConfig,
+                              ChunkStrategy chunkStrategy) {
+    /** Where {@code tk:chunks} goes: inside its document, or one document per chunk. */
+    public enum ChunkStrategy {
+        INLINE, DOCUMENTS
+    }
+
+    public ESEmitterConfig {
+        chunkStrategy = chunkStrategy == null ? ChunkStrategy.INLINE : chunkStrategy;
+    }
+
+    /** The 4.0.0 shape: chunks stay inline. */
+    public ESEmitterConfig(String esUrl, String idField, AttachmentStrategy attachmentStrategy,
+                           UpdateStrategy updateStrategy, int commitWithin,
+                           String embeddedFileFieldName, String apiKey,
+                           HttpClientConfig httpClientConfig) {
+        this(esUrl, idField, attachmentStrategy, updateStrategy, commitWithin,
+                embeddedFileFieldName, apiKey, httpClientConfig, ChunkStrategy.INLINE);
+    }
+
+    public enum AttachmentStrategy {
+        SEPARATE_DOCUMENTS, PARENT_CHILD,
+    }
+
+    public enum UpdateStrategy {
+        OVERWRITE, UPSERT
+    }
+
+    public static ESEmitterConfig load(final String json)
+            throws TikaConfigException {
+        ESEmitterConfig config = PluginJson.read(json, ESEmitterConfig.class);
+        config.validate();
+        return config;
+    }
+
+    /** Chunk documents carry no join field, so they cannot live in a PARENT_CHILD index. */
+    public void validate() throws TikaConfigException {
+        if (chunkStrategy == ChunkStrategy.DOCUMENTS
+                && attachmentStrategy == AttachmentStrategy.PARENT_CHILD) {
+            throw new TikaConfigException("chunkStrategy DOCUMENTS needs attachmentStrategy "
+                    + "SEPARATE_DOCUMENTS: chunk documents have no join field");
+        }
+    }
+
+    /** Overrides the record default to prevent {@code apiKey} leaking into logs. */
+    @Override
+    public String toString() {
+        return "ESEmitterConfig{esUrl='" + esUrl + '\'' +
+                ", idField='" + idField + '\'' +
+                ", attachmentStrategy=" + attachmentStrategy +
+                ", updateStrategy=" + updateStrategy +
+                ", chunkStrategy=" + chunkStrategy +
+                ", apiKey=" + (apiKey != null ? "[REDACTED]" : "null") +
+                '}';
+    }
+}

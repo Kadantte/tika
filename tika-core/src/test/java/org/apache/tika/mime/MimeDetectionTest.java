@@ -23,19 +23,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 
 import org.apache.commons.io.ByteOrderMark;
-import org.apache.commons.io.input.UnsynchronizedByteArrayInputStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import org.apache.tika.config.TikaConfig;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
 
 public class MimeDetectionTest {
 
@@ -48,7 +48,7 @@ public class MimeDetectionTest {
      */
     @BeforeAll
     public static void setUp() {
-        MIME_TYPES = TikaConfig.getDefaultConfig().getMimeRepository();
+        MIME_TYPES = MimeTypes.getDefaultMimeTypes();
         REGISTRY = MIME_TYPES.getMediaTypeRegistry();
     }
 
@@ -86,6 +86,132 @@ public class MimeDetectionTest {
 
         // truncated xml should still be detected as xml, See TIKA-3596
         testFile("application/xml", "truncated-utf16-xml.xyz");
+
+        // Android Binary XML (compiled AndroidManifest.xml / res/*.xml inside an APK).
+        // Carries a .xml extension, so magic must win over the *.xml glob and it must
+        // NOT be routed to application/xml / the XML parser. See TIKA-4747.
+        testFile("application/vnd.android.axml", "test-android-binary.xml");
+    }
+
+    /** The html magic needs the tag to end: an XML element such as htmlPath is not html. */
+    @Test
+    public void testHtmlMagicNeedsTagEnd() throws Exception {
+        String pad = " ".repeat(200);
+        String[] notHtml = {
+                "<htmlPath><![CDATA[TmplData\\tmpl.html]]></htmlPath>",
+                "<flashTemplate><info>" + pad + "<htmlPath>x</htmlPath></info></flashTemplate>",
+                "<root>" + pad + "<htmlContent>x</htmlContent></root>"
+        };
+        for (String xml : notHtml) {
+            assertDetected(MediaType.TEXT_PLAIN, xml.getBytes(UTF_8));
+            Metadata metadata = new Metadata();
+            metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, "flashTemplate.xml");
+            try (TikaInputStream tis = TikaInputStream.get(xml.getBytes(UTF_8))) {
+                assertEquals(MediaType.APPLICATION_XML, MIME_TYPES.detect(tis, metadata, new ParseContext()), xml);
+            }
+        }
+        String[] html = {
+                "<html><body>x</body></html>",
+                "<HTML>\n<body>x</body></HTML>",
+                "<html\nlang=\"en\"><body>x</body></html>",
+                "garbage\n".repeat(30) + "<html><body>x</body></html>"
+        };
+        for (String h : html) {
+            assertDetected(MediaType.TEXT_HTML, h.getBytes(UTF_8));
+        }
+    }
+
+    /** An OS/2 bitmap array's first entry header (size 40, next at 46) is not an icon. */
+    @Test
+    public void testOs2BitmapArrayIsNotAnIcon() throws Exception {
+        for (String tag : new String[]{"BM", "IC", "CI", "CP", "PT"}) {
+            byte[] bitmapArray = new byte[64];
+            bitmapArray[0] = 'B';
+            bitmapArray[1] = 'A';
+            bitmapArray[2] = 0x28;
+            bitmapArray[6] = 0x2e;
+            bitmapArray[14] = (byte) tag.charAt(0);
+            bitmapArray[15] = (byte) tag.charAt(1);
+            try (TikaInputStream tis = TikaInputStream.get(bitmapArray)) {
+                assertEquals(MediaType.parse("image/x-os2-graphics; charset=binary"),
+                        MIME_TYPES.detect(tis, new Metadata(), new ParseContext()), tag);
+            }
+        }
+    }
+
+    /**
+     * TGA has no signature. The rules key on the colour map type and image
+     * type, the colour map spec and the pixel depth.
+     */
+    @Test
+    public void testTgaDetection() throws Exception {
+        MediaType tga = MediaType.image("x-tga");
+        MediaType cursor = MediaType.image("x-win-bitmap");
+        // true colour, no id, no colour map, 24 bpp
+        assertDetected(tga, tgaHeader(0, 0, 2, 0, 24));
+        // the same with an id field and 32 bpp, and the RLE form
+        assertDetected(tga, tgaHeader(5, 0, 2, 0, 32));
+        assertDetected(tga, tgaHeader(0, 0, 10, 0, 32));
+        // 15 bpp, with and without an id
+        assertDetected(tga, tgaHeader(0, 0, 2, 0, 15));
+        assertDetected(tga, tgaHeader(3, 0, 2, 0, 15));
+        // greyscale
+        assertDetected(tga, tgaHeader(0, 0, 3, 0, 8));
+        assertDetected(tga, tgaHeader(0, 0, 11, 0, 8));
+        // colour mapped, 24 bit entries, 8 bit indices, and the RLE form
+        assertDetected(tga, tgaHeader(0, 1, 1, 24, 8));
+        assertDetected(tga, tgaHeader(0, 1, 9, 24, 8));
+        // no colour map but an entry size in the spec, as some writers leave it
+        byte[] strayEntrySize = tgaHeader(0, 0, 2, 0, 24);
+        strayEntrySize[7] = 24;
+        assertDetected(tga, strayEntrySize);
+
+        // a pixel depth no TGA has
+        assertDetected(MediaType.OCTET_STREAM, tgaHeader(0, 0, 2, 0, 7));
+        assertDetected(MediaType.OCTET_STREAM, tgaHeader(1, 0, 2, 0, 7));
+        // a colour map entry size and an index depth no TGA has
+        assertDetected(MediaType.OCTET_STREAM, tgaHeader(0, 1, 1, 7, 8));
+        assertDetected(MediaType.OCTET_STREAM, tgaHeader(0, 1, 1, 24, 99));
+        // a Windows cursor with one image starts like a true colour TGA
+        byte[] oneImage = tgaHeader(0, 0, 2, 0, 24);
+        oneImage[4] = 1;
+        assertDetected(cursor, oneImage);
+        // a cursor with no images is nothing; 256 images is a TGA with a colour map length
+        byte[] noImages = tgaHeader(0, 0, 2, 0, 24);
+        noImages[16] = 0;
+        assertDetected(MediaType.OCTET_STREAM, noImages);
+        byte[] images256 = tgaHeader(0, 0, 2, 0, 24);
+        images256[5] = 1;
+        assertDetected(MediaType.OCTET_STREAM, images256);
+        // Lotus 1-2-3 shares the first four bytes
+        byte[] lotus = new byte[64];
+        lotus[2] = 2;
+        lotus[4] = 4;
+        lotus[5] = 4;
+        assertDetected(MediaType.parse("application/vnd.lotus-1-2-3;version=1"), lotus);
+    }
+
+    private static byte[] tgaHeader(int idLength, int colourMapType, int imageType,
+                                    int colourMapEntrySize, int pixelDepth) {
+        byte[] header = new byte[64];
+        header[0] = (byte) idLength;
+        header[1] = (byte) colourMapType;
+        header[2] = (byte) imageType;
+        if (colourMapType == 1) {
+            // 256 entries
+            header[6] = 1;
+            header[7] = (byte) colourMapEntrySize;
+        }
+        header[12] = 32;
+        header[14] = 32;
+        header[16] = (byte) pixelDepth;
+        return header;
+    }
+
+    private static void assertDetected(MediaType expected, byte[] bytes) throws IOException {
+        try (TikaInputStream tis = TikaInputStream.get(bytes)) {
+            assertEquals(expected, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     @Test
@@ -105,12 +231,15 @@ public class MimeDetectionTest {
 
     @Test
     public void testByteOrderMark() throws Exception {
-        assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES
-                .detect(new ByteArrayInputStream("\ufefftest".getBytes(UTF_16LE)), new Metadata()));
-        assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES
-                .detect(new ByteArrayInputStream("\ufefftest".getBytes(UTF_16BE)), new Metadata()));
-        assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES
-                .detect(new ByteArrayInputStream("\ufefftest".getBytes(UTF_8)), new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get("\ufefftest".getBytes(UTF_16LE))) {
+            assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
+        try (TikaInputStream tis = TikaInputStream.get("\ufefftest".getBytes(UTF_16BE))) {
+            assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
+        try (TikaInputStream tis = TikaInputStream.get("\ufefftest".getBytes(UTF_8))) {
+            assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     @Test
@@ -119,19 +248,17 @@ public class MimeDetectionTest {
                 "To: someone@somewhere.com\r\n" + "Cc: someone-else@other.com\r\n" +
                 "Subject: Received\r\n";
         MediaType rfc822 = MediaType.parse("message/rfc822");
-        assertEquals(rfc822, MIME_TYPES.detect(UnsynchronizedByteArrayInputStream
-                .builder()
-                .setByteArray(header.getBytes(UTF_8))
-                .get(), new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get(header.getBytes(UTF_8))) {
+            assertEquals(rfc822, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
 
         int utfLength = ByteOrderMark.UTF_8.length();
         byte[] bytes = new byte[header.getBytes(UTF_8).length + utfLength];
         System.arraycopy(ByteOrderMark.UTF_8.getBytes(), 0, bytes, 0, utfLength);
         System.arraycopy(header.getBytes(UTF_8), 0, bytes, 3, header.getBytes(UTF_8).length);
-        assertEquals(rfc822, MIME_TYPES.detect(UnsynchronizedByteArrayInputStream
-                .builder()
-                .setByteArray(bytes)
-                .get(), new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get(bytes)) {
+            assertEquals(rfc822, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     @Test
@@ -172,7 +299,7 @@ public class MimeDetectionTest {
     private void testUrlWithoutContent(String expected, String url) throws IOException {
         Metadata metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, url);
-        String mime = this.MIME_TYPES.detect(null, metadata).toString();
+        String mime = this.MIME_TYPES.detect(null, metadata, new ParseContext()).toString();
         assertEquals(expected, mime,
                 url + " is not properly detected using only resource name");
     }
@@ -192,22 +319,17 @@ public class MimeDetectionTest {
     private void testStream(String expected, String urlOrFileName, InputStream in)
             throws IOException {
         assertNotNull(in, "Test stream: [" + urlOrFileName + "] is null!");
-        if (!in.markSupported()) {
-            in = new java.io.BufferedInputStream(in);
-        }
-        try {
+        try (TikaInputStream tis = TikaInputStream.get(in)) {
             Metadata metadata = new Metadata();
-            String mime = this.MIME_TYPES.detect(in, metadata).toString();
+            String mime = this.MIME_TYPES.detect(tis, metadata, new ParseContext()).toString();
             assertEquals(expected, mime,
                     urlOrFileName + " is not properly detected: detected.");
 
             //Add resource name and test again
             metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, urlOrFileName);
-            mime = this.MIME_TYPES.detect(in, metadata).toString();
+            mime = this.MIME_TYPES.detect(tis, metadata, new ParseContext()).toString();
             assertEquals(expected, mime,
                     urlOrFileName + " is not properly detected after adding resource name.");
-        } finally {
-            in.close();
         }
     }
 
@@ -218,18 +340,24 @@ public class MimeDetectionTest {
      */
     @Test
     public void testEmptyDocument() throws IOException {
-        assertEquals(MediaType.OCTET_STREAM,
-                MIME_TYPES.detect(new ByteArrayInputStream(new byte[0]), new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get(new byte[0])) {
+            assertEquals(MediaType.OCTET_STREAM,
+                    MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
 
         Metadata namehint = new Metadata();
         namehint.set(TikaCoreProperties.RESOURCE_NAME_KEY, "test.txt");
-        assertEquals(MediaType.TEXT_PLAIN,
-                MIME_TYPES.detect(new ByteArrayInputStream(new byte[0]), namehint));
+        try (TikaInputStream tis = TikaInputStream.get(new byte[0])) {
+            assertEquals(MediaType.TEXT_PLAIN,
+                    MIME_TYPES.detect(tis, namehint, new ParseContext()));
+        }
 
         Metadata typehint = new Metadata();
-        typehint.set(Metadata.CONTENT_TYPE, "text/plain");
-        assertEquals(MediaType.TEXT_PLAIN,
-                MIME_TYPES.detect(new ByteArrayInputStream(new byte[0]), typehint));
+        typehint.set(HttpHeaders.CONTENT_TYPE, "text/plain");
+        try (TikaInputStream tis = TikaInputStream.get(new byte[0])) {
+            assertEquals(MediaType.TEXT_PLAIN,
+                    MIME_TYPES.detect(tis, typehint, new ParseContext()));
+        }
 
     }
 
@@ -241,8 +369,9 @@ public class MimeDetectionTest {
      */
     @Test
     public void testNotXML() throws IOException {
-        assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES
-                .detect(new ByteArrayInputStream("<!-- test -->".getBytes(UTF_8)), new Metadata()));
+        try (TikaInputStream tis = TikaInputStream.get("<!-- test -->".getBytes(UTF_8))) {
+            assertEquals(MediaType.TEXT_PLAIN, MIME_TYPES.detect(tis, new Metadata(), new ParseContext()));
+        }
     }
 
     /**
@@ -273,16 +402,22 @@ public class MimeDetectionTest {
         // With a filename, picks the right one
         metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, "test.hello.world");
-        assertEquals(helloType, MIME_TYPES.detect(new ByteArrayInputStream(helloWorld), metadata));
+        try (TikaInputStream tis = TikaInputStream.get(helloWorld)) {
+            assertEquals(helloType, MIME_TYPES.detect(tis, metadata, new ParseContext()));
+        }
 
         metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, "test.x-hello-world");
-        assertEquals(helloXType, MIME_TYPES.detect(new ByteArrayInputStream(helloWorld), metadata));
+        try (TikaInputStream tis = TikaInputStream.get(helloWorld)) {
+            assertEquals(helloXType, MIME_TYPES.detect(tis, metadata, new ParseContext()));
+        }
 
         // Without, goes for the one that sorts last
         metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, "testingTESTINGtesting");
-        assertEquals(helloXType, MIME_TYPES.detect(new ByteArrayInputStream(helloWorld), metadata));
+        try (TikaInputStream tis = TikaInputStream.get(helloWorld)) {
+            assertEquals(helloXType, MIME_TYPES.detect(tis, metadata, new ParseContext()));
+        }
     }
 
     /**
@@ -291,5 +426,19 @@ public class MimeDetectionTest {
     @Test
     public void testPNGWithSomeEmlHeaders() throws IOException {
         testFile("image/png", "test-pngNotEml.bin");
+    }
+
+    @Test
+    public void testLyingDeclaredLengthDoesNotTruncateMagic() throws Exception {
+        byte[] pdf = "%PDF-1.4\nsome pdf content".getBytes(UTF_8);
+        Metadata metadata = new Metadata();
+        // an under-declared Content-Length must not shrink the magic read
+        metadata.set(HttpHeaders.CONTENT_LENGTH, "2");
+        try (TikaInputStream tis = TikaInputStream.get(
+                new java.io.ByteArrayInputStream(pdf),
+                new org.apache.tika.io.TemporaryResources(), metadata)) {
+            assertEquals(MediaType.application("pdf"),
+                    MIME_TYPES.detect(tis, metadata, new ParseContext()));
+        }
     }
 }

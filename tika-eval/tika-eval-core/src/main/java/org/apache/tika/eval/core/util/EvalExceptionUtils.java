@@ -21,23 +21,32 @@ import java.util.regex.Pattern;
 
 import org.apache.commons.lang3.StringUtils;
 
-import org.apache.tika.utils.ExceptionUtils;
-
 public class EvalExceptionUtils {
 
     //these remove runtime info from the stacktraces so
     //that actual causes can be counted.
+    //\t*: a suppressed exception's cause is tab-indented by printStackTrace
     private final static Pattern CAUSED_BY_SNIPPER =
-            Pattern.compile("(Caused by: [^:]+):[^\\r\\n]+");
+            Pattern.compile("(?m)^(\\t*Caused by: [^:\\r\\n]+):[^\\r\\n]+");
+
+    //strips the exception message off the first line, so that the same cause with
+    //differing runtime detail collapses to one entry. Anchored to the first line: a
+    //message-redacted trace has no ':' on line one, and the first ':' would otherwise
+    //be a frame's line number.
+    private final static Pattern MSG_PATTERN = Pattern.compile("^([^\\r\\n:]*):[^\\r\\n]+");
 
     public static String normalize(String stacktrace) {
         if (StringUtils.isBlank(stacktrace)) {
             return "";
         }
-        String sortTrace = ExceptionUtils.trimMessage(stacktrace);
+        String sortTrace = trimMessage(stacktrace);
 
         Matcher matcher = CAUSED_BY_SNIPPER.matcher(sortTrace);
         sortTrace = matcher.replaceAll("$1");
         return sortTrace.replaceAll("org.apache.tika.", "o.a.t.");
+    }
+
+    private static String trimMessage(String trace) {
+        return MSG_PATTERN.matcher(trace).replaceFirst("$1");
     }
 }

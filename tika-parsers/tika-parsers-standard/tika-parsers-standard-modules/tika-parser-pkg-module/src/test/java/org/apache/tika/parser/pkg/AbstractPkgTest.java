@@ -16,8 +16,9 @@
  */
 package org.apache.tika.parser.pkg;
 
+import static org.junit.jupiter.api.Assertions.assertNull;
+
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -28,6 +29,9 @@ import org.xml.sax.SAXException;
 
 import org.apache.tika.TikaTest;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.FileSystem;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -77,12 +81,12 @@ public abstract class AbstractPkgTest extends TikaTest {
             mediaTypes.clear();
         }
 
-        public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+        public void parse(TikaInputStream stream, ContentHandler handler, Metadata metadata,
                           ParseContext context) throws IOException, SAXException, TikaException {
             parser.parse(stream, handler, metadata, context);
 
             filenames.add(metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY));
-            mediaTypes.add(metadata.get(Metadata.CONTENT_TYPE));
+            mediaTypes.add(metadata.get(HttpHeaders.CONTENT_TYPE));
         }
     }
 
@@ -105,12 +109,14 @@ public abstract class AbstractPkgTest extends TikaTest {
             return AUTO_DETECT_PARSER.getSupportedTypes(context);
         }
 
-        public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+        public void parse(TikaInputStream stream, ContentHandler handler, Metadata metadata,
                           ParseContext context) throws IOException, SAXException, TikaException {
             filenames.add(metadata.get(TikaCoreProperties.RESOURCE_NAME_KEY));
-            mediatypes.add(metadata.get(Metadata.CONTENT_TYPE));
-            createdAts.add(metadata.get(TikaCoreProperties.CREATED));
-            modifiedAts.add(metadata.get(TikaCoreProperties.MODIFIED));
+            mediatypes.add(metadata.get(HttpHeaders.CONTENT_TYPE));
+            assertNull(metadata.get(TikaCoreProperties.CREATED));
+            assertNull(metadata.get(TikaCoreProperties.MODIFIED));
+            createdAts.add(metadata.get(FileSystem.CREATED));
+            modifiedAts.add(metadata.get(FileSystem.MODIFIED));
 
             lastSeenStart = new byte[32];
             stream.read(lastSeenStart);

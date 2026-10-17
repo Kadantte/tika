@@ -17,13 +17,18 @@
 package org.apache.tika.parser.executable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 import org.junit.jupiter.api.Test;
+import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.TikaTest;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.MachineMetadata.Endian;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
+import org.apache.tika.parser.ParseContext;
 
 public class ExecutableParserTest extends TikaTest {
 
@@ -32,7 +37,7 @@ public class ExecutableParserTest extends TikaTest {
         XMLResult r = getXML("testWindows-x86-32.exe");
         Metadata metadata = r.metadata;
 
-        assertEquals("application/x-msdownload", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-msdownload", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("2012-05-13T13:40:11Z", metadata.get(TikaCoreProperties.CREATED));
 
         assertEquals(ExecutableParser.MACHINE_x86_32, metadata.get(ExecutableParser.MACHINE_TYPE));
@@ -43,11 +48,29 @@ public class ExecutableParserTest extends TikaTest {
 
     }
 
+    /**
+     * A PE header cannot start inside the field that holds its offset; such a
+     * file is an MS-DOS executable, not a failure.
+     */
+    @Test
+    public void testPeOffsetInsideDosHeader() throws Exception {
+        byte[] mz = new byte[0x100];
+        mz[0] = 'M';
+        mz[1] = 'Z';
+        mz[0x3c] = 0x3f;
+        Metadata metadata = new Metadata();
+        try (TikaInputStream tis = TikaInputStream.get(mz)) {
+            new ExecutableParser().parse(tis, new DefaultHandler(), metadata, new ParseContext());
+        }
+        assertEquals("Windows", metadata.get(ExecutableParser.PLATFORM));
+        assertNull(metadata.get(ExecutableParser.MACHINE_TYPE));
+    }
+
     @Test
     public void testElfParser_x86_32() throws Exception {
         XMLResult r = getXML("testLinux-x86-32");
         Metadata metadata = r.metadata;
-        assertEquals("application/x-executable", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-executable", metadata.get(HttpHeaders.CONTENT_TYPE));
 
         assertEquals(ExecutableParser.MACHINE_x86_32, metadata.get(ExecutableParser.MACHINE_TYPE));
         assertEquals("Little", metadata.get(ExecutableParser.ENDIAN));
@@ -64,7 +87,7 @@ public class ExecutableParserTest extends TikaTest {
     public void testMachOParser_x86_64() throws Exception {
         XMLResult r = getXML("testMacOS-x86_64");
         Metadata metadata = r.metadata;
-        assertEquals("application/x-mach-o-executable", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-mach-o-executable", metadata.get(HttpHeaders.CONTENT_TYPE));
 
         assertEquals(Endian.LITTLE.getName(), metadata.get(ExecutableParser.ENDIAN));
         assertEquals(ExecutableParser.MACHINE_x86_64, metadata.get(ExecutableParser.MACHINE_TYPE));
@@ -77,7 +100,7 @@ public class ExecutableParserTest extends TikaTest {
     public void testMachOParser_arm64() throws Exception {
         XMLResult r = getXML("testMacOS-arm64");
         Metadata metadata = r.metadata;
-        assertEquals("application/x-mach-o-executable", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-mach-o-executable", metadata.get(HttpHeaders.CONTENT_TYPE));
 
         assertEquals(Endian.LITTLE.getName(), metadata.get(ExecutableParser.ENDIAN));
         assertEquals(ExecutableParser.MACHINE_ARM, metadata.get(ExecutableParser.MACHINE_TYPE));

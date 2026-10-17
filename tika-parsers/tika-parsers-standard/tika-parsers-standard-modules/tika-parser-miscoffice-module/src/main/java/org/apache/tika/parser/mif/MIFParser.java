@@ -17,7 +17,6 @@
 package org.apache.tika.parser.mif;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.Collections;
@@ -25,13 +24,15 @@ import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.detect.AutoDetectReader;
 import org.apache.tika.detect.EncodingDetector;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.AbstractEncodingDetectorParser;
@@ -39,6 +40,7 @@ import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.EndDocumentShieldingContentHandler;
 import org.apache.tika.sax.XHTMLContentHandler;
 
+@TikaComponent
 public class MIFParser extends AbstractEncodingDetectorParser {
 
     private static final Set<MediaType> SUPPORTED_TYPES = Collections.unmodifiableSet(new HashSet<>(
@@ -59,18 +61,19 @@ public class MIFParser extends AbstractEncodingDetectorParser {
     }
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        try (AutoDetectReader reader = new AutoDetectReader(CloseShieldInputStream.wrap(stream),
+        tis.setCloseShield();
+        try (AutoDetectReader reader = new AutoDetectReader(tis,
                 metadata, getEncodingDetector(context))) {
 
             Charset charset = reader.getCharset();
-            metadata.set(Metadata.CONTENT_ENCODING, charset.name());
+            metadata.set(HttpHeaders.CONTENT_ENCODING, charset.name());
             Optional<MediaType> firstElement = SUPPORTED_TYPES.stream().findFirst();
-            metadata.set(Metadata.CONTENT_TYPE, firstElement.get().toString());
+            metadata.set(HttpHeaders.CONTENT_TYPE, firstElement.get().toString());
 
-            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+            XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
             xhtml.startDocument();
             EndDocumentShieldingContentHandler parseHandler =
                     new EndDocumentShieldingContentHandler(xhtml);
@@ -80,6 +83,8 @@ public class MIFParser extends AbstractEncodingDetectorParser {
             if (parseHandler.isEndDocumentWasCalled()) {
                 parseHandler.reallyEndDocument();
             }
+        } finally {
+            tis.removeCloseShield();
         }
     }
 

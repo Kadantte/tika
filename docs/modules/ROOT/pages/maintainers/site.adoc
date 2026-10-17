@@ -1,0 +1,278 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+= Publishing the Documentation Site
+
+This guide covers how to build and publish the Apache Tika documentation site.
+
+== Overview
+
+The documentation is built using https://antora.org[Antora], a static site generator for AsciiDoc.
+The site supports multiple versions through Git branches and includes client-side search powered by Lunr.
+
+== Prerequisites
+
+* Maven 3.9+
+* Git
+* Internet access on first build — the Antora plugin downloads Node.js into `~/.cache/tika-antora/` (~100 MB, one-time per machine; reused across clean builds and across worktrees)
+
+== Building the Site Locally
+
+The `docs` module is only included in the reactor under the `apache-release` profile. Build the site from the repo root:
+
+[source,bash]
+----
+./mvnw package -Papache-release -pl :tika-docs -DskipTests
+----
+
+The generated site will be at `docs/target/site/`. The current git commit and date are stamped automatically onto the home page (a generated copy of the playbook lives at `docs/antora-playbook-stamped.yml` — gitignored).
+
+The playbook is pinned in `docs/pom.xml` (`<playbook>antora-playbook-stamped.yml</playbook>`),
+so it cannot be overridden from the command line — an explicit POM value beats the
+plugin's `antora.playbook` user property. To build against the unstamped playbook,
+change that element locally.
+
+=== Previewing the Site
+
+**Option 1: Python HTTP server (recommended)**
+
+[source,bash]
+----
+cd docs/target/site
+python3 -m http.server 8000
+----
+
+Then open http://localhost:8000 in your browser.
+
+**Option 2: Node.js HTTP server**
+
+[source,bash]
+----
+npx http-server docs/target/site -p 8000
+----
+
+Then open http://localhost:8000 in your browser.
+
+**Option 3: Open static HTML directly**
+
+[source,bash]
+----
+# Linux
+xdg-open docs/target/site/index.html
+
+# macOS
+open docs/target/site/index.html
+
+# Windows
+start docs/target/site/index.html
+----
+
+NOTE: Opening static HTML directly may not fully test search and relative links.
+
+== Living documentation
+
+`docs/modules/ROOT/examples/` is entirely symlinks into module resources — mostly
+`src/test/resources/config-examples/` across the parser, pipes-plugin, and
+serialization modules, plus a few `src/test/resources/configs/` and
+`tika-async-cli`'s shipped `config-template.json`. Nearly every published example
+is therefore a config the build actually exercises, and editing the source file
+updates the docs on the next build.
+
+Never edit or de-symlink a file under `examples/`: fix the module's resource instead.
+
+== Version Management
+
+Documentation versions are managed through Git branches with the `docs/` prefix.
+
+=== Branch Structure
+
+* `HEAD` (main branch) — current development version (SNAPSHOT); its
+  `antora.yml` carries `prerelease: true` so the `/docs` redirect stays on the
+  latest released line
+* `docs/X.Y.x` — one branch per released *minor* line, e.g. `docs/4.0.x`.
+  Patch releases commit to the same branch and republish in place, so there is
+  one URL per line (`/docs/4.0.x/`). The Changes page and javadoc stay
+  per-release (`/4.0.0/`, `/4.0.0/api/`) — javadocs are exact-version artifacts.
+
+The playbook (`antora-playbook.yml`) builds all `docs/{0..9}*` branches
+automatically (a brace range — `[0-9]` bracket globs don't match in Antora's
+matcher). The glob is numbered-only on purpose: a feature branch named
+`docs/anything` would otherwise be picked up as a content source and break the
+build with "Duplicate nav".
+
+=== Publishing to the Site
+
+Build the docs with Maven, then run `publish-docs.sh` to copy the output to a tika-site SVN checkout (with URL flattening so `/docs/tika/X.Y.Z/...` becomes `/docs/X.Y.Z/...`):
+
+[source,bash]
+----
+./mvnw package -Papache-release -pl :tika-docs -DskipTests
+cd docs
+./publish-docs.sh /path/to/tika-site/publish
+
+# Then in the SVN checkout:
+cd /path/to/tika-site
+svn add publish/docs publish/_ publish/search-index.js --force
+svn commit -m "Publish 4.0.0-SNAPSHOT docs"
+----
+
+The Maven `package` step builds the Antora site (stamping the current git
+commit and date on the home page); `publish-docs.sh` copies the output to
+the site checkout with the correct directory layout:
+
+* `publish/docs/4.0.0-SNAPSHOT/` -- the documentation pages
+* `publish/_/` -- CSS, JS, fonts (shared across versions)
+* `publish/docs/index.html` -- redirect to latest version
+* `publish/search-index.js` -- the Lunr index, with URLs rewritten to `/docs/...`
+  (TIKA-4743); it sits beside `_/`, not under `docs/`, and must be `svn add`ed
+  on the first publish or search 404s
+
+=== Publishing a Release
+
+When releasing a new minor line (e.g., 4.0.0 creates `docs/4.0.x`):
+
+[source,bash]
+----
+# 1. Create the docs branch (from the release tag, or from main if the
+#    post-tag docs improvements should ship too)
+git checkout -b docs/4.0.x 4.0.0
+
+# 2. Set the version (and the tika-version / tika-javadoc-url attributes) in docs/antora.yml
+#    version: '4.0.x'
+#    asciidoc:
+#      attributes:
+#        tika-version: '4.0.0'
+#        tika-javadoc-url: 'https://tika.apache.org/4.0.0/api'
+git commit -am "Set docs version to 4.0.x"
+git push origin docs/4.0.x
+
+# 3. On main, make sure docs/antora.yml still carries prerelease: true;
+#    without it /docs redirects to the SNAPSHOT after the version bump.
+
+# 4. Build and publish
+./mvnw package -Papache-release -pl :tika-docs -DskipTests
+cd docs
+./publish-docs.sh /path/to/tika-site/publish
+
+# 5. In the SVN checkout: prune any stale SNAPSHOT tree, then commit
+cd /path/to/tika-site
+svn rm publish/docs/<old>-SNAPSHOT   # nothing prunes it otherwise
+svn add publish/docs publish/_ publish/search-index.js --force
+svn commit -m "Publish 4.0.x docs"
+----
+
+For a patch release (e.g. 4.0.1), there is no new branch: merge or cherry-pick
+the doc changes to `docs/4.0.x`, bump its `tika-version` and `tika-javadoc-url`
+attributes, rebuild and republish in place.
+
+=== Updating Released Documentation
+
+To fix or update documentation for a released version:
+
+[source,bash]
+----
+# 1. Checkout the docs branch
+git checkout docs/4.0.x
+
+# 2. Make changes (docs or config examples)
+# Edit files as needed...
+
+# 3. Commit and push
+git commit -am "Fix PDF parser example"
+git push origin docs/4.0.x
+
+# 4. Rebuild and republish
+./mvnw package -Papache-release -pl :tika-docs -DskipTests
+cd docs
+./publish-docs.sh /path/to/tika-site/publish
+cd /path/to/tika-site
+svn commit -m "Update 4.0.x docs"
+----
+
+== Publishing the API docs (Javadoc)
+
+The per-version API docs at `https://tika.apache.org/<version>/api/` are a single
+aggregated Javadoc across all modules, generated from the release source tree and
+copied into the tika-site checkout next to the Antora docs.
+
+[NOTE]
+====
+Tika modules declare an `Automatic-Module-Name` but ship no `module-info.java`, so
+`maven-javadoc-plugin`'s aggregate goal defaults to a modular invocation that emits
+nothing (see https://issues.apache.org/jira/browse/TIKA-4318[TIKA-4318]).
+`tika-parent` works around this with an explicit `<sourcepath>` listing every
+module's `src/main/java` (except `tika-grpc`). That list is hand-maintained, so run
+the check in step 2 before generating -- a newly added module would otherwise drop
+out of the docs silently.
+====
+
+. Build and install first. `javadoc:aggregate` compiles nothing; it needs every
+  module jar (and grpc's generated sources) in the local repo. `-Pfast` skips tests
+  for speed:
++
+[source,bash]
+----
+./mvnw clean install -Pfast
+----
+
+. Verify the aggregate `<sourcepath>` still covers every module:
++
+[source,bash]
+----
+python3 .github/scripts/check_javadoc_sourcepath.py
+# on failure it names the missing module(s); regenerate the list with --fix:
+python3 .github/scripts/check_javadoc_sourcepath.py --fix
+----
+
+. Generate the aggregate Javadoc (output in `target/reports/apidocs/`; `tika-grpc`
+  is intentionally excluded):
++
+[source,bash]
+----
+./mvnw javadoc:aggregate
+----
+
+. Copy it into the tika-site checkout as this version's `api/` directory and commit:
++
+[source,bash]
+----
+mkdir -p /path/to/tika-site/publish/<version>
+cp -r target/reports/apidocs /path/to/tika-site/publish/<version>/api
+cd /path/to/tika-site
+svn add publish/<version>
+svn commit -m "Add <version> API docs"
+----
+
+== Site Structure
+
+The Antora configuration files:
+
+* `docs/antora.yml` - Component descriptor (name, version, navigation)
+* `docs/antora-playbook.yml` - Site-wide configuration (sources, UI, extensions)
+* `docs/modules/ROOT/nav.adoc` - Navigation sidebar structure
+* `docs/modules/ROOT/pages/` - Documentation pages
+* `docs/modules/ROOT/examples/` - Symlinks to config examples
+* `docs/supplemental-ui/` - Custom UI components (header, footer, search)
+
+== Search
+
+The site includes client-side search powered by the Lunr extension. The search index is generated
+at build time and requires no server-side infrastructure.
+
+== Logos
+
+Official Apache Tika logos are archived at `docs/assets/logos/asf-tika-logos.zip`.

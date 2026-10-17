@@ -21,7 +21,7 @@
   <parent>
     <artifactId>tika-parsers-standard</artifactId>
     <groupId>org.apache.tika</groupId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>${revision}</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
 
@@ -43,6 +43,12 @@
       <scope>provided</scope>
     </dependency>
     <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>tika-serialization</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>org.apache.logging.log4j</groupId>
       <artifactId>log4j-core</artifactId>
       <scope>test</scope>
@@ -55,8 +61,8 @@
   </dependencies>
   <modules>
     <module>tika-parser-jdbc-commons</module>
+    <module>tika-parser-datauri-commons</module>
     <module>tika-parser-digest-commons</module>
-    <module>tika-parser-mail-commons</module>
     <module>tika-parser-xmp-commons</module>
     <module>tika-parser-zip-commons</module>
 
@@ -74,24 +80,36 @@
     <module>tika-parser-apple-module</module>
     <module>tika-parser-cad-module</module>
     <module>tika-parser-mail-module</module>
+    <module>tika-parser-mail-commons</module>
     <module>tika-parser-miscoffice-module</module>
     <module>tika-parser-news-module</module>
     <module>tika-parser-crypto-module</module>
     <module>tika-parser-webarchive-module</module>
   </modules>
   <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <inputExcludes>
+            <inputExclude>tika-parser-code-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-html-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-image-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-image-module/src/main/resources/com/github/jaiimageio/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-pdf-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-pkg-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-text-module/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-xml-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-mail-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-miscoffice-module/src/test/resources/test-documents/**</inputExclude> <!-- already checked -->
+            <inputExclude>tika-parser-html-commons/target/**</inputExclude>
+          </inputExcludes>
+        </configuration>
+      </plugin>
+    </plugins>
     <pluginManagement>
       <plugins>
-        <plugin>
-          <groupId>org.apache.rat</groupId>
-          <artifactId>apache-rat-plugin</artifactId>
-          <version>${rat.version}</version>
-          <configuration>
-            <excludes>
-              <exclude>src/test/resources/test-documents/**</exclude>
-            </excludes>
-          </configuration>
-        </plugin>
         <plugin>
           <groupId>org.apache.felix</groupId>
           <artifactId>maven-bundle-plugin</artifactId>
@@ -119,6 +137,6 @@
   </build>
 
   <scm>
-    <tag>3.0.0-rc1</tag>
+    <tag>4.1.0-rc2</tag>
   </scm>
 </project>

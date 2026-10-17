@@ -18,7 +18,6 @@ package org.apache.tika.parser.pkg;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,6 +31,7 @@ import org.apache.commons.io.IOUtils;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.EncryptedDocumentException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.exception.TikaTimeoutException;
@@ -52,6 +52,7 @@ import org.apache.tika.utils.ProcessUtils;
  * and on the path.  This is not the default rar parser and must
  * be selected via the tika-config.xml.
  */
+@TikaComponent(spi = false)
 public class UnrarParser implements Parser {
     private static final long serialVersionUID = 6157727985054451501L;
 
@@ -65,10 +66,10 @@ public class UnrarParser implements Parser {
     private long timeoutMillis = 60000;
 
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
 
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
 
         EmbeddedDocumentExtractor extractor =
@@ -78,9 +79,9 @@ public class UnrarParser implements Parser {
         try {
             Path tmp = Files.createTempFile(cwd, "input", ".rar");
             try (OutputStream os = Files.newOutputStream(tmp, StandardOpenOption.WRITE)) {
-                IOUtils.copy(stream, os);
+                IOUtils.copy(tis, os);
             }
-            FileProcessResult result = unrar(cwd, tmp);
+            FileProcessResult result = unrar(cwd, tmp, context);
             //delete the tmp rar file so that we don't recursively parse it in the next step
             try {
                 Files.delete(tmp);
@@ -88,7 +89,8 @@ public class UnrarParser implements Parser {
                 //warn failed to delete tmp
             }
             if (result.isTimeout()) {
-                throw new TikaTimeoutException("timed out unrarring");
+                throw new TikaTimeoutException("timed out unrarring",
+                        result.getRequestedTimeoutMillis(), result.getGrantedTimeoutMillis());
             } else if (result.getExitValue() != 0) {
                 if (result.getStderr().contains("error in the encrypted file")) {
                     throw new EncryptedDocumentException();
@@ -127,18 +129,18 @@ public class UnrarParser implements Parser {
                              XHTMLContentHandler xhtml, EmbeddedDocumentExtractor extractor, ParseContext context)
             throws IOException, SAXException {
         String relPath = base.relativize(embeddedFile).toString();
-        Metadata metadata = new Metadata();
+        Metadata metadata = Metadata.newInstance(context);
         String fName = FilenameUtils.getName(relPath);
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, fName);
         metadata.set(TikaCoreProperties.ORIGINAL_RESOURCE_NAME, relPath);
-        if (extractor.shouldParseEmbedded(metadata)) {
+        if (extractor.shouldParseEmbedded(metadata, context)) {
             try (TikaInputStream tis = TikaInputStream.get(embeddedFile)) {
-                extractor.parseEmbedded(tis, xhtml, metadata, true);
+                extractor.parseEmbedded(tis, xhtml, metadata, context, true);
             }
         }
     }
 
-    private FileProcessResult unrar(Path cwd, Path tmp) throws IOException {
+    private FileProcessResult unrar(Path cwd, Path tmp, ParseContext context) throws IOException {
         //we could use the -l option to check for potentially bad file names
         //e.g. path traversals
         ProcessBuilder pb = new ProcessBuilder();
@@ -151,6 +153,6 @@ public class UnrarParser implements Parser {
                 ProcessUtils.escapeCommandLine(tmp.toAbsolutePath().toString())
 
         );
-        return ProcessUtils.execute(pb, timeoutMillis, 10000, 1000);
+        return ProcessUtils.execute(pb, context, timeoutMillis, 10000, 1000);
     }
 }

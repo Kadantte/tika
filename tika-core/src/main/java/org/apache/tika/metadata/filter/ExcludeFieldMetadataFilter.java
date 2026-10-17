@@ -21,11 +21,21 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.metadata.Metadata;
 
-public class ExcludeFieldMetadataFilter extends MetadataFilter {
+@TikaComponent
+public class ExcludeFieldMetadataFilter extends MetadataFilterBase {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public List<String> exclude = new ArrayList<>();
+    }
+
     private final Set<String> excludeSet;
 
     public ExcludeFieldMetadataFilter() {
@@ -36,8 +46,27 @@ public class ExcludeFieldMetadataFilter extends MetadataFilter {
         this.excludeSet = exclude;
     }
 
+    /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public ExcludeFieldMetadataFilter(Config config) {
+        this.excludeSet = new HashSet<>(config.exclude);
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public ExcludeFieldMetadataFilter(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
+
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void filter(Metadata metadata) {
         for (String field : excludeSet) {
             metadata.remove(field);
         }
@@ -46,7 +75,6 @@ public class ExcludeFieldMetadataFilter extends MetadataFilter {
     /**
      * @param exclude list of fields to exclude
      */
-    @Field
     public void setExclude(List<String> exclude) {
         this.excludeSet.addAll(exclude);
     }

@@ -21,22 +21,21 @@ import static org.apache.tika.utils.ParserUtils.recordParserDetails;
 import static org.apache.tika.utils.ParserUtils.recordParserFailure;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
-import org.apache.tika.config.Param;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.CacheMemoryBudget;
 import org.apache.tika.io.TemporaryResources;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
@@ -45,7 +44,6 @@ import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.parser.ParserDecorator;
 import org.apache.tika.sax.ContentHandlerFactory;
-import org.apache.tika.utils.ParserUtils;
 
 /**
  * Abstract base class for parser wrappers which may / will
@@ -83,12 +81,6 @@ public abstract class AbstractMultipleParser implements Parser {
      */
     private MediaTypeRegistry registry;
 
-    @SuppressWarnings("rawtypes")
-    public AbstractMultipleParser(MediaTypeRegistry registry, Collection<? extends Parser> parsers,
-                                  Map<String, Param> params) {
-        this(registry, getMetadataPolicy(params), parsers);
-    }
-
     public AbstractMultipleParser(MediaTypeRegistry registry, MetadataPolicy policy,
                                   Parser... parsers) {
         this(registry, policy, Arrays.asList(parsers));
@@ -108,15 +100,6 @@ public abstract class AbstractMultipleParser implements Parser {
         }
     }
 
-    @SuppressWarnings("rawtypes")
-    protected static MetadataPolicy getMetadataPolicy(Map<String, Param> params) {
-        if (params.containsKey(METADATA_POLICY_CONFIG_KEY)) {
-            return (MetadataPolicy) params.get(METADATA_POLICY_CONFIG_KEY).getValue();
-        }
-        throw new IllegalArgumentException(
-                "Required parameter '" + METADATA_POLICY_CONFIG_KEY + "' not supplied");
-    }
-
     protected static Metadata mergeMetadata(Metadata newMetadata, Metadata lastMetadata,
                                             MetadataPolicy policy) {
         if (policy == MetadataPolicy.DISCARD_ALL) {
@@ -129,7 +112,7 @@ public abstract class AbstractMultipleParser implements Parser {
             if (n.equals(TikaCoreProperties.TIKA_PARSED_BY.getName())) {
                 continue;
             }
-            if (n.equals(ParserUtils.EMBEDDED_PARSER.getName())) {
+            if (n.equals(TikaCoreProperties.EMBEDDED_PARSER.getName())) {
                 continue;
             }
             if (n.equals(TikaCoreProperties.EMBEDDED_EXCEPTION.getName())) {
@@ -142,7 +125,7 @@ public abstract class AbstractMultipleParser implements Parser {
             if (newVals == null || newVals.length == 0) {
                 // Metadata only in previous run, keep old values
                 for (String val : oldVals) {
-                    newMetadata.add(n, val);
+                    newMetadata.reconstruct(n, val, true);
                 }
             } else if (Arrays.deepEquals(oldVals, newVals)) {
                 // Metadata is the same, nothing to do
@@ -153,7 +136,7 @@ public abstract class AbstractMultipleParser implements Parser {
                         // Use the earlier value(s) in place of this/these one/s
                         newMetadata.remove(n);
                         for (String val : oldVals) {
-                            newMetadata.add(n, val);
+                            newMetadata.reconstruct(n, val, true);
                         }
                         continue;
                     case LAST_WINS:
@@ -164,11 +147,11 @@ public abstract class AbstractMultipleParser implements Parser {
                         List<String> vals = new ArrayList<>(Arrays.asList(oldVals));
                         newMetadata.remove(n);
                         for (String oldVal : oldVals) {
-                            newMetadata.add(n, oldVal);
+                            newMetadata.reconstruct(n, oldVal, true);
                         }
                         for (String newVal : newVals) {
                             if (!vals.contains(newVal)) {
-                                newMetadata.add(n, newVal);
+                                newMetadata.reconstruct(n, newVal, true);
                                 vals.add(newVal);
                             }
                         }
@@ -237,9 +220,9 @@ public abstract class AbstractMultipleParser implements Parser {
      * call the method with a {@link ContentHandlerFactory} instead.
      */
     @Override
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        parse(stream, handler, null, metadata, context);
+        parse(tis, handler, null, metadata, context);
     }
 
     /**
@@ -253,14 +236,17 @@ public abstract class AbstractMultipleParser implements Parser {
      * and the method signature is subject to change before Tika 2.0
      */
     @Deprecated
-    public void parse(InputStream stream, ContentHandlerFactory handlers, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandlerFactory handlers, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        parse(stream, null, handlers, metadata, context);
+        parse(tis, null, handlers, metadata, context);
     }
 
-    private void parse(InputStream stream, ContentHandler handler,
+    private void parse(TikaInputStream tis, ContentHandler handler,
                        ContentHandlerFactory handlerFactory, Metadata originalMetadata,
                        ParseContext context) throws IOException, SAXException, TikaException {
+        // Enable rewind capability since we rewind between multiple parsers
+        tis.enableRewind(context == null ? null : context.get(CacheMemoryBudget.class));
+
         // Track the metadata between parsers, so we can apply our policy
         Metadata lastMetadata = cloneMetadata(originalMetadata);
         Metadata metadata = lastMetadata;
@@ -268,16 +254,12 @@ public abstract class AbstractMultipleParser implements Parser {
         // Start tracking resources, so we can clean up when done
         TemporaryResources tmp = new TemporaryResources();
         try {
-            // Ensure we'll be able to re-read safely, buffering to disk if so,
-            //  to permit Parsers 2+ to be able to read the same data
-            InputStream taggedStream = ParserUtils.ensureStreamReReadable(stream, tmp, originalMetadata);
-
             for (Parser p : parsers) {
                 // Get a new handler for this parser, if we can
                 // If not, the user will get text from every parser
                 //  mushed together onto the one solitary handler...
                 if (handlerFactory != null) {
-                    handler = handlerFactory.getNewContentHandler();
+                    handler = handlerFactory.createHandler();
                 }
 
                 // Record that we used this parser
@@ -292,11 +274,11 @@ public abstract class AbstractMultipleParser implements Parser {
                 // Process if possible
                 Exception failure = null;
                 try {
-                    p.parse(taggedStream, handler, metadata, context);
+                    p.parse(tis, handler, metadata, context);
                 } catch (Exception e) {
                     // Record the failure such that it can't get lost / overwritten
-                    recordParserFailure(p, e, originalMetadata);
-                    recordParserFailure(p, e, metadata);
+                    recordParserFailure(p, e, originalMetadata, context);
+                    recordParserFailure(p, e, metadata, context);
                     failure = e;
                 }
 
@@ -326,7 +308,7 @@ public abstract class AbstractMultipleParser implements Parser {
 
                 // Prepare for the next parser, if present
                 lastMetadata = cloneMetadata(metadata);
-                taggedStream = ParserUtils.streamResetForReRead(taggedStream, tmp);
+                tis.rewind();
             }
         } finally {
             tmp.dispose();
@@ -336,7 +318,7 @@ public abstract class AbstractMultipleParser implements Parser {
         for (String n : metadata.names()) {
             originalMetadata.remove(n);
             for (String val : metadata.getValues(n)) {
-                originalMetadata.add(n, val);
+                originalMetadata.reconstruct(n, val, true);
             }
         }
     }

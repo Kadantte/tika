@@ -14,12 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.tika.example;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
 import java.util.Date;
 
 import org.apache.lucene.document.Document;
@@ -28,6 +25,7 @@ import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.IndexWriter;
 
 import org.apache.tika.Tika;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.DublinCore;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Property;
@@ -49,8 +47,8 @@ public class MetadataAwareLuceneIndexer {
 
     public void indexContentSpecificMet(File file) throws Exception {
         Metadata met = new Metadata();
-        try (InputStream is = new FileInputStream(file)) {
-            tika.parse(is, met);
+        try (TikaInputStream tis = TikaInputStream.get(file.toPath(), met)) {
+            tika.parse(tis, met);
             Document document = new Document();
             for (String key : met.names()) {
                 String[] values = met.getValues(key);
@@ -75,9 +73,9 @@ public class MetadataAwareLuceneIndexer {
         met.add(TikaCoreProperties.SUBJECT, "File");
         met.add(TikaCoreProperties.SUBJECT, "Indexing");
         met.add(TikaCoreProperties.SUBJECT, "Metadata");
-        met.set(Property.externalClosedChoise(TikaCoreProperties.RIGHTS.getName(), "public", "private"), "public");
-        try (InputStream is = new FileInputStream(file)) {
-            tika.parse(is, met);
+        met.set(Property.externalClosedChoice(TikaCoreProperties.RIGHTS.getName(), "public", "private"), "public");
+        try (TikaInputStream tis = TikaInputStream.get(file.toPath(), met)) {
+            tika.parse(tis, met);
             Document document = new Document();
             for (String key : met.names()) {
                 String[] values = met.getValues(key);

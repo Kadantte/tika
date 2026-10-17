@@ -21,11 +21,21 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.tika.config.Field;
-import org.apache.tika.exception.TikaException;
+import org.apache.tika.annotation.TikaComponent;
+import org.apache.tika.config.ConfigDeserializer;
+import org.apache.tika.config.JsonConfig;
 import org.apache.tika.metadata.Metadata;
 
-public class IncludeFieldMetadataFilter extends MetadataFilter {
+@TikaComponent
+public class IncludeFieldMetadataFilter extends MetadataFilterBase {
+
+    /**
+     * Configuration class for JSON deserialization.
+     */
+    public static class Config {
+        public List<String> include = new ArrayList<>();
+    }
+
     private final Set<String> includeSet;
 
     public IncludeFieldMetadataFilter() {
@@ -37,9 +47,27 @@ public class IncludeFieldMetadataFilter extends MetadataFilter {
     }
 
     /**
+     * Constructor with explicit Config object.
+     *
+     * @param config the configuration
+     */
+    public IncludeFieldMetadataFilter(Config config) {
+        this.includeSet = new HashSet<>(config.include);
+    }
+
+    /**
+     * Constructor for JSON configuration.
+     * Requires Jackson on the classpath.
+     *
+     * @param jsonConfig JSON configuration
+     */
+    public IncludeFieldMetadataFilter(JsonConfig jsonConfig) {
+        this(ConfigDeserializer.buildConfig(jsonConfig, Config.class));
+    }
+
+    /**
      * @param include comma-delimited list of fields to include
      */
-    @Field
     public void setInclude(List<String> include) {
         includeSet.addAll(include);
     }
@@ -49,7 +77,7 @@ public class IncludeFieldMetadataFilter extends MetadataFilter {
     }
 
     @Override
-    public void filter(Metadata metadata) throws TikaException {
+    protected void filter(Metadata metadata) {
 
         for (String n : metadata.names()) {
             if (!includeSet.contains(n)) {

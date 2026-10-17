@@ -34,6 +34,8 @@ import org.apache.tika.detect.Detector;
 import org.apache.tika.detect.apple.IWorkDetector;
 import org.apache.tika.detect.zip.DefaultZipContainerDetector;
 import org.apache.tika.detect.zip.ZipContainerDetector;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.metadata.Office;
 import org.apache.tika.metadata.TikaCoreProperties;
@@ -54,17 +56,63 @@ public class IWorkParserTest extends TikaTest {
     }
 
     /**
+     * The QuickLook preview of a Pages '09 package is the document's
+     * THUMBNAIL embedded document, emitted after the content.
+     */
+    @Test
+    public void testPagesThumbnail() throws Exception {
+        List<Metadata> metadataList = getRecursiveMetadata("testPages.pages");
+        assertEquals(2, metadataList.size());
+        assertEquals("application/vnd.apple.pages",
+                metadataList.get(0).get(HttpHeaders.CONTENT_TYPE));
+        Metadata thumbnail = metadataList.get(1);
+        assertEquals("QuickLook/Thumbnail.jpg", thumbnail.get(TikaCoreProperties.RESOURCE_NAME_KEY));
+        assertEquals("image/jpeg", thumbnail.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                thumbnail.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
+    }
+
+    @Test
+    public void testNumbersThumbnail() throws Exception {
+        List<Metadata> metadataList = getRecursiveMetadata("testNumbers.numbers");
+        assertEquals(2, metadataList.size());
+        Metadata thumbnail = metadataList.get(1);
+        assertEquals("QuickLook/Thumbnail.jpg", thumbnail.get(TikaCoreProperties.RESOURCE_NAME_KEY));
+        assertEquals("image/jpeg", thumbnail.get(HttpHeaders.CONTENT_TYPE));
+        assertEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                thumbnail.get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
+    }
+
+    /**
+     * Keynote '09 also carries per-slide thumbnails under thumbs/; only the
+     * QuickLook document preview is the thumbnail
+     */
+    @Test
+    public void testKeynoteThumbnail() throws Exception {
+        List<Metadata> metadataList = getRecursiveMetadata("testKeynote.key");
+        assertEquals(2, metadataList.size());
+        assertEquals("QuickLook/Thumbnail.jpg",
+                metadataList.get(1).get(TikaCoreProperties.RESOURCE_NAME_KEY));
+        assertEquals(TikaCoreProperties.EmbeddedResourceType.THUMBNAIL.toString(),
+                metadataList.get(1).get(TikaCoreProperties.EMBEDDED_RESOURCE_TYPE));
+    }
+
+    /**
      * Check the given InputStream is not closed by the Parser (TIKA-1117).
      *
      * @throws Exception
      */
     @Test
     public void testStreamNotClosed() throws Exception {
-        InputStream input = getResourceAsStream("/test-documents/testKeynote.key");
-        Metadata metadata = new Metadata();
-        ContentHandler handler = new BodyContentHandler();
-        iWorkParser.parse(input, handler, metadata, new ParseContext());
-        input.read();   // Will throw an Exception if the stream was already closed.
+        TikaInputStream tis = getResourceAsStream("/test-documents/testKeynote.key");
+        try {
+            Metadata metadata = new Metadata();
+            ContentHandler handler = new BodyContentHandler();
+            iWorkParser.parse(tis, handler, metadata, new ParseContext());
+            tis.read();   // Will throw an Exception if the stream was already closed.
+        } finally {
+            tis.close();
+        }
     }
 
     @Test
@@ -76,7 +124,7 @@ public class IWorkParserTest extends TikaTest {
         // (Exact numbers will vary based on composites)
         assertTrue(metadata.size() >= 6, "Insufficient metadata found " + metadata.size());
         List<String> metadataKeys = Arrays.asList(metadata.names());
-        assertTrue(metadataKeys.contains(Metadata.CONTENT_TYPE),
+        assertTrue(metadataKeys.contains(HttpHeaders.CONTENT_TYPE.getName()),
                 "Metadata not found in " + metadataKeys);
         assertTrue(metadataKeys.contains(Office.SLIDE_COUNT.getName()),
                 "Metadata not found in " + metadataKeys);
@@ -88,7 +136,7 @@ public class IWorkParserTest extends TikaTest {
                 "Metadata not found in " + metadataKeys);
 
         // Check the metadata values
-        assertEquals("application/vnd.apple.keynote", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.apple.keynote", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("3", metadata.get(Office.SLIDE_COUNT));
         assertEquals("1024", metadata.get(KeynoteContentHandler.PRESENTATION_WIDTH));
         assertEquals("768", metadata.get(KeynoteContentHandler.PRESENTATION_HEIGHT));
@@ -155,7 +203,7 @@ public class IWorkParserTest extends TikaTest {
         // (Exact numbers will vary based on composites)
         assertTrue(metadata.size() >= 50, "Insufficient metadata found " + metadata.size());
         List<String> metadataKeys = Arrays.asList(metadata.names());
-        assertTrue(metadataKeys.contains(Metadata.CONTENT_TYPE),
+        assertTrue(metadataKeys.contains(HttpHeaders.CONTENT_TYPE.getName()),
                 "Metadata not found in " + metadataKeys);
         assertTrue(metadataKeys.contains(Office.PAGE_COUNT.getName()),
                 "Metadata not found in " + metadataKeys);
@@ -169,13 +217,16 @@ public class IWorkParserTest extends TikaTest {
                 "Metadata not found in " + metadataKeys);
 
         // Check the metadata values
-        assertEquals("application/vnd.apple.pages", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/vnd.apple.pages", metadata.get(HttpHeaders.CONTENT_TYPE));
         assertEquals("Tika user", metadata.get(TikaCoreProperties.CREATOR));
         assertEquals("Apache tika", metadata.get(TikaCoreProperties.TITLE));
         assertEquals("2010-05-09T21:34:38+0200", metadata.get(TikaCoreProperties.CREATED));
         assertEquals("2010-05-09T23:50:36+0200", metadata.get(TikaCoreProperties.MODIFIED));
         assertEquals("en", metadata.get(TikaCoreProperties.LANGUAGE));
         assertEquals("2", metadata.get(Office.PAGE_COUNT));
+        // sf:copyright has no mapped Property, so PagesContentHandler routes it through the
+        // pages: KeyPrefix (TIKA-4816).
+        assertEquals("(c)", metadata.get("pages:copyright"));
 
         // text on page 1
         assertContains("Sample pages document", content);
@@ -216,7 +267,7 @@ public class IWorkParserTest extends TikaTest {
         // (Exact numbers will vary based on composites)
         assertTrue(metadata.size() >= 8, "Insufficient metadata found " + metadata.size());
         List<String> metadataKeys = Arrays.asList(metadata.names());
-        assertTrue(metadataKeys.contains(Metadata.CONTENT_TYPE),
+        assertTrue(metadataKeys.contains(HttpHeaders.CONTENT_TYPE.getName()),
                 "Metadata not found in " + metadataKeys);
         assertTrue(metadataKeys.contains(Office.PAGE_COUNT.getName()),
                 "Metadata not found in " + metadataKeys);
@@ -279,7 +330,7 @@ public class IWorkParserTest extends TikaTest {
         assertEquals("", content);
 
         // Will have been identified as encrypted
-        assertEquals("application/x-tika-iworks-protected", metadata.get(Metadata.CONTENT_TYPE));
+        assertEquals("application/x-tika-iworks-protected", metadata.get(HttpHeaders.CONTENT_TYPE));
     }
 
     /**
@@ -423,8 +474,9 @@ public class IWorkParserTest extends TikaTest {
         zips.add(new IWorkDetector());
         Detector d = new CompositeDetector(new DefaultZipContainerDetector(zips));
         try (InputStream is = this.getClass()
-                .getResourceAsStream("/test-documents/testIWorksNPEDetector.zip")) {
-            MediaType mt = d.detect(is, new Metadata());
+                .getResourceAsStream("/test-documents/testIWorksNPEDetector.zip");
+             TikaInputStream tis = TikaInputStream.get(is)) {
+            MediaType mt = d.detect(tis, new Metadata(), new ParseContext());
             assertEquals(MediaType.application("zip"), mt);
         }
     }

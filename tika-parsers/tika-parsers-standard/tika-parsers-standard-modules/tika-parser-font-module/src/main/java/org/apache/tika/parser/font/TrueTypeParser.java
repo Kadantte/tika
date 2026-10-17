@@ -17,11 +17,10 @@
 package org.apache.tika.parser.font;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Set;
 
-import org.apache.commons.io.input.CloseShieldInputStream;
 import org.apache.fontbox.ttf.NameRecord;
 import org.apache.fontbox.ttf.NamingTable;
 import org.apache.fontbox.ttf.TTFParser;
@@ -32,18 +31,23 @@ import org.apache.pdfbox.io.RandomAccessReadBufferedFile;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 
+import org.apache.tika.annotation.TikaComponent;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.HttpHeaders;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.mime.MediaType;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.Parser;
 import org.apache.tika.sax.XHTMLContentHandler;
+import org.apache.tika.utils.TikaDates;
 
 /**
  * Parser for TrueType font files (TTF).
  */
+@TikaComponent
 public class TrueTypeParser implements Parser {
 
     /**
@@ -59,53 +63,63 @@ public class TrueTypeParser implements Parser {
         return SUPPORTED_TYPES;
     }
 
-    public void parse(InputStream stream, ContentHandler handler, Metadata metadata,
+    public void parse(TikaInputStream tis, ContentHandler handler, Metadata metadata,
                       ParseContext context) throws IOException, SAXException, TikaException {
-        TikaInputStream tis = TikaInputStream.cast(stream);
 
         // Ask FontBox to parse the file for us
         TrueTypeFont font = null;
         try {
             TTFParser parser = new TTFParser();
-            if (tis != null && tis.hasFile()) {
+            if (tis.hasFile()) {
                 try (RandomAccessRead rar = new RandomAccessReadBufferedFile(tis.getFile())) {
                     font = parser.parse(rar);
                 }
             } else {
-                try (RandomAccessRead rar =
-                             new RandomAccessReadBuffer(CloseShieldInputStream.wrap(tis))) {
+                tis.setCloseShield();
+                try (RandomAccessRead rar = new RandomAccessReadBuffer(tis)) {
                     font = parser.parse(rar);
+                } finally {
+                    tis.removeCloseShield();
                 }
             }
 
             // Report the details of the font
-            metadata.set(Metadata.CONTENT_TYPE, TYPE.toString());
-            metadata.set(TikaCoreProperties.CREATED, font.getHeader().getCreated());
-            metadata.set(TikaCoreProperties.MODIFIED, font.getHeader().getModified());
-            metadata.set(AdobeFontMetricParser.MET_DOC_VERSION,
+            metadata.set(HttpHeaders.CONTENT_TYPE, TYPE.toString());
+            // header dates are often junk (e.g. year 138339611)
+            Calendar created = font.getHeader().getCreated();
+            if (created != null && TikaDates.inYearBounds(created.toInstant())) {
+                metadata.set(TikaCoreProperties.CREATED, created);
+            }
+            Calendar modified = font.getHeader().getModified();
+            if (modified != null && TikaDates.inYearBounds(modified.toInstant())) {
+                metadata.set(TikaCoreProperties.MODIFIED, modified);
+            }
+            metadata.set(Property.externalText(AdobeFontMetricParser.MET_DOC_VERSION),
                     Float.toString(font.getHeader().getVersion()));
 
             // Pull out the naming info
             NamingTable fontNaming = font.getNaming();
             for (NameRecord nr : fontNaming.getNameRecords()) {
                 if (nr.getNameId() == NameRecord.NAME_FONT_FAMILY_NAME) {
-                    metadata.set(AdobeFontMetricParser.MET_FONT_FAMILY_NAME, nr.getString());
+                    metadata.set(Property.externalText(AdobeFontMetricParser.MET_FONT_FAMILY_NAME),
+                            nr.getString());
                 }
                 if (nr.getNameId() == NameRecord.NAME_FONT_SUB_FAMILY_NAME) {
-                    metadata.set(AdobeFontMetricParser.MET_FONT_SUB_FAMILY_NAME, nr.getString());
+                    metadata.set(Property.externalText(AdobeFontMetricParser.MET_FONT_SUB_FAMILY_NAME),
+                            nr.getString());
                 }
                 if (nr.getNameId() == NameRecord.NAME_FULL_FONT_NAME) {
-                    metadata.set(AdobeFontMetricParser.MET_FONT_NAME, nr.getString());
+                    metadata.set(Property.externalText(AdobeFontMetricParser.MET_FONT_NAME), nr.getString());
                     metadata.set(TikaCoreProperties.TITLE, nr.getString());
                 }
                 if (nr.getNameId() == NameRecord.NAME_POSTSCRIPT_NAME) {
-                    metadata.set(AdobeFontMetricParser.MET_PS_NAME, nr.getString());
+                    metadata.set(Property.externalText(AdobeFontMetricParser.MET_PS_NAME), nr.getString());
                 }
                 if (nr.getNameId() == NameRecord.NAME_COPYRIGHT) {
-                    metadata.set("Copyright", nr.getString());
+                    metadata.set(TikaCoreProperties.RIGHTS, nr.getString());
                 }
                 if (nr.getNameId() == NameRecord.NAME_TRADEMARK) {
-                    metadata.set("Trademark", nr.getString());
+                    metadata.set(Property.externalText("Trademark"), nr.getString());
                 }
             }
         } finally {
@@ -115,7 +129,7 @@ public class TrueTypeParser implements Parser {
         }
 
         // For now, we only output metadata, no textual contents
-        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata);
+        XHTMLContentHandler xhtml = new XHTMLContentHandler(handler, metadata, context);
         xhtml.startDocument();
         xhtml.endDocument();
     }

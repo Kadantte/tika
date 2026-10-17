@@ -18,21 +18,19 @@ package org.apache.tika.pipes.s3.tests;
 
 import java.io.File;
 import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.client.builder.AwsClientBuilder;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.s3.model.S3Object;
-import org.apache.commons.io.IOUtils;
-import org.jetbrains.annotations.NotNull;
+import org.apache.commons.io.FileUtils;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
@@ -40,14 +38,24 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testcontainers.containers.DockerComposeContainer;
+import org.testcontainers.containers.ComposeContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.shaded.org.apache.commons.io.FileUtils;
-import org.testcontainers.shaded.org.hamcrest.MatcherAssert;
-import org.testcontainers.shaded.org.hamcrest.Matchers;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 import org.apache.tika.cli.TikaCLI;
-import org.apache.tika.pipes.HandlerConfig;
+import org.apache.tika.pipes.api.ParseMode;
+import org.apache.tika.serialization.config.JsonConfigHelper;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @Testcontainers(disabledWithoutDocker = true)
@@ -55,24 +63,24 @@ class S3PipeIntegrationTest {
     private static final Logger LOG = LoggerFactory.getLogger(S3PipeIntegrationTest.class);
 
     public static final int MAX_STARTUP_TIMEOUT = 120;
-    private static final DockerComposeContainer<?> minioContainer = new DockerComposeContainer<>(
+    private static final ComposeContainer minioContainer = new ComposeContainer(
             new File("src/test/resources/docker-compose.yml")).withStartupTimeout(
                     Duration.of(MAX_STARTUP_TIMEOUT, ChronoUnit.SECONDS))
-            .withExposedService("minio-service", 9000);
+            .withExposedService("s3-service", 9000);
     private static final String MINIO_ENDPOINT = "http://localhost:9000";
     private static final String ACCESS_KEY = "minio";
     private static final String SECRET_KEY = "minio123";
     private static final String FETCH_BUCKET = "fetch-bucket";
     private static final String EMIT_BUCKET = "emit-bucket";
 
-    private static final String REGION = Regions.US_EAST_1.getName();
+    private static final Region REGION = Region.US_EAST_1;
 
-    private AmazonS3 s3Client;
+    private S3Client s3Client;
 
     private final File testFileFolder = new File("target", "test-files");
     private final Set<String> testFiles = new HashSet<>();
 
-    private void createTestFiles() {
+    private void createTestFiles() throws NoSuchAlgorithmException {
         if (testFileFolder.mkdirs()) {
             LOG.info("Created test folder: {}", testFileFolder);
         }
@@ -80,13 +88,17 @@ class S3PipeIntegrationTest {
         for (int i = 0; i < numDocs; ++i) {
             String nextFileName = "test-" + i + ".html";
             testFiles.add(nextFileName);
-            s3Client.putObject(FETCH_BUCKET, nextFileName,
-                    "<html><body>body-of-" + nextFileName + "</body></html>");
+            String s = "<html><head><meta charset=\"UTF-8\"></head><body>body-of-" +
+                    nextFileName + "</body></html>";
+            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            PutObjectRequest request = PutObjectRequest.builder().bucket(FETCH_BUCKET).key(nextFileName).build();
+            RequestBody requestBody = RequestBody.fromBytes(bytes);
+            s3Client.putObject(request, requestBody);
         }
     }
 
     @BeforeAll
-    void setupMinio() {
+    void setupMinio() throws URISyntaxException {
         minioContainer.start();
         initializeS3Client();
     }
@@ -96,69 +108,64 @@ class S3PipeIntegrationTest {
         minioContainer.close();
     }
 
-    private void initializeS3Client() {
-        AwsClientBuilder.EndpointConfiguration endpoint =
-                new AwsClientBuilder.EndpointConfiguration(MINIO_ENDPOINT, REGION);
-        s3Client = AmazonS3ClientBuilder.standard().withCredentials(
-                        new AWSStaticCredentialsProvider(new BasicAWSCredentials(ACCESS_KEY, SECRET_KEY)))
-                .withEndpointConfiguration(endpoint).withPathStyleAccessEnabled(true).build();
+    private void initializeS3Client() throws URISyntaxException {
+        AwsBasicCredentials awsCreds = AwsBasicCredentials.create(ACCESS_KEY, SECRET_KEY);
+        // https://github.com/aws/aws-sdk-java-v2/discussions/3536
+        StaticCredentialsProvider credentialsProvider = StaticCredentialsProvider.create(awsCreds);
+        S3Configuration s3c = S3Configuration.builder().pathStyleAccessEnabled(true).build(); // SO11228792
+        s3Client = S3Client.builder().
+                requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED). // https://stackoverflow.com/a/79488850/535646
+                serviceConfiguration(s3c).region(REGION).
+                credentialsProvider(credentialsProvider).endpointOverride(new URI(MINIO_ENDPOINT)).build();
     }
 
     @Test
     void s3PipelineIteratorS3FetcherAndS3Emitter() throws Exception {
 
         // create s3 bucket for fetches and for emits
-        s3Client.createBucket(FETCH_BUCKET);
-        s3Client.createBucket(EMIT_BUCKET);
+        s3Client.createBucket(CreateBucketRequest.builder().bucket(FETCH_BUCKET).build());
+        s3Client.createBucket(CreateBucketRequest.builder().bucket(EMIT_BUCKET).build());
 
         // create some test files and insert into fetch bucket
         createTestFiles();
 
-        // Let's fetch it
-        File tikaConfigFile = new File("target", "ta.xml");
-        File log4jPropFile = new File("target", "tmp-log4j2.xml");
+        // Setup config files
+        Path log4jPropFile = Path.of("target", "tmp-log4j2.xml");
+        Path tikaConfigFile = Path.of("target", "plugins-config-s3.json");
+
         try (InputStream is = this.getClass()
                 .getResourceAsStream("/pipes-fork-server-custom-log4j2.xml")) {
             Assertions.assertNotNull(is);
-            FileUtils.copyInputStreamToFile(is, log4jPropFile);
+            FileUtils.copyInputStreamToFile(is, log4jPropFile.toFile());
         }
-        String tikaConfigTemplateXml;
-        try (InputStream is = this.getClass()
-                .getResourceAsStream("/tika-config-s3-integration-test.xml")) {
-            assert is != null;
-            tikaConfigTemplateXml = IOUtils.toString(is, StandardCharsets.UTF_8);
-        }
-        try {
-            String tikaConfigXml =
-                    createTikaConfigXml(tikaConfigFile, log4jPropFile, tikaConfigTemplateXml);
 
-            FileUtils.writeStringToFile(tikaConfigFile, tikaConfigXml, StandardCharsets.UTF_8);
-            TikaCLI.main(new String[]{"-a", "--config=" + tikaConfigFile.getAbsolutePath()});
+        // Create plugins config JSON
+        Map<String, Object> replacements = new HashMap<>();
+        replacements.put("LOG4J_JVM_ARG", "-Dlog4j.configurationFile=" + log4jPropFile.toAbsolutePath());
+        replacements.put("PARSE_MODE", ParseMode.RMETA.name());
+        replacements.put("PIPE_ITERATOR_BUCKET", FETCH_BUCKET);
+        replacements.put("EMIT_BUCKET", EMIT_BUCKET);
+        replacements.put("FETCH_BUCKET", FETCH_BUCKET);
+        replacements.put("ACCESS_KEY", ACCESS_KEY);
+        replacements.put("SECRET_KEY", SECRET_KEY);
+        replacements.put("ENDPOINT_CONFIGURATION_SERVICE", MINIO_ENDPOINT);
+        replacements.put("REGION", REGION.id());
+
+        JsonConfigHelper.writeConfigFromResource("/s3/plugins-template.json",
+                S3PipeIntegrationTest.class, replacements, tikaConfigFile);
+
+        try {
+            TikaCLI.main(new String[]{"-a", "-c", tikaConfigFile.toAbsolutePath().toString()});
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
 
         for (String testFile : testFiles) {
-            S3Object object = s3Client.getObject(EMIT_BUCKET, testFile + ".json");
-            Assertions.assertNotNull(object);
-            String data = IOUtils.toString(object.getObjectContent(), StandardCharsets.UTF_8);
-            MatcherAssert.assertThat(
-                    "Should be able to read the parsed body of the HTML file as the body of the document",
-                    data, Matchers.containsString("body-of-" + testFile));
+            GetObjectRequest objectRequest = GetObjectRequest.builder().bucket(EMIT_BUCKET).key(testFile + ".json").build();
+            ResponseBytes<GetObjectResponse> objectAsBytes = s3Client.getObjectAsBytes(objectRequest);
+            String data = objectAsBytes.asString(StandardCharsets.UTF_8);
+            Assertions.assertTrue(data.contains("body-of-" + testFile),
+                        "Should be able to read the parsed body of the HTML file as the body of the document");
         }
-    }
-
-    @NotNull
-    private String createTikaConfigXml(File tikaConfigFile, File log4jPropFile,
-                                       String tikaConfigTemplateXml) {
-        return tikaConfigTemplateXml.replace("{TIKA_CONFIG}", tikaConfigFile.getAbsolutePath())
-                .replace("{LOG4J_PROPERTIES_FILE}", log4jPropFile.getAbsolutePath())
-                .replace("{PATH_TO_DOCS}", testFileFolder.getAbsolutePath())
-                .replace("{PARSE_MODE}", HandlerConfig.PARSE_MODE.RMETA.name())
-                .replace("{PIPE_ITERATOR_BUCKET}", FETCH_BUCKET)
-                .replace("{EMIT_BUCKET}", EMIT_BUCKET).replace("{FETCH_BUCKET}", FETCH_BUCKET)
-                .replace("{ACCESS_KEY}", ACCESS_KEY).replace("{SECRET_KEY}", SECRET_KEY)
-                .replace("{ENDPOINT_CONFIGURATION_SERVICE}", MINIO_ENDPOINT)
-                .replace("{REGION}", REGION);
     }
 }

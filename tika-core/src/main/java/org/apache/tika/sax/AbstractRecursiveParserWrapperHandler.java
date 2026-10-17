@@ -16,16 +16,13 @@
  */
 package org.apache.tika.sax;
 
-import java.io.OutputStream;
 import java.io.Serializable;
-import java.nio.charset.Charset;
 
 import org.xml.sax.ContentHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.Property;
 import org.apache.tika.metadata.TikaCoreProperties;
 
 /**
@@ -37,43 +34,28 @@ import org.apache.tika.metadata.TikaCoreProperties;
 public abstract class AbstractRecursiveParserWrapperHandler extends DefaultHandler
         implements Serializable {
 
-    public final static Property EMBEDDED_RESOURCE_LIMIT_REACHED = Property.internalBoolean(
-            TikaCoreProperties.TIKA_META_EXCEPTION_PREFIX + "embedded_resource_limit_reached");
     private static final int MAX_DEPTH = 100;
     private final ContentHandlerFactory contentHandlerFactory;
-    private final int maxEmbeddedResources;
-    private int embeddedResources = 0;
     private int embeddedDepth = 0;
 
     public AbstractRecursiveParserWrapperHandler(ContentHandlerFactory contentHandlerFactory) {
-        this(contentHandlerFactory, -1);
-    }
-
-    public AbstractRecursiveParserWrapperHandler(ContentHandlerFactory contentHandlerFactory,
-                                                 int maxEmbeddedResources) {
         this.contentHandlerFactory = contentHandlerFactory;
-        this.maxEmbeddedResources = maxEmbeddedResources;
     }
 
-    public ContentHandler getNewContentHandler() {
-        return contentHandlerFactory.getNewContentHandler();
-    }
-
-    public ContentHandler getNewContentHandler(OutputStream os, Charset charset) {
-        return contentHandlerFactory.getNewContentHandler(os, charset);
+    public ContentHandler createHandler() {
+        return contentHandlerFactory.createHandler();
     }
 
     /**
      * This is called before parsing each embedded document.  Override this
      * for custom behavior.  Make sure to call this in your custom classes
-     * because this tracks the number of embedded documents.
+     * because this tracks the embedded depth.
      *
      * @param contentHandler local handler to be used on this embedded document
      * @param metadata       embedded document's metadata
      */
     public void startEmbeddedDocument(ContentHandler contentHandler, Metadata metadata)
             throws SAXException {
-        embeddedResources++;
         embeddedDepth++;
         if (embeddedDepth >= MAX_DEPTH) {
             throw new SAXException("Max embedded depth reached: " + embeddedDepth);
@@ -108,25 +90,25 @@ public abstract class AbstractRecursiveParserWrapperHandler extends DefaultHandl
     /**
      * This is called after the full parse has completed.  Override this
      * for custom behavior.  Make sure to call this as <code>super.endDocument(...)</code>
-     * in subclasses because this adds whether or not the embedded resource
-     * maximum has been hit to the metadata.
+     * in subclasses.
      *
      * @param contentHandler content handler that was used on the main document
      * @param metadata       metadata that was gathered for the main document
      * @throws SAXException
      */
     public void endDocument(ContentHandler contentHandler, Metadata metadata) throws SAXException {
-        if (hasHitMaximumEmbeddedResources()) {
-            metadata.set(EMBEDDED_RESOURCE_LIMIT_REACHED, "true");
-        }
         metadata.set(TikaCoreProperties.EMBEDDED_DEPTH, 0);
     }
 
     /**
-     * @return whether this handler has hit the maximum embedded resources during the parse
+     * The metadata this handler kept for an embedded document, by its
+     * {@code tk:embedded-id-path}, or null when it keeps none: a component that writes
+     * results after the document has ended writes there, not onto the parser's copy.
+     *
+     * @since Apache Tika 4.1
      */
-    public boolean hasHitMaximumEmbeddedResources() {
-        return maxEmbeddedResources > -1 && embeddedResources >= maxEmbeddedResources;
+    public Metadata getEmbeddedMetadata(String idPath) {
+        return null;
     }
 
     public ContentHandlerFactory getContentHandlerFactory() {
